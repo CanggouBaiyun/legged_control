@@ -1,0 +1,18 @@
+.idea/
+.vscode/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.venv/
+
+# Generated reports
+artifacts/*
+!artifacts/.gitkeep
+
+# Official repositories are downloaded manually and pinned separately.
+third_party/unitree_ros/
+third_party/unitree_mujoco/
+third_party/unitree_sdk2/
+

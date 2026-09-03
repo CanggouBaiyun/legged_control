@@ -1,0 +1,15 @@
+name: go2_control
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pinocchio>=3.7,<4
+  - numpy>=2,<3
+  - scipy>=1.14,<2
+  - osqp>=1,<2
+  - matplotlib>=3.9,<4
+  - pytest>=8,<9
+  - pip
+  - pip:
+      - mujoco==3.4.0
+
