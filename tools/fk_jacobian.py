@@ -107,3 +107,70 @@ print(
         - jacobian_pinocchio
     )
 )
+
+
+# ============================================================
+# 7. 验证足端速度 v_foot = J @ v
+# ============================================================
+
+v_test = np.zeros(model.nv)
+
+test_joint_velocoties = {
+    "FR_hip_joint" : 0.2,
+    "FR_thigh_joint" : -0.3,
+    "FR_calf_joint" : 0.4,
+}
+
+for name, velovity in test_joint_velocoties.items():
+    current_joint_id = model.getJointId(name)
+    current_v_index = model.joints[current_joint_id].idx_v
+    v_test[current_v_index] = velovity
+
+#使用Jacobian计算足端速度
+foot_velocity_jacobian = jacobian_linear @ v_test
+
+
+#按照v_test运动极短时间dt
+dt = 1e-7
+
+q_next = pin.integrate(
+    model,
+    q,
+    v_test * dt,
+)
+
+#计算运动一个dt后的足端位置
+data_next = model.createData()
+
+pin.forwardKinematics(model, data_next, q_next)
+pin.updateFramePlacements(model, data_next)
+
+p_next = data_next.oMf[foot_id].translation.copy()
+
+
+#通过位置变化估计足端速度
+foot_velocity_finite_difference = (
+    p_next - p_before
+) / dt
+
+#比较两种变化足端速度
+print("\n========== Full velocity test ==========")
+
+print("\nGeneralized velocity v:")
+print(v_test)
+
+print("\nFoot velocity from J @ v [m/s]:")
+print(foot_velocity_jacobian)
+
+print("\nFoot velocity from position difference [m/s]:")
+print(foot_velocity_finite_difference)
+
+print("\nVelocity error norm:")
+print(
+    np.linalg.norm(
+        foot_velocity_jacobian
+        - foot_velocity_finite_difference
+    )
+)
+
+
