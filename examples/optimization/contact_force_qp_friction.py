@@ -1,6 +1,7 @@
 import numpy as np
 import pinocchio as pin
 import osqp
+import proxsuite
 from scipy import sparse
 
 from go2_control.model import (
@@ -216,6 +217,36 @@ if not result.info.status.lower().startswith(
 
 contact_force_vector = result.x.copy()
 
+# ============================================================
+# 使用 ProxQP 求解同一个 QP
+# ============================================================
+proxqp_solver = proxsuite.proxqp.dense.QP(
+    number_of_contact_force_variables,
+    dynamics_constraint.shape[0],
+    friction_constraint.shape[0],
+)
+
+proxqp_solver.init(
+    quadratic_cost.toarray(),
+    linear_cost,
+    dynamics_constraint.toarray(),
+    required_generalized_force[:6],
+    friction_constraint.toarray(),
+    friction_lower_bound,
+    friction_upper_bound,
+)
+
+proxqp_solver.solve()
+
+proxqp_contact_force_vector = (
+    proxqp_solver.results.x.copy()
+)
+
+solver_solution_difference = np.linalg.norm(
+    contact_force_vector - proxqp_contact_force_vector
+)
+
+
 generalized_contact_force = (
     contact_jacobian.T @ contact_force_vector
 )
@@ -281,6 +312,15 @@ print(
     f"primal_residual={result.info.prim_res:.3e}, "
     f"dual_residual={result.info.dual_res:.3e}"
 )
+
+print(
+    f"ProxQP: "
+    f"status={proxqp_solver.results.info.status}, "
+    f"iterations={proxqp_solver.results.info.iter}"
+)
+
+print("\nOSQP-ProxQP solution difference:")
+print(solver_solution_difference)
 
 print(
     "\nBase force mapping: "
