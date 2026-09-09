@@ -1,13 +1,16 @@
 import numpy as np
 import pinocchio as pin
-import osqp
-import proxsuite
 from scipy import sparse
 
-from go2_control.model import (
+from go2_control.model import(
     GO2_FOOT_FRAMES,
     build_go2_model,
     nominal_configuration,
+)
+
+from go2_control.optimization.qp_solvers import(
+    solve_with_osqp,
+    solve_with_proxqp,
 )
 
 np.set_printoptions(
@@ -143,13 +146,6 @@ friction_constraint = sparse.block_diag(
     format="csc",
 )
 
-constraint_matrix = sparse.vstack(
-    [
-        dynamics_constraint,
-        friction_constraint,
-    ],
-    format="csc",
-)
 
 single_foot_lower_bound = np.array([
     -np.inf,
@@ -177,74 +173,35 @@ friction_upper_bound = np.tile(
     number_of_feet,
 )
 
-lower_bound = np.concatenate(
-    [
-        required_generalized_force[:6],
-        friction_lower_bound,
-    ]
+
+contact_force_vector, osqp_info = solve_with_osqp(
+    quadratic_cost=quadratic_cost,
+    linear_cost=linear_cost,
+    equality_matrix=dynamics_constraint,
+    equality_target=required_generalized_force[:6],
+    inequality_matrix=friction_constraint,
+    inequality_lower_bound=friction_lower_bound,
+    inequality_upper_bound=friction_upper_bound,
 )
 
-upper_bound = np.concatenate(
-    [
-        required_generalized_force[:6],
-        friction_upper_bound,
-    ]
-)
-
-
-solver = osqp.OSQP()
-
-solver.setup(
-    P=quadratic_cost,
-    q=linear_cost,
-    A=constraint_matrix,
-    l=lower_bound,
-    u=upper_bound,
-    verbose=False,
-    polishing=True,
-)
-
-result = solver.solve()
-
-if not result.info.status.lower().startswith(
-    "solved"
-):
-    raise RuntimeError(
-        f"OSQP failed: {result.info.status}"
+proxqp_contact_force_vector, proxqp_info = (
+    solve_with_proxqp(
+        quadratic_cost=quadratic_cost,
+        linear_cost=linear_cost,
+        equality_matrix=dynamics_constraint,
+        equality_target=required_generalized_force[:6],
+        inequality_matrix=friction_constraint,
+        inequality_lower_bound=friction_lower_bound,
+        inequality_upper_bound=friction_upper_bound,
     )
-
-#OSQP直接返回四只脚的12维接触力
-
-contact_force_vector = result.x.copy()
-
-# ============================================================
-# 使用 ProxQP 求解同一个 QP
-# ============================================================
-proxqp_solver = proxsuite.proxqp.dense.QP(
-    number_of_contact_force_variables,
-    dynamics_constraint.shape[0],
-    friction_constraint.shape[0],
-)
-
-proxqp_solver.init(
-    quadratic_cost.toarray(),
-    linear_cost,
-    dynamics_constraint.toarray(),
-    required_generalized_force[:6],
-    friction_constraint.toarray(),
-    friction_lower_bound,
-    friction_upper_bound,
-)
-
-proxqp_solver.solve()
-
-proxqp_contact_force_vector = (
-    proxqp_solver.results.x.copy()
 )
 
 solver_solution_difference = np.linalg.norm(
-    contact_force_vector - proxqp_contact_force_vector
+    contact_force_vector
+    - proxqp_contact_force_vector
 )
+
+
 
 
 generalized_contact_force = (
@@ -307,16 +264,16 @@ base_dynamics_residual = (
 )
 
 print(
-    f"OSQP: status={result.info.status}, "
-    f"iterations={result.info.iter}, "
-    f"primal_residual={result.info.prim_res:.3e}, "
-    f"dual_residual={result.info.dual_res:.3e}"
+    f"OSQP: status={osqp_info.status}, "
+    f"iterations={osqp_info.iter}, "
+    f"primal_residual={osqp_info.prim_res:.3e}, "
+    f"dual_residual={osqp_info.dual_res:.3e}"
 )
 
 print(
     f"ProxQP: "
-    f"status={proxqp_solver.results.info.status}, "
-    f"iterations={proxqp_solver.results.info.iter}"
+    f"status={proxqp_info.status}, "
+    f"iterations={proxqp_info.iter}"
 )
 
 print("\nOSQP-ProxQP solution difference:")
