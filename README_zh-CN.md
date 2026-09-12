@@ -86,25 +86,35 @@ v0.3.0-pinocchio-dynamics
 
 当前三维算例的目标合力为 `[8.0435, 0.0, 165.85697] N`，完整动力学残差约为 `2.96e-15`，OSQP 与 ProxQP 的解差约为 `3.64e-6 N`。
 
-### M5：站立 WBC——进行中
+### M5：离线站立 WBC——完成
 
-- 使用 Pinocchio 足端经典加速度验证 `J_dot @ v`；
-- 在 FR 足端上数值验证 `J @ dv + J_dot @ v`；
-- 将 QP 构造与具体求解器调用分开；
-- 在 `feature/wbc-standing` 分支开发。
+- 将四个足端的线性 Jacobian 堆叠成 `J_c`，并验证支撑足加速度约束；
+- 建立 42 维联合决策变量 `[dv, lambda, tau]`；
+- 加入完整浮动基动力学和四足加速度等式；
+- 加入单边接触、线性摩擦锥、法向力范围和电机力矩限制；
+- 加入三维基座位置 PD 与 SO(3) 姿态 PD 任务；
+- 使用 roll 扰动验证左右足载荷重新分配；
+- 抽取可复用的动力学、接触运动学、基座任务和 QP 求解器函数；
+- 为模型、基座任务、不同接触足集合、质量矩阵和 RNEA 一致性加入自动测试。
 
-下一步是堆叠全部支撑脚约束，并建立联合决策变量 `[dv, lambda, tau]`。
+在名义状态下，期望基座向上加速度为 `0.5 m/s²` 时，WBC 求得 `0.49971572 m/s²`。完整动力学残差约为 `2.97e-14`，四足加速度残差约为 `1.69e-16`。人为加入 `+5°` roll 扰动后，期望恢复角加速度为 `-3.4906585 rad/s²`，左右足接触力按预期重新分配。
+
+阶段标签：
+
+```text
+v0.4.0-wbc-standing-offline
+```
 
 ## 开发路线
 
-- M5：实现 Go2 WBC，加入动力学、支撑足、摩擦锥和力矩约束；
-- M6：完成 Pinocchio 与 MuJoCo 状态和索引映射；
+- M5：完成带动力学、固定接触、摩擦、力矩限制和基座位姿任务的离线站立 WBC；
+- M6：完成 Pinocchio 与 MuJoCo 状态和索引映射——当前阶段；
 - M7：实现 MuJoCo 站立、蹲起、抬腿和原地踏步；
 - M8：加入 Trot 步态调度和摆动足轨迹；
 - M9：运行 OCS2 示例并建立 Go2 NMPC；
 - M10：加入 ROS 2、SDK2、状态估计和安全接口。
 
-MuJoCo 闭环、WBC、OCS2 和实机控制接口仍在开发中。
+离线四足站立 WBC 已完成。MuJoCo 闭环、动态接触模式、OCS2、状态估计和实机控制接口仍在开发中。
 
 ## 目录
 
@@ -114,8 +124,10 @@ docs/                            路线、安装记录和公式推导
 examples/pinocchio/kinematics/   运动学算法示例与数值验证
 examples/pinocchio/dynamics/     动力学和接触力算法验证
 examples/optimization/            接触力 QP 示例
+examples/wbc/                     接触运动学和离线 WBC 示例
 scripts/                         环境和模型版本记录工具
-src/go2_control/                 可复用的模型、优化与控制模块
+src/go2_control/wbc/             可复用的动力学、接触和基座任务函数
+src/go2_control/optimization/    可复用的 QP 求解器接口
 tests/                           自动化数值测试
 tools/                           模型检查和维护工具
 third_party/                     Unitree 官方模型仓库
@@ -143,6 +155,7 @@ python examples/pinocchio/kinematics/fk_jacobian.py
 python examples/pinocchio/kinematics/contact_acceleration.py
 python examples/pinocchio/dynamics/static_contact_balance.py
 python examples/optimization/contact_force_qp_friction.py
+python examples/wbc/standing_wbc_qp.py
 ```
 
 运行数值测试：
@@ -154,7 +167,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 当前测试结果：
 
 ```text
-3 passed
+12 passed
 ```
 
 `hppfcl` 关于迁移到 `coal` 的提示是依赖库弃用警告，目前不影响现有数值检查。
@@ -167,4 +180,4 @@ $$
 M(q)\dot v+h(q,v)=S^T\tau+J_c^T\lambda
 $$
 
-浮动基前 6 维没有直接驱动，所需的基座合力和力矩必须由足端接触产生。当前接触力 QP 先根据基座方程求 `lambda`，再根据驱动关节方程恢复关节力矩。站立 WBC 将同时优化 `dv`、`lambda` 和 `tau`，并满足支撑足加速度约束。
+浮动基前 6 维没有直接驱动，所需的基座合力和力矩必须由足端接触产生。当前离线站立 WBC 已经联合优化 `dv`、`lambda` 和 `tau`，并同时满足完整动力学、支撑足加速度、摩擦、法向力和电机力矩约束。下一步将其作为 MuJoCo 站立闭环的力矩计算核心。
