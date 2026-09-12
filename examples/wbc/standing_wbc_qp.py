@@ -20,6 +20,11 @@ from go2_control.wbc.kinematics import (
     compute_contact_kinematics,
 )
 
+from go2_control.wbc.dynamics import (
+    compute_dynamics_terms,
+)
+
+
 np.set_printoptions(
     precision=8,
     suppress=True,
@@ -40,23 +45,16 @@ contact_kinematics_data = (
 )
 
 
-
-mass_matrix_upper = pin.crba(
-    model,
-    dynamics_data,
-    q,
+(
+    mass_matrix,
+    nonlinear_effects,
+) = compute_dynamics_terms(
+    model=model,
+    data=dynamics_data,
+    q=q,
+    v=v,
 )
 
-mass_matrix = (
-    np.triu(mass_matrix_upper) + np.triu(mass_matrix_upper, k = 1).T
-)
-
-nonlinear_effects = pin.nonLinearEffects(
-    model,
-    dynamics_data,
-    q,
-    v,
-).copy()
 
 (
     contact_jacobian,
