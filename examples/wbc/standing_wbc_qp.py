@@ -275,17 +275,113 @@ linear_cost = (
 
 
 # ============================================================
-# 8. 当前版本暂时没有不等式约束
+# 8. 构造摩擦、法向力和电机力矩约束
 # ============================================================
-inequality_matrix = sparse.csc_matrix(
+
+friction_coefficient = 0.5
+maximum_normal_force = 100.0
+
+#单脚接触力顺序：[fx, fy, fz]
+friction_block = np.array([
+    [1.0, 0.0, -friction_coefficient],
+    [-1.0, 0.0, -friction_coefficient],
+    [0.0, 1.0, -friction_coefficient],
+    [0.0, -1.0, -friction_coefficient],
+    [0.0, 0.0, 1.0],
+])
+
+friction_force_matrix = sparse.block_diag(
+    [friction_block] * len(GO2_FOOT_FRAMES),
+    format="csc",
+).toarray()
+
+friction_constraint = np.zeros(
     (
-        0,
+        friction_force_matrix.shape[0],
         number_of_decision_variables,
     )
 )
 
-inequality_lower_bound = np.empty(0)
-inequality_upper_bound = np.empty(0)
+friction_constraint[
+    :,
+    contact_force_slice,
+] = friction_force_matrix
+
+single_foot_friction_lower_bound = np.array([
+    -np.inf,
+    -np.inf,
+    -np.inf,
+    -np.inf,
+    0.0,
+])
+
+single_foot_friction_upper_bound = np.array([
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    maximum_normal_force,
+])
+
+friction_lower_bound = np.tile(
+    single_foot_friction_lower_bound,
+    len(GO2_FOOT_FRAMES),
+)
+
+friction_upper_bound = np.tile(
+    single_foot_friction_upper_bound,
+    len(GO2_FOOT_FRAMES),
+)
+
+motor_torque_limits = (
+    model.effortLimit[6:].copy()
+)
+
+motor_torque_constraint = np.zeros(
+    (
+        number_of_motor_torques,
+        number_of_decision_variables,
+    )
+)
+
+motor_torque_constraint[
+    :,
+    motor_torque_slice,
+] = np.eye(
+    number_of_motor_torques
+)
+
+motor_torque_lower_bound = (
+    -motor_torque_limits
+)
+
+motor_torque_upper_bound = (
+    motor_torque_limits
+)
+
+inequality_matrix = sparse.csc_matrix(
+    np.vstack(
+        [
+            friction_constraint,
+            motor_torque_constraint,
+        ]
+    )
+)
+
+inequality_lower_bound = np.concatenate(
+    [
+        friction_lower_bound,
+        motor_torque_lower_bound,
+    ]
+)
+
+
+inequality_upper_bound = np.concatenate(
+    [
+        friction_upper_bound,
+        motor_torque_upper_bound,
+    ]
+)
 
 
 # ============================================================
@@ -337,6 +433,28 @@ contact_forces_by_foot = (
     )
 )
 
+normal_forces = (
+    contact_forces_by_foot[:, 2]
+)
+
+friction_utilization = (
+    np.max(
+        np.abs(
+            contact_forces_by_foot[:, :2]
+        ),
+        axis=1,
+    )
+    / (
+        friction_coefficient
+        * normal_forces
+    )
+)
+
+motor_torque_utilization = (
+    np.abs(motor_torques)
+    / motor_torque_limits
+)
+
 print(
     f"OSQP: status={solver_info.status}, "
     f"iterations={solver_info.iter}"
@@ -347,6 +465,9 @@ print(number_of_decision_variables)
 
 print("\nEquality matrix shape:")
 print(equality_matrix.shape)
+
+print("\nInequality matrix shape:")
+print(inequality_matrix.shape)
 
 print("\nSolved base acceleration:")
 print(generalized_acceleration[:6])
@@ -392,3 +513,15 @@ print(
         contact_acceleration_residual
     )
 )
+
+print("\nMinimum normal force [N]:")
+print(np.min(normal_forces))
+
+print("\nMaximum normal force [N]:")
+print(np.max(normal_forces))
+
+print("\nMaximum friction utilization:")
+print(np.max(friction_utilization))
+
+print("\nMaximum motor torque utilization:")
+print(np.max(motor_torque_utilization))
