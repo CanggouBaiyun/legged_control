@@ -231,14 +231,39 @@ equality_target = np.concatenate(
 # ============================================================
 total_mass = pin.computeTotalMass(model)
 
-desired_base_acceleration = np.array([
-    0.0,
-    0.0,
-    0.5,
-    0.0,
-    0.0,
-    0.0,
-])
+current_base_height = q[2]
+current_base_vertical_velocity = v[2]
+
+desired_base_height = 0.28
+#desired_base_height = 0.27
+#desired_base_height = 0.26
+desired_base_vertical_velocity = 0.0
+
+height_kp = 50.0
+height_kd = 10.0
+
+height_error = (
+    desired_base_height - current_base_height
+)
+
+vertical_velocity_error = (
+    desired_base_vertical_velocity - current_base_vertical_velocity
+)
+
+desired_vertical_acceleration = (
+    height_kp * height_error + height_kd * vertical_velocity_error
+)
+
+desired_vertical_acceleration = np.clip(
+    desired_vertical_acceleration,
+    -2.0,
+    2.0,
+)
+
+desired_base_acceleration = np.zeros(6)
+desired_base_acceleration[2] = (
+    desired_vertical_acceleration
+)
 
 reference_contact_force = np.tile(
     np.array([
