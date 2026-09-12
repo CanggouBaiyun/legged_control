@@ -12,6 +12,10 @@ from go2_control.optimization.qp_solvers import (
     solve_with_osqp,
 )
 
+from go2_control.wbc.tasks import(
+    compute_base_acceleration_task,
+)
+
 np.set_printoptions(
     precision=8,
     suppress=True,
@@ -232,52 +236,19 @@ equality_target = np.concatenate(
 # ============================================================
 total_mass = pin.computeTotalMass(model)
 
-# ---------------------------
-# 读取基座状态
-# ---------------------------
-current_base_placement = (
-    pin.XYZQUATToSE3(q[:7])
-)
-
-current_base_position = (
-    current_base_placement.translation.copy()
-)
-
-current_base_rotation = (
-    current_base_placement.rotation.copy()
-)
-
-current_base_linear_velocity_local = (
-    v[:3].copy()
-)
-
-current_base_angular_velocity = (
-    v[3:6].copy()
-)
-
-current_base_linear_velocity_world = (
-    current_base_rotation @ current_base_linear_velocity_local
-)
-
-# ---------------------------
-# 基座位置 PD（世界坐标系）
-# ---------------------------
 desired_base_position = np.array([
     0.0,
     0.0,
     0.28,
 ])
+desired_base_rotation = np.eye(3)
 
 desired_base_linear_velocity_world = (
     np.zeros(3)
 )
 
-position_error = (
-    desired_base_position - current_base_position
-)
-
-linear_velocity_error_world = (
-    desired_base_linear_velocity_world - current_base_linear_velocity_world
+desired_base_angular_velocity_local = (
+    np.zeros(3)
 )
 
 position_kp = np.array([
@@ -292,65 +263,28 @@ position_kd = np.array([
     10.0,
 ])
 
-desired_linear_acceleration_world = (
-    position_kp * position_error + position_kd * linear_velocity_error_world
-)
-
-desired_linear_acceleration_world = np.clip(
-    desired_linear_acceleration_world,
-    -2.0,
-    2.0,
-)
-
-# 把世界坐标系线加速度转换为 Pinocchio 浮动基的局部广义加速度
-desired_linear_acceleration_local = (
-    current_base_rotation.T @ desired_linear_acceleration_world
-    - np.cross(
-        current_base_angular_velocity,
-        current_base_linear_velocity_local,
-    )
-)
-
-# ---------------------------
-# 基座姿态 PD（局部坐标系）
-# ---------------------------
-desired_base_rotation = np.eye(3)
-
-orientation_error = pin.log3(
-    current_base_rotation.T @ desired_base_rotation
-)
-
-desired_base_angular_velocity = np.zeros(3)
-
-angular_velocity_error = (
-    desired_base_angular_velocity - current_base_angular_velocity
-)
-
 orientation_kp = 40.0
 orientation_kd = 8.0
 
-desired_angular_acceleration = (
-    orientation_kp * orientation_error + orientation_kd * angular_velocity_error
-)
-
-desired_angular_acceleration = np.clip(
-    desired_angular_acceleration,
-    -5.0,
-    5.0,
-)
-
-# ---------------------------
-# 组成基座六维加速度任务
-# ---------------------------
-
-desired_base_acceleration = np.zeros(6)
-
-desired_base_acceleration[:3] = (
-    desired_linear_acceleration_local
-)
-
-desired_base_acceleration[3:6] = (
-    desired_angular_acceleration
+desired_base_acceleration = (
+    compute_base_acceleration_task(
+        q=q,
+        v=v,
+        desired_position=desired_base_position,
+        desired_rotation=desired_base_rotation,
+        desired_linear_velocity_world=(
+            desired_base_linear_velocity_world
+        ),
+        desired_angular_velocity_local=(
+            desired_base_angular_velocity_local
+        ),
+        position_kp=position_kp,
+        position_kd=position_kd,
+        orientation_kp=orientation_kp,
+        orientation_kd=orientation_kd,
+        maximum_linear_acceleration=2.0,
+        maximum_angular_acceleration=5.0,
+    )
 )
 
 reference_contact_force = np.tile(
