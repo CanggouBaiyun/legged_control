@@ -70,12 +70,12 @@ def compute_contact_kinematics(
         foot_jacobians
     )
 
-    contact_jacbian_time_variation = np.vstack(
+    contact_jacobian_time_variation = np.vstack(
         foot_jacobian_time_variations
     )
 
     contact_bias_acceleration = (
-        contact_jacbian_time_variation @ v
+        contact_jacobian_time_variation @ v
     )
 
     return (
@@ -100,7 +100,7 @@ mass_matrix_upper = pin.crba(
 )
 
 mass_matrix = (
-    np.triu(mass_matrix_upper + np.triu(mass_matrix_upper, k = 1).T)
+    np.triu(mass_matrix_upper) + np.triu(mass_matrix_upper, k = 1).T
 )
 
 nonlinear_effects = pin.nonLinearEffects(
