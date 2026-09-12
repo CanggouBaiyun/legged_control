@@ -12,80 +12,18 @@ from go2_control.optimization.qp_solvers import (
     solve_with_osqp,
 )
 
-from go2_control.wbc.tasks import(
+from go2_control.wbc.tasks import (
     compute_base_acceleration_task,
+)
+
+from go2_control.wbc.kinematics import (
+    compute_contact_kinematics,
 )
 
 np.set_printoptions(
     precision=8,
     suppress=True,
 )
-
-def compute_contact_kinematics(
-        model,
-        q,
-        v,
-):
-    data = model.createData()
-
-    pin.computeJointJacobiansTimeVariation(
-        model,
-        data,
-        q,
-        v,
-    )
-
-    pin.updateFramePlacements(
-        model,
-        data,
-    )
-
-    foot_jacobians = []
-    foot_jacobian_time_variations = []
-
-    for foot_name in GO2_FOOT_FRAMES:
-        foot_id = model.getFrameId(foot_name)
-
-        frame_jacobian = pin.getFrameJacobian(
-            model,
-            data,
-            foot_id,
-            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
-        )
-
-        frame_jacobian_time_variation = (
-                pin.getFrameJacobianTimeVariation(
-                    model,
-                    data,
-                    foot_id,
-                    pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
-                )
-            )   
-
-        foot_jacobians.append(
-            frame_jacobian[:3, :].copy()
-        )
-
-        foot_jacobian_time_variations.append(
-            frame_jacobian_time_variation[:3, :].copy()
-        )
-
-    contact_jacobian = np.vstack(
-        foot_jacobians
-    )
-
-    contact_jacobian_time_variation = np.vstack(
-        foot_jacobian_time_variations
-    )
-
-    contact_bias_acceleration = (
-        contact_jacobian_time_variation @ v
-    )
-
-    return (
-        contact_jacobian,
-        contact_bias_acceleration,
-    )
 
 
 model = build_go2_model()
@@ -97,6 +35,11 @@ v = np.zeros(model.nv)
 # 1. 计算动力学和接触运动学
 # ============================================================
 dynamics_data = model.createData()
+contact_kinematics_data = (
+    model.createData()
+)
+
+
 
 mass_matrix_upper = pin.crba(
     model,
@@ -119,9 +62,11 @@ nonlinear_effects = pin.nonLinearEffects(
     contact_jacobian,
     contact_bias_acceleration,
 ) = compute_contact_kinematics(
-    model,
-    q,
-    v,
+    model=model,
+    data=contact_kinematics_data,
+    q=q,
+    v=v,
+    contact_frame_names=GO2_FOOT_FRAMES,
 )
 
 # ============================================================
