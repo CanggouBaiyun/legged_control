@@ -231,6 +231,15 @@ equality_target = np.concatenate(
 # ============================================================
 total_mass = pin.computeTotalMass(model)
 
+desired_base_acceleration = np.array([
+    0.0,
+    0.0,
+    0.5,
+    0.0,
+    0.0,
+    0.0,
+])
+
 reference_contact_force = np.tile(
     np.array([
         0.0,
@@ -245,6 +254,7 @@ reference_decision = np.zeros(
 )
 
 reference_decision[contact_force_slice] = reference_contact_force
+reference_decision[:6] = desired_base_acceleration
 
 decision_weights = np.concatenate(
     [
@@ -409,6 +419,10 @@ motor_torques = solution[
     motor_torque_slice
 ]
 
+base_acceleration_error = (
+    generalized_acceleration[:6] - desired_base_acceleration
+)
+
 
 # ============================================================
 # 10. 验证约束残差
@@ -469,6 +483,9 @@ print(equality_matrix.shape)
 print("\nInequality matrix shape:")
 print(inequality_matrix.shape)
 
+print("\nDesired base acceleration:")
+print(desired_base_acceleration)
+
 print("\nSolved base acceleration:")
 print(generalized_acceleration[:6])
 
@@ -525,3 +542,9 @@ print(np.max(friction_utilization))
 
 print("\nMaximum motor torque utilization:")
 print(np.max(motor_torque_utilization))
+
+print("\nBase acceleration tracking error:")
+print(base_acceleration_error)
+
+print("\nBase acceleration tracking error norm:")
+print(np.linalg.norm(base_acceleration_error))
