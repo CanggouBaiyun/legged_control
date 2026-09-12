@@ -88,6 +88,7 @@ model = build_go2_model()
 q = nominal_configuration(model)
 v = np.zeros(model.nv)
 
+
 # ============================================================
 # 1. 计算动力学和接触运动学
 # ============================================================
@@ -231,12 +232,13 @@ equality_target = np.concatenate(
 # ============================================================
 total_mass = pin.computeTotalMass(model)
 
+# ---------------------------
+# 基座高度 PD
+# ---------------------------
 current_base_height = q[2]
 current_base_vertical_velocity = v[2]
 
 desired_base_height = 0.28
-#desired_base_height = 0.27
-#desired_base_height = 0.26
 desired_base_vertical_velocity = 0.0
 
 height_kp = 50.0
@@ -255,14 +257,51 @@ desired_vertical_acceleration = (
 )
 
 desired_vertical_acceleration = np.clip(
-    desired_vertical_acceleration,
-    -2.0,
-    2.0,
+    desired_vertical_acceleration,-2.0,2.0
 )
 
+# ---------------------------
+# 基座姿态 PD
+# ---------------------------
+current_base_rotation = (
+    pin.XYZQUATToSE3(q[:7]).rotation
+)
+
+desired_base_rotation = np.eye(3)
+
+orientation_error = pin.log3(
+    current_base_rotation.T @ desired_base_rotation
+)
+
+current_base_angular_velocity = v[3:6]
+desired_base_angular_velocity = np.zeros(3)
+
+angular_velocity_error = (
+    desired_base_angular_velocity - current_base_angular_velocity
+)
+
+orientation_kp = 40.0
+orientation_kd = 8.0
+
+desired_angular_acceleration = (
+    orientation_kp * orientation_error + orientation_kd * angular_velocity_error
+)
+desired_angular_acceleration = np.clip(
+    desired_angular_acceleration,
+    -5.0,
+    5.0,
+)
+# ---------------------------
+# 组成基座六维加速度任务
+# ---------------------------
 desired_base_acceleration = np.zeros(6)
+
 desired_base_acceleration[2] = (
     desired_vertical_acceleration
+)
+
+desired_base_acceleration[3:6] = (
+    desired_angular_acceleration
 )
 
 reference_contact_force = np.tile(
