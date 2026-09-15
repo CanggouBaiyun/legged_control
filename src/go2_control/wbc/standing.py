@@ -319,6 +319,7 @@ class StandingWBC:
         desired_base_angular_velocity_local: (
             np.ndarray | None
         ) = None,
+        desired_base_linear_acceleration_world: np.ndarray | None = None,
     ) -> StandingWBCResult:
         """Solve the standing WBC problem at the current state."""
 
@@ -442,6 +443,7 @@ class StandingWBC:
                 desired_angular_velocity_local=(
                     desired_base_angular_velocity_local
                 ),
+                desired_linear_acceleration_world=desired_base_linear_acceleration_world,
                 position_kp=self.position_kp,
                 position_kd=self.position_kd,
                 orientation_kp=self.orientation_kp,

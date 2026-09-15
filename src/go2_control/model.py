@@ -71,6 +71,12 @@ def build_go2_simulation_model(
         str(mjcf_path)
     )
 
+    # Bridge q[:7] is the absolute world pose, not an offset from XML body pos.
+    # The MJCF parser preserves that initial placement (Go2: z=0.445 m).
+    if model.joints[1].nq != 7 or model.joints[1].nv != 6:
+        raise ValueError("Expected a free-flyer root joint")
+    model.jointPlacements[1] = pin.SE3.Identity()
+
     # Pinocchio 的 MJCF 解析器没有把 actuator 的限制
     # 写入 effortLimit 和 velocityLimit。
     # 暂时从官方 URDF 模型按关节名称复制。
@@ -160,4 +166,3 @@ def foot_positions(model: pin.Model, q: np.ndarray) -> dict[str, list[float]]:
         frame_id = model.getFrameId(name)
         positions[name] = data.oMf[frame_id].translation.tolist()
     return positions
-
