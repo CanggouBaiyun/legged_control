@@ -53,6 +53,52 @@ def build_go2_model(urdf_path: Path | None = None) -> pin.Model:
         )
     return pin.buildModelFromUrdf(str(urdf_path), pin.JointModelFreeFlyer())
 
+def build_go2_simulation_model(
+    mjcf_path: Path | None = None,
+) -> pin.Model:
+    """Build simulation dynamics from MJCF and limits from URDF."""
+
+    if mjcf_path is None:
+        mjcf_path = load_model_config()["mjcf"]
+
+    if not mjcf_path.is_file():
+        raise FileNotFoundError(
+            f"Go2 MJCF not found at {mjcf_path}."
+        )
+
+    # 质量、惯量、质心和 armature 来自 MuJoCo MJCF。
+    model = pin.buildModelFromMJCF(
+        str(mjcf_path)
+    )
+
+    # Pinocchio 的 MJCF 解析器没有把 actuator 的限制
+    # 写入 effortLimit 和 velocityLimit。
+    # 暂时从官方 URDF 模型按关节名称复制。
+    urdf_model = build_go2_model()
+
+    for joint_name in GO2_SDK_JOINT_ORDER:
+        simulation_joint = model.joints[
+            model.getJointId(joint_name)
+        ]
+
+        urdf_joint = urdf_model.joints[
+            urdf_model.getJointId(joint_name)
+        ]
+
+        model.effortLimit[
+            simulation_joint.idx_v
+        ] = urdf_model.effortLimit[
+            urdf_joint.idx_v
+        ]
+
+        model.velocityLimit[
+            simulation_joint.idx_v
+        ] = urdf_model.velocityLimit[
+            urdf_joint.idx_v
+        ]
+
+    return model
+
 
 def nominal_configuration(model: pin.Model) -> np.ndarray:
     """Return the official MuJoCo home posture in Pinocchio coordinates."""

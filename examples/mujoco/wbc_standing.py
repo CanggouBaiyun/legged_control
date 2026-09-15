@@ -6,7 +6,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-from go2_control.model import build_go2_model
+from go2_control.model import build_go2_simulation_model
 from go2_control.simulation.mujoco_bridge import (
     MujocoPinocchioBridge,
 )
@@ -41,7 +41,7 @@ mujoco_data = mujoco.MjData(
     mujoco_model
 )
 
-pinocchio_model = build_go2_model()
+pinocchio_model = build_go2_simulation_model()
 
 # ============================================================
 # 2. 恢复 MuJoCo 的 home 初始构型
