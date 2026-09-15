@@ -14,8 +14,9 @@ def compute_base_acceleration_task(
     orientation_kd,
     maximum_linear_acceleration,
     maximum_angular_acceleration,
+    desired_linear_acceleration_world=None,
 ):
-    """Compute the desired floating-base acceleration from pose PD."""
+    """Compute base acceleration from trajectory feedforward and pose PD."""
 
     base_placement = pin.XYZQUATToSE3(q[:7])
     current_position = base_placement.translation.copy()
@@ -43,8 +44,13 @@ def compute_base_acceleration_task(
         desired_linear_velocity_world - current_linear_velocity_world
     )
 
+    if desired_linear_acceleration_world is None:
+        desired_linear_acceleration_world = np.zeros(3)
+
     desired_linear_acceleration_world = (
-        position_kp * position_error_world + position_kd * linear_velocity_error_world
+        np.asarray(desired_linear_acceleration_world)
+        + position_kp * position_error_world
+        + position_kd * linear_velocity_error_world
     )
 
     desired_linear_acceleration_world = np.clip(
