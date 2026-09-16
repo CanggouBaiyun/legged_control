@@ -55,6 +55,17 @@ q, _ = reference.solve(
 
 v = np.zeros(model.nv)
 
+# 记录移重完成后右前脚的位置，作为保持目标。
+pin.forwardKinematics(model, data, q)
+pin.updateFramePlacements(model, data)
+
+swing_foot_name = "FR_foot"
+swing_frame_id = model.getFrameId(swing_foot_name)
+
+desired_swing_position = (
+    data.oMf[swing_frame_id].translation.copy()
+)
+
 #3. 创建三足支撑控制器
 controller = StandingWBC(
     model,
@@ -67,6 +78,8 @@ result = controller.solve(
     v=v,
     desired_base_position=desired_base_position,
     desired_base_rotation=desired_base_rotation,
+    swing_foot_name=swing_foot_name,
+    desired_swing_position=desired_swing_position,
 )
 
 # 5. 输出关键结果。
@@ -134,3 +147,28 @@ print(total_force)
 
 print("\nCOM acceleration from force balance [m/s^2]:")
 print(com_acceleration_world)
+
+
+# 检查 QP 解对应的右前脚线加速度。
+pin.forwardKinematics(
+    model,
+    data,
+    q,
+    v,
+    result.generalized_acceleration,
+)
+
+pin.updateFramePlacements(model, data)
+
+swing_acceleration = pin.getFrameClassicalAcceleration(
+    model,
+    data,
+    swing_frame_id,
+    pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+).linear.copy()
+
+print("\nSwing foot acceleration [m/s^2]:")
+print(swing_acceleration)
+
+print("\nSwing foot acceleration norm:")
+print(np.linalg.norm(swing_acceleration))

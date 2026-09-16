@@ -335,6 +335,8 @@ class StandingWBC:
             np.ndarray | None
         ) = None,
         desired_base_linear_acceleration_world: np.ndarray | None = None,
+        swing_foot_name: str | None = None,
+        desired_swing_position: np.ndarray | None = None,
     ) -> StandingWBCResult:
         """Solve the standing WBC problem at the current state."""
 
@@ -485,9 +487,77 @@ class StandingWBC:
         )
 
         linear_cost = (
-            -self.decision_weights
-            * reference_decision
+            -self.decision_weights * reference_decision
         )
+
+        #保留原来的目标函数，本次求解按需添加摆动脚任务。
+        quadratic_cost = self.quadratic_cost.copy()
+
+        if swing_foot_name is not None:
+            if swing_foot_name in self.contact_frame_names:
+                raise ValueError(
+                    "Swing foot cannot also be a stance foot"
+                )
+
+            if swing_foot_name not in GO2_FOOT_FRAMES:
+                raise ValueError("Unknown swing foot")
+
+            if desired_swing_position is None:
+                raise ValueError(
+                    "Swing foot position target is required"
+                )
+
+            # 1. 计算这只脚的 Jacobian 和 J_dot @ v
+            swing_data = self.model.createData()
+
+            swing_jacobian, swing_bias = (
+                compute_contact_kinematics(
+                    model = self.model,
+                    data = swing_data,
+                    q = q,
+                    v = v,
+                    contact_frame_names=(swing_foot_name,),
+                )
+            )
+
+
+            swing_frame_id = self.model.getFrameId(
+                swing_foot_name
+            )
+
+            current_swing_position = (
+                swing_data.oMf[swing_frame_id].translation.copy()
+            )
+
+            current_swing_velocity = swing_jacobian @ v
+
+            # 2.本步只做位置保持，期望足端速度为零
+            swing_kp = 100.0
+            swing_kd = 20.0
+
+            desired_swing_acceleration = (
+                swing_kp * (np.asarray(desired_swing_position) - current_swing_position)
+                - swing_kd * current_swing_velocity
+            )
+
+            #3.希望 J_swing @ a + bias 接近期望加速度
+            swing_task_matrix = np.zeros((3, self.number_of_decision_variables))
+
+            swing_task_matrix[:, self.acceleration_slice] = swing_jacobian
+            swing_task_target = desired_swing_acceleration - swing_bias
+
+            # 4.把这个跟踪任务加入 QP 目标函数
+            swing_weight = 1e5
+
+            quadratic_cost = (
+                quadratic_cost + sparse.csc_matrix(swing_weight * swing_task_matrix.T @ swing_task_matrix)
+            )
+
+            linear_cost = (
+                linear_cost - swing_weight * swing_task_matrix.T @ swing_task_target
+            )
+
+
 
         # --------------------------------------------
         # 求解 QP
@@ -495,9 +565,7 @@ class StandingWBC:
 
         solution, solver_info = (
             solve_with_osqp(
-                quadratic_cost=(
-                    self.quadratic_cost
-                ),
+                quadratic_cost=quadratic_cost,
                 linear_cost=linear_cost,
                 equality_matrix=equality_matrix,
                 equality_target=equality_target,
