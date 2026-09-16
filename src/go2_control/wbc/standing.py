@@ -39,17 +39,32 @@ class StandingWBCResult:
     solver_iterations: int
 
 class StandingWBC:
-    """Four-foot standing whole-body controller."""
+    """Whole-body controller for a fixed set of stance feet."""
 
     def __init__(
         self,
         model: pin.Model,
+        contact_frame_names=None,
     ):
         self.model = model
 
-        self.contact_frame_names = (
-            GO2_FOOT_FRAMES
-        )
+        #默认仍然使用四足支撑，保持原有例子的行为
+        if contact_frame_names is None:
+            contact_frame_names = GO2_FOOT_FRAMES
+
+        self.contact_frame_names = tuple(contact_frame_names)
+
+        if not self.contact_frame_names:
+            raise ValueError("At least one stance foot is required")
+
+        if len(set(self.contact_frame_names)) != len(
+            self.contact_frame_names
+        ):
+            raise ValueError("Duplicate stance foot names")
+
+        for name in self.contact_frame_names:
+            if name not in GO2_FOOT_FRAMES:
+                raise ValueError(f"Unknown stance foot: {name}")
 
         self.dynamics_data = (
             model.createData()
@@ -154,7 +169,7 @@ class StandingWBC:
             np.array([
                 0.0,
                 0.0,
-                total_mass * 9.81 / 4.0,
+                total_mass * 9.81 / len(self.contact_frame_names),
             ]),
             len(self.contact_frame_names),
         )
@@ -391,7 +406,7 @@ class StandingWBC:
         )
 
         # --------------------------------------------
-        # 四个支撑足加速度为零
+        # 选定支撑足加速度为零
         # --------------------------------------------
         contact_constraint = np.zeros(
             (
