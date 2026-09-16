@@ -102,7 +102,7 @@ pin.updateFramePlacements(model, data)
 
 contact_bias_parts = []
 
-for foot in stance_feet:
+for foot_name in stance_feet:
     foot_id = model.getFrameId(foot_name)
 
     foot_acceleration = pin.getFrameClassicalAcceleration(
