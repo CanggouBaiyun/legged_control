@@ -452,22 +452,21 @@ def run(args):
                         touching.add(g1)
                 rotation = pin.XYZQUATToSE3(q[:7]).rotation
                 tilt_deg = np.rad2deg(np.linalg.norm(pin.rpy.matrixToRpy(rotation)[:2]))
+                fr_actual_force = read_foot_normal_force(
+                    model, data, fr_geom_id, floor_id,
+                )
                 rows.append([
                     t, z_ref, q[2], z_ref - q[2], tilt_deg,
                     np.linalg.norm(q[:2]), np.max(np.abs(controls)),
                     np.max(np.abs(feedback)), len(touching),
                     np.max(np.abs(raw_controls - controls)),
+                    foot_positions_ref[fr_index, 2],
+                    fr_position[2],
+                    fr_actual_force,
                 ])
                 max_dynamics_residual = max(max_dynamics_residual, result.dynamics_residual_norm)
                 max_contact_residual = max(max_contact_residual, result.contact_acceleration_residual_norm)
                 if t >= next_print_time:
-                    fr_actual_force = read_foot_normal_force(
-                        model,
-                        data,
-                        fr_geom_id,
-                        floor_id,
-                    )
-
                     print(
                         f"{t:5.2f}"
                         f" {phase:>6s}"
@@ -523,7 +522,8 @@ def run(args):
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         np.savetxt(args.csv, records, delimiter=",", comments="", header=(
             "time_s,z_ref_m,z_m,z_error_m,tilt_deg,xy_drift_m,"
-            "max_torque_nm,max_feedback_nm,stance_feet,clip_nm"
+            "max_torque_nm,max_feedback_nm,stance_feet,clip_nm,"
+            "fr_ref_z_m,fr_z_m,fr_normal_force_n"
         ))
         args.csv.with_suffix(".json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
@@ -546,7 +546,7 @@ def main():
         args.joint_kd,
     ]
 
-    if not np.isfinite(values).all() or args.duration <= 10.0:
+    if not np.isfinite(values).all() or args.duration <= 19.0:
         parser.error(
             "Expected finite arguments and duration > 19 s"
         )
