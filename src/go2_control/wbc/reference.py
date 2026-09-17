@@ -53,7 +53,34 @@ class FixedFootReference:
     def solve(
         self, base_position, base_rotation, linear_velocity_world,
         angular_velocity_local=None,
+        foot_positions_world=None,
+        foot_velocities_world=None,
     ):
+        #不传足端目标时，沿用初始化时的四脚固定位置
+        target_positions = (
+            self.feet.copy()
+            if foot_positions_world is None
+            else np.array(foot_positions_world, dtype=float, copy=True)
+        )
+        #不传足端速度时，默认四只脚都静止
+        target_velocities = (
+            np.zeros((4,3))
+            if foot_velocities_world is None
+            else np.array(foot_velocities_world, dtype=float, copy=True)
+        )
+
+        if target_positions.shape != (4, 3):
+            raise ValueError("Expected foot_positions_world shape (4, 3)")
+
+        if target_velocities.shape != (4, 3):
+            raise ValueError("Expected foot_velocities_world shape (4, 3)")
+
+        if (
+            not np.isfinite(target_positions).all()
+            or not np.isfinite(target_velocities).all()
+        ):
+            raise ValueError("Foot references must be finite")
+        
         q = self.q.copy()
         q[:3] = base_position
         q[3:7] = pin.Quaternion(base_rotation).coeffs()
@@ -66,7 +93,7 @@ class FixedFootReference:
                 self.data.oMf[frame_id].translation.copy()
                 for frame_id in self.frame_ids
             ])
-            error = (self.feet - positions).ravel()
+            error = (target_positions - positions).ravel()
             jacobian = np.vstack([
                 pin.getFrameJacobian(
                     self.model, self.data, frame_id,
@@ -87,12 +114,18 @@ class FixedFootReference:
         else:
             raise RuntimeError("Fixed-foot IK did not converge within joint limits")
 
-        # Velocity reference: J_b v_b_des + J_j v_j_des = 0.
+        # Velocity reference: J_b v_b_des + J_j v_j_des = v_foot_des.
         v = np.zeros(self.model.nv)
         v[:3] = np.asarray(base_rotation).T @ linear_velocity_world
         if angular_velocity_local is not None:
             v[3:6] = angular_velocity_local
-        v[6:] = np.linalg.solve(jacobian[:, 6:], -jacobian[:, :6] @ v[:6])
+        desired_foot_velocity = target_velocities.ravel()
+
+        v[6:] = np.linalg.solve(
+            jacobian[:, 6:],
+            desired_foot_velocity - jacobian[:, :6] @ v[:6],
+        )
+
         if not np.isfinite(q).all() or not np.isfinite(v).all():
             raise RuntimeError("Non-finite joint reference")
         if np.any(np.abs(v[6:]) > self.model.velocityLimit[6:]):

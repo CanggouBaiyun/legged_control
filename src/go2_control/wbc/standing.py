@@ -39,17 +39,32 @@ class StandingWBCResult:
     solver_iterations: int
 
 class StandingWBC:
-    """Four-foot standing whole-body controller."""
+    """Whole-body controller for a fixed set of stance feet."""
 
     def __init__(
         self,
         model: pin.Model,
+        contact_frame_names=None,
     ):
         self.model = model
 
-        self.contact_frame_names = (
-            GO2_FOOT_FRAMES
-        )
+        #默认仍然使用四足支撑，保持原有例子的行为
+        if contact_frame_names is None:
+            contact_frame_names = GO2_FOOT_FRAMES
+
+        self.contact_frame_names = tuple(contact_frame_names)
+
+        if not self.contact_frame_names:
+            raise ValueError("At least one stance foot is required")
+
+        if len(set(self.contact_frame_names)) != len(
+            self.contact_frame_names
+        ):
+            raise ValueError("Duplicate stance foot names")
+
+        for name in self.contact_frame_names:
+            if name not in GO2_FOOT_FRAMES:
+                raise ValueError(f"Unknown stance foot: {name}")
 
         self.dynamics_data = (
             model.createData()
@@ -154,7 +169,7 @@ class StandingWBC:
             np.array([
                 0.0,
                 0.0,
-                total_mass * 9.81 / 4.0,
+                total_mass * 9.81 / len(self.contact_frame_names),
             ]),
             len(self.contact_frame_names),
         )
@@ -320,6 +335,11 @@ class StandingWBC:
             np.ndarray | None
         ) = None,
         desired_base_linear_acceleration_world: np.ndarray | None = None,
+        swing_foot_name: str | None = None,
+        desired_swing_position: np.ndarray | None = None,
+        desired_swing_velocity: np.ndarray | None = None,
+        desired_swing_acceleration: np.ndarray | None = None,
+        normal_force_upper_bounds: np.ndarray | None = None,
     ) -> StandingWBCResult:
         """Solve the standing WBC problem at the current state."""
 
@@ -391,7 +411,7 @@ class StandingWBC:
         )
 
         # --------------------------------------------
-        # 四个支撑足加速度为零
+        # 选定支撑足加速度为零
         # --------------------------------------------
         contact_constraint = np.zeros(
             (
@@ -470,9 +490,118 @@ class StandingWBC:
         )
 
         linear_cost = (
-            -self.decision_weights
-            * reference_decision
+            -self.decision_weights * reference_decision
         )
+
+        #保留原来的目标函数，本次求解按需添加摆动脚任务。
+        quadratic_cost = self.quadratic_cost.copy()
+
+        if swing_foot_name is not None:
+            if swing_foot_name in self.contact_frame_names:
+                raise ValueError(
+                    "Swing foot cannot also be a stance foot"
+                )
+
+            if swing_foot_name not in GO2_FOOT_FRAMES:
+                raise ValueError("Unknown swing foot")
+
+            if desired_swing_position is None:
+                raise ValueError(
+                    "Swing foot position target is required"
+                )
+
+            # 1. 计算这只脚的 Jacobian 和 J_dot @ v
+            swing_data = self.model.createData()
+
+            swing_jacobian, swing_bias = (
+                compute_contact_kinematics(
+                    model = self.model,
+                    data = swing_data,
+                    q = q,
+                    v = v,
+                    contact_frame_names=(swing_foot_name,),
+                )
+            )
+
+
+            swing_frame_id = self.model.getFrameId(
+                swing_foot_name
+            )
+
+            current_swing_position = (
+                swing_data.oMf[swing_frame_id].translation.copy()
+            )
+
+            current_swing_velocity = swing_jacobian @ v
+
+            # 2.轨迹加速度前馈 + 足端位置、速度反馈。
+            if desired_swing_velocity is None:
+                desired_swing_velocity = np.zeros(3)
+
+            if desired_swing_acceleration is None:
+                desired_swing_acceleration = np.zeros(3)
+
+            swing_kp = 100.0
+            swing_kd = 20.0
+
+            swing_task_acceleration = (
+                np.asarray(desired_swing_acceleration) + swing_kp * (np.asarray(desired_swing_position) - current_swing_position)
+                + swing_kd * (np.asarray(desired_swing_velocity) - current_swing_velocity)
+            )
+
+            #3.希望 J_swing @ a + bias 接近期望加速度
+            swing_task_matrix = np.zeros((3, self.number_of_decision_variables))
+
+            swing_task_matrix[:, self.acceleration_slice] = swing_jacobian
+            swing_task_target = swing_task_acceleration - swing_bias
+
+            # 4.把这个跟踪任务加入 QP 目标函数
+            swing_weight = 1e5
+
+            quadratic_cost = (
+                quadratic_cost + sparse.csc_matrix(swing_weight * swing_task_matrix.T @ swing_task_matrix)
+            )
+
+            linear_cost = (
+                linear_cost - swing_weight * swing_task_matrix.T @ swing_task_target
+            )
+
+        #本次求解使用的上限， 不修改控制器保存的默认值
+        inequality_upper_bound = (
+            self.inequality_upper_bound.copy()
+        )
+
+        if normal_force_upper_bounds is not None:
+            limits = np.asarray(
+                normal_force_upper_bounds,
+                dtype=float,
+            )
+
+            number_of_feet = len(self.contact_frame_names)
+
+            if limits.shape != (number_of_feet,):
+                raise ValueError(
+                    "Expected one normal-force limit per stance foot"
+                )
+
+            if not np.isfinite(limits).all():
+                raise ValueError("Force limits must be finite")
+
+            if np.any(limits < 0.0):
+                raise ValueError("Force limits must be nonnegative")
+
+            if np.any(limits > self.maximum_normal_force):
+                raise ValueError(
+                    "Force limits cannot exceed the configured maximum"
+                )
+
+            #每只脚有5行摩擦/法向力约束
+            #每5行是0 <= fz <= maximum_normal_force
+            normal_force_rows = (
+                5 * np.arange(number_of_feet) + 4
+            )
+
+            inequality_upper_bound[normal_force_rows] = limits
 
         # --------------------------------------------
         # 求解 QP
@@ -480,9 +609,7 @@ class StandingWBC:
 
         solution, solver_info = (
             solve_with_osqp(
-                quadratic_cost=(
-                    self.quadratic_cost
-                ),
+                quadratic_cost=quadratic_cost,
                 linear_cost=linear_cost,
                 equality_matrix=equality_matrix,
                 equality_target=equality_target,
@@ -492,9 +619,7 @@ class StandingWBC:
                 inequality_lower_bound=(
                     self.inequality_lower_bound
                 ),
-                inequality_upper_bound=(
-                    self.inequality_upper_bound
-                ),
+                inequality_upper_bound=inequality_upper_bound,
             )
         )
 
