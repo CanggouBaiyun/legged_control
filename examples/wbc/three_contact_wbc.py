@@ -62,9 +62,16 @@ pin.updateFramePlacements(model, data)
 swing_foot_name = "FR_foot"
 swing_frame_id = model.getFrameId(swing_foot_name)
 
-desired_swing_position = (
+current_swing_position = (
     data.oMf[swing_frame_id].translation.copy()
 )
+
+lift_height = 0.03
+
+desired_swing_position = (
+    current_swing_position + np.array([0.0, 0.0, lift_height])
+)
+
 
 #3. 创建三足支撑控制器
 controller = StandingWBC(
@@ -172,3 +179,21 @@ print(swing_acceleration)
 
 print("\nSwing foot acceleration norm:")
 print(np.linalg.norm(swing_acceleration))
+
+
+
+# 与 standing.py 中当前的 swing_kp 保持一致。
+swing_kp = 100.0
+
+expected_swing_acceleration = (
+    swing_kp * (desired_swing_position - current_swing_position)
+)
+
+print("\nDesired foot displacement [m]:")
+print(desired_swing_position - current_swing_position)
+
+print("\nExpected swing acceleration [m/s^2]:")
+print(expected_swing_acceleration)
+
+print("\nSwing acceleration tracking error [m/s^2]:")
+print(swing_acceleration - expected_swing_acceleration)

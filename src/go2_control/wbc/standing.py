@@ -337,6 +337,8 @@ class StandingWBC:
         desired_base_linear_acceleration_world: np.ndarray | None = None,
         swing_foot_name: str | None = None,
         desired_swing_position: np.ndarray | None = None,
+        desired_swing_velocity: np.ndarray | None = None,
+        desired_swing_acceleration: np.ndarray | None = None,
     ) -> StandingWBCResult:
         """Solve the standing WBC problem at the current state."""
 
@@ -531,20 +533,26 @@ class StandingWBC:
 
             current_swing_velocity = swing_jacobian @ v
 
-            # 2.本步只做位置保持，期望足端速度为零
+            # 2.轨迹加速度前馈 + 足端位置、速度反馈。
+            if desired_swing_velocity is None:
+                desired_swing_velocity = np.zeros(3)
+
+            if desired_swing_acceleration is None:
+                desired_swing_acceleration = np.zeros(3)
+
             swing_kp = 100.0
             swing_kd = 20.0
 
-            desired_swing_acceleration = (
-                swing_kp * (np.asarray(desired_swing_position) - current_swing_position)
-                - swing_kd * current_swing_velocity
+            swing_task_acceleration = (
+                np.asarray(desired_swing_acceleration) + swing_kp * (np.asarray(desired_swing_position) - current_swing_position)
+                + swing_kd * (np.asarray(desired_swing_velocity) - current_swing_velocity)
             )
 
             #3.希望 J_swing @ a + bias 接近期望加速度
             swing_task_matrix = np.zeros((3, self.number_of_decision_variables))
 
             swing_task_matrix[:, self.acceleration_slice] = swing_jacobian
-            swing_task_target = desired_swing_acceleration - swing_bias
+            swing_task_target = swing_task_acceleration - swing_bias
 
             # 4.把这个跟踪任务加入 QP 目标函数
             swing_weight = 1e5
