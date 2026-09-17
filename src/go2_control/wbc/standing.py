@@ -339,6 +339,7 @@ class StandingWBC:
         desired_swing_position: np.ndarray | None = None,
         desired_swing_velocity: np.ndarray | None = None,
         desired_swing_acceleration: np.ndarray | None = None,
+        normal_force_upper_bounds: np.ndarray | None = None,
     ) -> StandingWBCResult:
         """Solve the standing WBC problem at the current state."""
 
@@ -565,7 +566,42 @@ class StandingWBC:
                 linear_cost - swing_weight * swing_task_matrix.T @ swing_task_target
             )
 
+        #本次求解使用的上限， 不修改控制器保存的默认值
+        inequality_upper_bound = (
+            self.inequality_upper_bound.copy()
+        )
 
+        if normal_force_upper_bounds is not None:
+            limits = np.asarray(
+                normal_force_upper_bounds,
+                dtype=float,
+            )
+
+            number_of_feet = len(self.contact_frame_names)
+
+            if limits.shape != (number_of_feet,):
+                raise ValueError(
+                    "Expected one normal-force limit per stance foot"
+                )
+
+            if not np.isfinite(limits).all():
+                raise ValueError("Force limits must be finite")
+
+            if np.any(limits < 0.0):
+                raise ValueError("Force limits must be nonnegative")
+
+            if np.any(limits > self.maximum_normal_force):
+                raise ValueError(
+                    "Force limits cannot exceed the configured maximum"
+                )
+
+            #每只脚有5行摩擦/法向力约束
+            #每5行是0 <= fz <= maximum_normal_force
+            normal_force_rows = (
+                5 * np.arange(number_of_feet) + 4
+            )
+
+            inequality_upper_bound[normal_force_rows] = limits
 
         # --------------------------------------------
         # 求解 QP
@@ -583,9 +619,7 @@ class StandingWBC:
                 inequality_lower_bound=(
                     self.inequality_lower_bound
                 ),
-                inequality_upper_bound=(
-                    self.inequality_upper_bound
-                ),
+                inequality_upper_bound=inequality_upper_bound,
             )
         )
 

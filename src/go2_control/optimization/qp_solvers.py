@@ -47,9 +47,19 @@ def solve_with_osqp(
         u=upper_bound,
         verbose=False,
         polishing=True,
+        max_iter=20000,
     )
 
     result = solver.solve()
+
+    if result.info.status.lower() != "solved":
+        print(
+            "[OSQP diagnostic] "
+            f"status={result.info.status}, "
+            f"iterations={result.info.iter}, "
+            f"primal_residual={result.info.prim_res:.3e}, "
+            f"dual_residual={result.info.dual_res:.3e}"
+        )
 
     if not result.info.status.lower().startswith("solved"):
         raise RuntimeError(
