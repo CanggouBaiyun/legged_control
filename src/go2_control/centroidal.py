@@ -77,3 +77,83 @@ def pinocchio_from_state(model ,data, state, joint_velocities):
     )
 
     return q, v
+
+def centroidal_dynamics(model, data, state, control):
+    """计算完整质心模型的状态导数， 接触力采用世界坐标系"""
+    state = np.asarray(state, dtype=float)
+    control = np.asarray(control, dtype=float)
+
+    if state.shape != (24,) or control.shape != (24,):
+        raise ValueError("Expected state and control with shape (24,)")
+
+    if not np.all(np.isfinite(state)) or not np.all(np.isfinite(control)):
+        raise ValueError("State and control must contain finite values")
+
+    # 1.输入前12维四足三维接触力，后12维是关节速度
+    contact_names = (
+        "FR_foot",
+        "FL_foot",
+        "RR_foot",
+        "RL_foot",
+    )
+    contact_forces = control[:12].reshape(4,3)
+    joint_velocities = control[12:]
+
+    # 2. 从状态和关节速度恢复完整的q、v
+    q, v = pinocchio_from_state(model, data, state, joint_velocities)
+    mass = pin.computeTotalMass(model)
+
+    # 3. 在当前构型下，重新计算质心和足端位置
+    com_position = pin.centerOfMass(model, data, q).copy()
+
+    pin.forwardKinematics(model, data, q)
+    pin.updateFramePlacements(model, data)
+
+    # 4. 外力决定线动量变化率，绕质心的力矩决定角动量变化率
+    linear_momentum_rate = (
+        np.sum(contact_forces, axis=0) + mass * model.gravity.linear
+    )
+
+    angular_momentum_rate = np.zeros(3)
+
+    for name, force in zip(contact_names, contact_forces):
+        frame_id = model.getFrameId(name)
+
+        if frame_id >= model.nframes:
+            raise ValueError(f"Unknown contact frame: {name}")
+
+        foot_position = data.oMf[frame_id].translation
+        lever_arm = foot_position - com_position
+        angular_momentum_rate += np.cross(lever_arm, force)
+
+    # 5. 身体系基座线速度转换为世界系位置导数
+    rotation = pin.XYZQUATToSE3(q[:7]).rotation
+    base_position_rate = rotation @ v[:3]
+
+    # 6. 身体系角速度转换为ZYX欧拉角导数
+    yaw, pitch, roll = state[9:12]
+
+    if abs(np.cos(pitch)) < 1e-6:
+        raise ValueError("ZYX Euler angles are near a singular configuration")
+
+    euler_rate_to_body_omega = np.array([
+        [-np.sin(pitch), 0.0, 1.0],
+        [np.sin(roll) * np.cos(pitch), np.cos(roll), 0.0],
+        [np.cos(roll) * np.cos(pitch), -np.sin(roll), 0.0],
+    ])
+
+    orientation_rate = np.linalg.solve(
+        euler_rate_to_body_omega,
+        v[3:6],
+    )
+
+    # 7. 按状态的排列顺序，组装状态导数。
+    state_rate = np.zeros(24)
+    state_rate[:3] = linear_momentum_rate / mass
+    state_rate[3:6] = angular_momentum_rate / mass
+    state_rate[6:9] = base_position_rate
+    state_rate[9:12] = orientation_rate
+    state_rate[12:] = joint_velocities
+
+
+    return state_rate

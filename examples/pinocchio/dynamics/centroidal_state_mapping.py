@@ -11,6 +11,7 @@ from go2_control.centroidal import (
     get_joint_indices,
     state_from_pinocchio,
     pinocchio_from_state,
+    centroidal_dynamics,
 )
 
 model = build_go2_simulation_model()
@@ -58,3 +59,45 @@ print(np.linalg.norm(velocity_error))
 assert np.linalg.norm(configuration_error) < 1e-10
 assert np.linalg.norm(velocity_error) < 1e-10
 
+# 构造测试输入：四脚均分重力，关节速度沿用当前值
+mass = pin.computeTotalMass(model)
+
+control = np.zeros(24)
+contact_forces = control[:12].reshape(4, 3)
+contact_forces[:, 2] = mass * abs(model.gravity.linear[2]) / 4.0
+control[12:] = v[v_indices]
+
+state_rate = centroidal_dynamics(
+    model, data, state, control
+)
+
+print("\nState derivative shape:")
+print(state_rate.shape)
+
+print("\nNormalized momentum rate:")
+print(state_rate[:6])
+
+# 验证后十八维：位置、姿态、关节角的导数。
+# 用原始 q、v 做一个很小的构型积分，再通过正运动学状态转换比较
+dt = 1e-7
+q_next = pin.integrate(model, q, v * dt)
+
+state_next = state_from_pinocchio(
+    model, data, q_next, v
+)
+
+finite_difference = (
+    state_next[6:] - state[6:]
+) / dt
+
+kinematic_error = np.linalg.norm(
+    finite_difference - state_rate[6:]
+)
+
+print("\nKinematic derivative error norm:")
+print(kinematic_error)
+
+assert state_rate.shape == (24,)
+assert np.all(np.isfinite(state_rate))
+assert np.linalg.norm(state_rate[:3]) < 1e-10
+assert kinematic_error < 1e-6
