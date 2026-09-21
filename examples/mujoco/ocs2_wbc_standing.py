@@ -8,6 +8,9 @@ import subprocess
 
 import mujoco
 import numpy as np
+import mujoco
+import mujoco.viewer
+
 
 from go2_control.centroidal import (
     pinocchio_from_state,
@@ -70,6 +73,29 @@ def evaluate_policy(times, states, inputs, stamp):
     ])
     return state, control
 
+def standing_height_goal(time):
+    """Smooth height goal: hold, lower, hold, rise, hold."""
+
+    def smooth_progress(s):
+        s = np.clip(s, 0.0, 1.0)
+        return 10.0 * s**3 - 15.0 * s**4 + 6.0 * s**5
+
+    if time < 5.0:
+        return 0.28
+
+    if time < 8.0:
+        progress = smooth_progress((time - 5.0) / 3.0)
+        return 0.28 - 0.01 * progress
+
+    if time < 12.0:
+        return 0.27
+
+    if time < 15.0:
+        progress = smooth_progress((time - 12.0) / 3.0)
+        return 0.27 + 0.01 * progress
+
+    return 0.28
+
 def main():
     root = Path(__file__).resolve().parents[2]
     scene = root / "third_party/unitree_mujoco/unitree_robots/go2/scene.xml"
@@ -94,6 +120,20 @@ def main():
     target[:6] = 0.0
     target[8] = 0.28
 
+    # 每0.05s提供一个目标节点，覆盖整个20s实验
+    target_times = np.linspace(0.0, 20.0, 401)
+
+    target_states = np.repeat(
+        target[np.newaxis, :],
+        len(target_times),
+        axis = 0,
+    )
+
+    target_states[:, 8] = np.array([
+        standing_height_goal(stamp)
+        for stamp in target_times
+    ])
+
     # 子进程单独加载 ROS 环境，不污染当前 Conda 进程。
     transport = root / "examples/ocs2/standing_mpc_transport.py"
     command = (
@@ -116,13 +156,31 @@ def main():
     last_control = np.zeros(24)
     next_print = 0.0
     clipped_steps = 0
+    viewer = None
     predicted_next_z = None
     prediction_error_mm = float("nan")
 
     try:
+        viewer = mujoco.viewer.launch_passive(
+            mj_model,
+            mj_data,
+        )
+
+        # 镜头看向机器人。
+        viewer.cam.lookat[:] = mj_data.qpos[:3]
+        viewer.cam.distance = 1.2
+        viewer.cam.azimuth = 135
+        viewer.cam.elevation = -20
+        viewer.sync()
+
         for step in range(total_steps):
+            if not viewer.is_running():
+                break
+
             # A. 实测状态：来自 MuJoCo，不来自 MPC 预测。
             q, v = bridge.state(mj_data)
+            # 当前目标用于日志；完整时间表在首次请求时交给 MPC。
+            target[8] = standing_height_goal(mj_data.time)
 
             if (
                 not np.isfinite(q).all()
@@ -153,6 +211,8 @@ def main():
                         "state": state.tolist(),
                         "input": observation_input.tolist(),
                         "target": target.tolist(),
+                        "target_times": target_times.tolist(),
+                        "target_states": target_states.tolist(),
                     },
                 )
 
@@ -310,6 +370,7 @@ def main():
 
             # E. 执行力矩，推进真实的仿真动力学。
             mujoco.mj_step(mj_model, mj_data)
+            viewer.sync()
 
         print("\nFinal base position:", mj_data.qpos[:3])
         print("Clipped steps:", clipped_steps)
@@ -317,6 +378,8 @@ def main():
     finally:
         # 出错时停止推进仿真，而不是继续执行旧策略。
         mj_data.ctrl[:] = 0.0
+        if viewer is not None:
+            viewer.close()
         process.terminate()
         try:
             process.wait(timeout=3.0)

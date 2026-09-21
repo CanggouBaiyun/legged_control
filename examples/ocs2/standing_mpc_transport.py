@@ -49,15 +49,35 @@ def main():
                     if not reset_client.wait_for_service(timeout_sec=10.0):
                         raise RuntimeError("MPC reset service is unavailable")
 
+                    # 支持完整目标时间表，同时保留固定目标请求的兼容性。
+                    target_times = request.get(
+                        "target_times", [stamp, stamp + 1.0]
+                    )
+                    target_states = request.get(
+                        "target_states",
+                        [request["target"], request["target"]],
+                    )
+
+                    if (
+                        len(target_times) < 2
+                        or len(target_times) != len(target_states)
+                        or any(len(state) != 24 for state in target_states)
+                        or any(
+                            second <= first
+                            for first, second in zip(
+                                target_times[:-1], target_times[1:]
+                            )
+                        )
+                    ):
+                        raise ValueError("Invalid target trajectory")
+
                     target = MpcTargetTrajectories()
-                    target.time_trajectory = [stamp, stamp + 1.0]
+                    target.time_trajectory = target_times
                     target.state_trajectory = [
-                        MpcState(value=request["target"]),
-                        MpcState(value=request["target"]),
+                        MpcState(value=state) for state in target_states
                     ]
                     target.input_trajectory = [
-                        MpcInput(value=[0.0] * 24),
-                        MpcInput(value=[0.0] * 24),
+                        MpcInput(value=[0.0] * 24) for _ in target_times
                     ]
 
                     reset_request = Reset.Request()
