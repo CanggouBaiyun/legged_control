@@ -112,10 +112,12 @@ def main():
 
     dt = mj_model.opt.timestep
     steps_per_policy = max(1, round(0.02 / dt))
-    total_steps = round(5.0 / dt)
+    total_steps = round(20.0 / dt)
     last_control = np.zeros(24)
     next_print = 0.0
     clipped_steps = 0
+    predicted_next_z = None
+    prediction_error_mm = float("nan")
 
     try:
         for step in range(total_steps):
@@ -130,6 +132,11 @@ def main():
                 raise RuntimeError("Invalid state or unsafe base height")
 
             if step % steps_per_policy == 0:
+                if predicted_next_z is not None:
+                    prediction_error_mm = (
+                        q[2] - predicted_next_z
+                    ) * 1000.0
+
                 state = state_from_pinocchio(model, mapping_data, q, v)
 
                 observation_input = last_control.copy()
@@ -149,6 +156,17 @@ def main():
                     },
                 )
 
+                next_policy_time = (
+                    mj_data.time + steps_per_policy * dt
+                )
+
+                predicted_next_z = float(np.interp(
+                    next_policy_time,
+                    times,
+                    states[:, 8],
+                ))
+
+
             # B. 用当前仿真时间取得 MPC 参考。
             state_ref, input_ref = evaluate_policy(
                 times, states, inputs, mj_data.time
@@ -163,6 +181,50 @@ def main():
                 input_ref,
                 wbc.contact_frame_names,
             )
+
+            # 同一条策略上，用参考基座世界系速度的变化估计加速度
+            acceleration_interval = 0.005
+            future_time = mj_data.time + acceleration_interval
+
+            if future_time > times[-1]:
+                raise RuntimeError(
+                    "Policy does not cover acceleration estimation"
+                )
+
+            future_state_ref, future_input_ref = evaluate_policy(
+                times,
+                states,
+                inputs,
+                future_time,
+            )
+
+            future_reference = standing_reference_from_mpc(
+                model,
+                mapping_data,
+                q,
+                future_state_ref,
+                future_input_ref,
+                wbc.contact_frame_names,
+            )
+
+            current_velocity_world = reference[
+                "desired_base_linear_velocity_world"
+            ]
+
+            future_velocity_world = future_reference[
+                "desired_base_linear_velocity_world"
+            ]
+
+            acceleration_ff_world = (
+                future_velocity_world - current_velocity_world
+            ) / acceleration_interval
+
+            if not np.isfinite(acceleration_ff_world).all():
+                raise RuntimeError(
+                    "Non-finite base acceleration feedforward"
+                )
+
+            reference["desired_base_linear_acceleration_world"] = acceleration_ff_world
 
             # C. WBC 必须用实测 q、v 求解。
             result = wbc.solve(q=q, v=v, **reference)
@@ -199,14 +261,51 @@ def main():
             mj_data.ctrl[:] = limited
 
             if mj_data.time >= next_print:
+                lookahead_time = mj_data.time + 0.2
+                if lookahead_time > times[-1]:
+                    raise RuntimeError(
+                        "Policy does not cover the 0.2 s diagnostic lookahead"
+                    )
+
+                future_z = float(np.interp(
+                    lookahead_time,
+                    times,
+                    states[:, 8],
+                ))
+
+                # MuJoCo 浮动基线速度在世界坐标系表达。
+                actual_vz = float(mj_data.qvel[2])
+
+                # 适配器已将参考基座线速度转换到世界坐标系。
+                reference_vz = float(
+                    reference["desired_base_linear_velocity_world"][2]
+                )
+
+                # 世界系竖直接触合力 [N]：MPC 参考与 WBC 求解值。
+                # 两者都不是 MuJoCo 实际测得的接触力。
+                mpc_fz = float(
+                    np.sum(input_ref[:12].reshape(4, 3)[:, 2])
+                )
+                wbc_fz = float(
+                    np.sum(result.contact_forces[:, 2])
+                )
+
                 print(
                     f"t={mj_data.time:5.2f} "
-                    f"z_ref={state_ref[8]:.4f} "
+                    f"goal={target[8]:.4f} "
                     f"z={q[2]:.4f} "
-                    f"max_tau={np.max(np.abs(limited)):.3f} "
-                    f"QP={result.solver_status}",
+                    f"plan+0.2={future_z:.4f} "
+                    f"plan_end={states[-1, 8]:.4f} "
+                    f"horizon={times[-1] - mj_data.time:.2f} "
+                    f"vz_ref={reference_vz:+.5f} "
+                    f"vz={actual_vz:+.5f} "
+                    f"pred_err_mm={prediction_error_mm:+.3f} "
+                    f"mpc_fz={mpc_fz:.3f} "
+                    f"wbc_fz={wbc_fz:.3f} "
+                    f"az_ff={acceleration_ff_world[2]:+.3f}",
                     flush=True,
                 )
+
                 next_print += 1.0
 
             # E. 执行力矩，推进真实的仿真动力学。
