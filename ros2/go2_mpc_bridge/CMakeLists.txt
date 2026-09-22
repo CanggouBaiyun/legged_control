@@ -17,6 +17,8 @@ find_package(OpenMP REQUIRED COMPONENTS CXX)
 find_package(Threads REQUIRED)
 
 find_package(ocs2_ros_interfaces REQUIRED)
+find_package(ocs2_msgs REQUIRED)
+
 
 add_executable(
   mrt_interface_check
@@ -29,8 +31,20 @@ ament_target_dependencies(
     ocs2_ros_interfaces
 )
 
+add_executable(
+  mrt_policy_check
+  src/mrt_policy_check.cpp
+)
+
+ament_target_dependencies(
+  mrt_policy_check
+  rclcpp
+  ocs2_ros_interfaces
+  ocs2_msgs
+)
+
 install(
-  TARGETS mrt_interface_check
+  TARGETS mrt_interface_check mrt_policy_check
   DESTINATION lib/${PROJECT_NAME}
 )
 
