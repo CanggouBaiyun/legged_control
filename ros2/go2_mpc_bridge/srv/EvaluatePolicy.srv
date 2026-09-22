@@ -1,0 +1,17 @@
+# 请求：明确指定策略，防止用错 reset 之前或更新后的策略。
+uint64 reset_epoch
+uint64 policy_sequence
+
+# 查询时刻，以及当前测量的MPC状态
+float64 time
+float64[24] current_state
+---
+# 响应：失败时不得使用下面的参考值
+bool success
+string error 
+
+uint64 reset_epoch
+uint64 policy_sequence
+float64[24] state_reference
+float64[24] input_reference
+uint64 mode
