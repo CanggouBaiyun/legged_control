@@ -1,5 +1,6 @@
 """ROS transport for synchronized, simulation-only standing integration."""
 import json
+import math
 import sys
 import time
 
@@ -12,6 +13,101 @@ from ocs2_msgs.msg import (
     MpcTargetTrajectories,
 )
 from ocs2_msgs.srv import Reset
+from go2_mpc_bridge.srv import EvaluatePolicy
+
+
+def query_mrt(node, client, policy, stamp, current_state):
+    """Query the exact selected policy; never substitute another policy."""
+
+    if (
+        not math.isfinite(stamp)
+        or len(current_state) != 24
+        or not all(math.isfinite(value) for value in current_state)
+    ):
+        raise ValueError("Invalid MRT query state or time")
+
+    times = policy.time_trajectory
+    start_time = float(times[0])
+    end_time = float(times[-1])
+    time_tolerance = 1e-6
+    if (
+    stamp < start_time - time_tolerance
+    or stamp > end_time + time_tolerance
+    ):
+        raise RuntimeError(
+            f"MRT query outside policy: "
+            f"query={stamp:.12f}, "
+            f"start={start_time:.12f}, "
+            f"end={end_time:.12f}, "
+            f"epoch={policy.reset_epoch}, "
+            f"sequence={policy.policy_sequence}"
+        )
+
+    # 只修正容差以内的边界偏差，不允许真正越界。
+    query_time = min(max(stamp, start_time), end_time)
+
+    if not client.wait_for_service(timeout_sec=3.0):
+        raise RuntimeError("MRT service is unavailable")
+
+    query = EvaluatePolicy.Request()
+    query.reset_epoch = policy.reset_epoch
+    query.policy_sequence = policy.policy_sequence
+    query.time = query_time
+    query.current_state = current_state
+
+    # 两个订阅者可能先后收到同一条消息，允许短暂等待缓存就绪。
+    deadline = time.monotonic() + 3.0
+
+    while time.monotonic() < deadline:
+        future = client.call_async(query)
+
+        rclpy.spin_until_future_complete(
+            node,
+            future,
+            timeout_sec=min(1.0, max(0.0, deadline - time.monotonic())),
+        )
+
+        if not future.done():
+            future.cancel()
+            raise RuntimeError("MRT service response timed out")
+
+        response = future.result()
+        if response is None:
+            raise RuntimeError("MRT returned no response")
+
+        if not response.success:
+            if response.error == "Requested policy is not cached":
+                rclpy.spin_once(node, timeout_sec=0.01)
+                continue
+            raise RuntimeError(response.error)
+
+        if (
+            response.reset_epoch != query.reset_epoch
+            or response.policy_sequence != query.policy_sequence
+            or response.mode != 15
+        ):
+            raise RuntimeError("MRT response policy ID or mode mismatch")
+
+        state = list(response.state_reference)
+        control = list(response.input_reference)
+
+        if (
+            len(state) != 24
+            or len(control) != 24
+            or not all(math.isfinite(value) for value in state + control)
+        ):
+            raise RuntimeError("Invalid MRT reference")
+
+        return {
+            "reset_epoch": response.reset_epoch,
+            "policy_sequence": response.policy_sequence,
+            "state": state,
+            "input": control,
+            "mode": response.mode,
+        }
+
+    raise RuntimeError("Selected policy was not available in MRT cache")
+
 
 def main():
     rclpy.init()
@@ -34,16 +130,41 @@ def main():
         "/legged_robot_mpc_reset",
     )
 
+    mrt_client = node.create_client(
+        EvaluatePolicy,
+        "/go2_mpc/evaluate_policy"
+    )
+
     epoch = None
     last_sequence = -1
+    selected_policy = None
 
     try:
         # 每行 JSON 是仿真端发来的一次请求。
         for line in sys.stdin:
             try:
                 request = json.loads(line)
+                action = request.get("action", "plan")
                 stamp = float(request["time"])
 
+                if action == "evaluate":
+                    if selected_policy is None:
+                        raise RuntimeError("Request a policy before querying MRT")
+
+                    output = query_mrt(
+                        node,
+                        mrt_client,
+                        selected_policy,
+                        stamp,
+                        request["state"],
+                    )
+
+                    print(json.dumps(output, allow_nan=False), flush=True)
+                    continue
+
+                if action != "plan":
+                    raise ValueError(f"Unknown request action: {action}")
+                
                 # 第一次请求：用站立目标初始化 MPC。
                 if epoch is None:
                     if not reset_client.wait_for_service(timeout_sec=10.0):
@@ -161,6 +282,7 @@ def main():
                             for item in policy.data
                         ],
                     }
+                    selected_policy = policy
                     last_sequence = policy.policy_sequence
                     break
 

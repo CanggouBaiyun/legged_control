@@ -22,8 +22,8 @@ from go2_control.simulation.mujoco_bridge import MujocoPinocchioBridge
 from go2_control.wbc import StandingWBC
 from go2_control.wbc.reference import joint_pd_feedback
 
-def request_policy(process, message):
-    """Send measured state; wait while simulation time is paused."""
+def request_transport(process, message):
+    """Send one request to the ROS subprocess and receive its response."""
     process.stdin.write(json.dumps(message, allow_nan=False) + "\n")
     process.stdin.flush()
 
@@ -38,7 +38,12 @@ def request_policy(process, message):
     reply = json.loads(line)
     if "error" in reply:
         raise RuntimeError(reply["error"])
+    return reply
 
+def request_policy(process, message):
+    """Request a fresh MPC policy."""
+    reply = request_transport(process, message)
+    
     times = np.asarray(reply["times"], dtype=float)
     states = np.asarray(reply["states"], dtype=float)
     inputs = np.asarray(reply["inputs"], dtype=float)
@@ -52,25 +57,37 @@ def request_policy(process, message):
         or not np.isfinite(states).all()
         or not np.isfinite(inputs).all()
         or not np.all(np.diff(times) > 0.0)
+        or not np.any(np.diff(times) > 0.0)
     ):
         raise RuntimeError("Invalid standing policy arrays")
 
     return times, states, inputs
 
 
-def evaluate_policy(times, states, inputs, stamp):
-    """Interpolate a feedforward stance policy at simulation time."""
-    if stamp < times[0] - 1e-6 or stamp > times[-1]:
-        raise RuntimeError("Attempted to use an expired/out-of-range policy")
+def evaluate_policy(process, stamp, current_state):
+    """Obtain references from the C++ MRT service."""
 
-    state = np.array([
-        np.interp(stamp, times, states[:, index])
-        for index in range(24)
-    ])
-    control = np.array([
-        np.interp(stamp, times, inputs[:, index])
-        for index in range(24)
-    ])
+    reply = request_transport(
+        process,
+        {
+            "action": "evaluate",
+            "time": float(stamp),
+            "state": current_state.tolist(),
+        },
+    )
+
+    state = np.asarray(reply["state"], dtype=float)
+    control = np.asarray(reply["input"], dtype=float)
+
+    if (
+        reply["mode"] != 15
+        or state.shape != (24,)
+        or control.shape != (24,)
+        or not np.isfinite(state).all()
+        or not np.isfinite(control).all()
+    ):
+        raise RuntimeError("Invalid reference returned by MRT")
+
     return state, control
 
 def standing_height_goal(time):
@@ -137,10 +154,11 @@ def main():
     # 子进程单独加载 ROS 环境，不污染当前 Conda 进程。
     transport = root / "examples/ocs2/standing_mpc_transport.py"
     command = (
-        "source /opt/ros/jazzy/setup.bash && "
-        "source /home/bot/Project/ocs2_ws/install/setup.bash && "
-        "export RCUTILS_LOGGING_USE_STDOUT=0 && "
-        f"exec /usr/bin/python3 {shlex.quote(str(transport))}"
+    "source /opt/ros/jazzy/setup.bash && "
+    "source /home/bot/Project/ocs2_ws/install/setup.bash && "
+    "source /tmp/go2_mpc_bridge_install/setup.bash && "
+    "export RCUTILS_LOGGING_USE_STDOUT=0 && "
+    f"exec /usr/bin/python3 {shlex.quote(str(transport))}"
     )
     process = subprocess.Popen(
         ["/bin/bash", "-c", command],
@@ -228,9 +246,19 @@ def main():
 
 
             # B. 用当前仿真时间取得 MPC 参考。
-            state_ref, input_ref = evaluate_policy(
-                times, states, inputs, mj_data.time
+            current_mpc_state = state_from_pinocchio(
+                model,
+                mapping_data,
+                q,
+                v,
             )
+
+            state_ref, input_ref = evaluate_policy(
+                process,
+                mj_data.time,
+                current_mpc_state,
+            )
+
             last_control = input_ref.copy()
 
             reference = standing_reference_from_mpc(
@@ -252,10 +280,9 @@ def main():
                 )
 
             future_state_ref, future_input_ref = evaluate_policy(
-                times,
-                states,
-                inputs,
+                process,
                 future_time,
+                current_mpc_state,
             )
 
             future_reference = standing_reference_from_mpc(
