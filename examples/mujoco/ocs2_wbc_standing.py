@@ -5,10 +5,10 @@ from pathlib import Path
 import select
 import shlex
 import subprocess
+import time
 
 import mujoco
 import numpy as np
-import mujoco
 import mujoco.viewer
 
 
@@ -21,6 +21,15 @@ from go2_control.mpc_reference import standing_reference_from_mpc
 from go2_control.simulation.mujoco_bridge import MujocoPinocchioBridge
 from go2_control.wbc import StandingWBC
 from go2_control.wbc.reference import joint_pd_feedback
+
+
+def timed_call(samples, function, *args, **kwargs):
+    """Record wall-clock duration of a successful function call."""
+    start = time.perf_counter()
+    result = function(*args, **kwargs)
+    samples.append(time.perf_counter() - start)
+    return result
+
 
 def request_transport(process, message):
     """Send one request to the ROS subprocess and receive its response."""
@@ -56,7 +65,7 @@ def request_policy(process, message):
         or not np.isfinite(times).all()
         or not np.isfinite(states).all()
         or not np.isfinite(inputs).all()
-        or not np.all(np.diff(times) > 0.0)
+        or not np.all(np.diff(times) >= 0.0)
         or not np.any(np.diff(times) > 0.0)
     ):
         raise RuntimeError("Invalid standing policy arrays")
@@ -177,6 +186,12 @@ def main():
     viewer = None
     predicted_next_z = None
     prediction_error_mm = float("nan")
+    timings = {
+        "plan": [],
+        "mrt": [],
+        "wbc": [],
+        "loop": [],
+    }
 
     try:
         viewer = mujoco.viewer.launch_passive(
@@ -194,6 +209,8 @@ def main():
         for step in range(total_steps):
             if not viewer.is_running():
                 break
+
+            loop_start = time.perf_counter()
 
             # A. 实测状态：来自 MuJoCo，不来自 MPC 预测。
             q, v = bridge.state(mj_data)
@@ -219,7 +236,9 @@ def main():
                 # observation 中使用实际关节速度。
                 observation_input[12:] = v[6:]
 
-                times, states, inputs = request_policy(
+                times, states, inputs = timed_call(
+                    timings["plan"],
+                    request_policy,
                     process,
                     {
                         "time": float(mj_data.time),
@@ -253,7 +272,9 @@ def main():
                 v,
             )
 
-            state_ref, input_ref = evaluate_policy(
+            state_ref, input_ref = timed_call(
+                timings["mrt"],
+                evaluate_policy,
                 process,
                 mj_data.time,
                 current_mpc_state,
@@ -279,7 +300,9 @@ def main():
                     "Policy does not cover acceleration estimation"
                 )
 
-            future_state_ref, future_input_ref = evaluate_policy(
+            future_state_ref, future_input_ref = timed_call(
+                timings["mrt"],
+                evaluate_policy,
                 process,
                 future_time,
                 current_mpc_state,
@@ -314,7 +337,13 @@ def main():
             reference["desired_base_linear_acceleration_world"] = acceleration_ff_world
 
             # C. WBC 必须用实测 q、v 求解。
-            result = wbc.solve(q=q, v=v, **reference)
+            result = timed_call(
+                timings["wbc"],
+                wbc.solve,
+                q=q,
+                v=v,
+                **reference,
+            )
 
             if (
                 result.solver_status.lower() != "solved"
@@ -398,9 +427,44 @@ def main():
             # E. 执行力矩，推进真实的仿真动力学。
             mujoco.mj_step(mj_model, mj_data)
             viewer.sync()
+            timings["loop"].append(time.perf_counter() - loop_start)
 
         print("\nFinal base position:", mj_data.qpos[:3])
         print("Clipped steps:", clipped_steps)
+
+        # Inclusive wall-clock measurements; loop already contains all sections.
+        # MRT entries are individual round trips (two per control step).
+        print("\nTiming summary [ms]:")
+        print(
+            f"{'section':<10} {'calls':>8} "
+            f"{'mean':>10} {'p95':>10} {'max':>10}"
+        )
+        for name, samples in timings.items():
+            if not samples:
+                continue
+            values_ms = np.asarray(samples) * 1000.0
+            print(
+                f"{name:<10} {len(samples):>8d} "
+                f"{np.mean(values_ms):>10.3f} "
+                f"{np.percentile(values_ms, 95):>10.3f} "
+                f"{np.max(values_ms):>10.3f}"
+            )
+
+        if timings["plan"]:
+            print(
+                "\nFirst plan request, including initialization [ms]:",
+                timings["plan"][0] * 1000.0,
+            )
+
+        loop_times = np.asarray(timings["loop"])
+        if loop_times.size:
+            print("\nSimulation timestep [ms]:", dt * 1000.0)
+            print(
+                "Loops exceeding simulation timestep:",
+                int(np.count_nonzero(loop_times > dt)),
+                "/",
+                len(loop_times),
+            )
 
     finally:
         # 出错时停止推进仿真，而不是继续执行旧策略。
