@@ -165,7 +165,6 @@ def main():
     command = (
     "source /opt/ros/jazzy/setup.bash && "
     "source /home/bot/Project/ocs2_ws/install/setup.bash && "
-    "source /tmp/go2_mpc_bridge_install/setup.bash && "
     "export RCUTILS_LOGGING_USE_STDOUT=0 && "
     f"exec /usr/bin/python3 {shlex.quote(str(transport))}"
     )

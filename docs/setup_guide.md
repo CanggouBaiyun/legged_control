@@ -119,3 +119,103 @@ pytest -q
 
 把完整输出发回学习记录，不要只截取最后一行报错。
 
+## 7. OCS2 ROS 2 工作区
+
+当前 OCS2 集成基于 ROS 2 Jazzy。Go2 所需的模型名称配置和 RViz
+关节名称修正保存在项目维护的 OCS2 fork 中：
+
+```text
+Repository: https://github.com/CanggouBaiyun/ocs2
+Branch: feature/go2-model-config
+Verified commit: 083c222ee7876d449099fb750a79292291a57050
+
+Robotic assets: https://github.com/leggedrobotics/ocs2_robotic_assets
+Branch: ros2
+Verified commit: 9feab34
+```
+
+建立工作区：
+
+```bash
+mkdir -p /home/bot/Project/ocs2_ws/src
+cd /home/bot/Project/ocs2_ws/src
+
+git clone \
+  --branch feature/go2-model-config \
+  https://github.com/CanggouBaiyun/ocs2.git \
+  ocs2
+
+git -C ocs2 remote add \
+  upstream https://github.com/leggedrobotics/ocs2.git
+
+git clone \
+  --branch ros2 \
+  https://github.com/leggedrobotics/ocs2_robotic_assets.git
+```
+
+构建 Go2 MPC 所需的 OCS2 包及依赖：
+
+```bash
+cd /home/bot/Project/ocs2_ws
+source /opt/ros/jazzy/setup.bash
+
+CMAKE_BUILD_PARALLEL_LEVEL=2 \
+colcon build \
+  --packages-up-to \
+    ocs2_legged_robot_ros \
+    ocs2_double_integrator \
+  --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
+```
+
+`go2_mpc_bridge` 的源码由主项目 Git 管理，通过符号链接加入 OCS2
+工作区，避免维护两份代码：
+
+```bash
+cd /home/bot/Project/ocs2_ws/src
+
+ln -s \
+  /home/bot/Project/go2_traditional_locomotion/ros2/go2_mpc_bridge \
+  go2_mpc_bridge
+```
+
+构建桥接包：
+
+```bash
+cd /home/bot/Project/ocs2_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+
+CMAKE_BUILD_PARALLEL_LEVEL=2 \
+colcon build \
+  --packages-select go2_mpc_bridge \
+  --symlink-install
+```
+
+验证安装结果：
+
+```bash
+source /home/bot/Project/ocs2_ws/install/setup.bash
+
+ros2 pkg prefix go2_mpc_bridge
+ros2 pkg executables go2_mpc_bridge
+ros2 run go2_mpc_bridge mrt_interface_check
+```
+
+预期能发现以下三个可执行程序：
+
+```text
+mrt_interface_check
+mrt_policy_check
+mrt_policy_server
+```
+
+Python 控制环境与 ROS 2 Jazzy 使用不同的 Python 版本。运行 Conda
+环境下的测试时，应避免 ROS 2 的 Python 3.12 路径覆盖 Conda 的
+Python 3.10 包：
+
+```bash
+env -u PYTHONPATH \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+/home/bot/miniconda3/envs/go2_control/bin/python \
+-m pytest -q
+```
