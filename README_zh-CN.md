@@ -235,3 +235,9 @@ v0.6.0-mujoco-single-leg-cycle
 ```
 
 `v0.6.0-mujoco-single-leg-cycle` 包含已验证的单腿抬落脚循环及回归测试。下一阶段接入 OCS2。
+
+## 许可证
+
+本项目的原创代码与文档采用 [MIT 许可证](LICENSE)。Copyright (c) 2026 CanggouBaiyun。
+
+第三方代码、依赖库、机器人模型、网格及其他资源仍遵循各自的许可证和版权声明，包括 `third_party/` 中的内容，以及从上游资源派生的文件，例如 `models/ocs2/` 下导出的 Unitree URDF。本项目的许可证不替代上游许可条款或署名要求。

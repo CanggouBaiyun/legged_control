@@ -235,3 +235,9 @@ v0.6.0-mujoco-single-leg-cycle
 ```
 
 `v0.6.0-mujoco-single-leg-cycle` contains the verified lift–touchdown cycle and its regression test. OCS2 integration is the next development milestone.
+
+## License
+
+Original code and documentation in this project are licensed under the [MIT License](LICENSE). Copyright (c) 2026 CanggouBaiyun.
+
+Third-party code, dependencies, robot models, meshes and other assets remain subject to their respective licenses and copyright notices. This includes content under `third_party/` and files derived from upstream sources, such as the exported Unitree URDF under `models/ocs2/`. The project license does not replace upstream license terms or attribution requirements.
