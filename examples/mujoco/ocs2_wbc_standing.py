@@ -1,5 +1,6 @@
 """Synchronized OCS2-WBC-MuJoCo standing experiment; simulation only."""
 
+import argparse
 import json
 from pathlib import Path
 import select
@@ -8,16 +9,44 @@ import subprocess
 import time
 
 import mujoco
-import numpy as np
 import mujoco.viewer
+import numpy as np
 
+CSV_COLUMNS = (
+    "time_s",
+    "goal_z_m",
+    "mpc_z_m",
+    "measured_z_m",
+    "measured_minus_goal_m",
+    "measured_minus_mpc_m",
+    "mpc_vz_mps",
+    "measured_vz_mps",
+    "mpc_fz_fl_n",
+    "mpc_fz_fr_n",
+    "mpc_fz_rl_n",
+    "mpc_fz_rr_n",
+    "wbc_fz_fl_n",
+    "wbc_fz_fr_n",
+    "wbc_fz_rl_n",
+    "wbc_fz_rr_n",
+    "max_applied_torque_nm",
+    "max_feedback_torque_nm",
+    "max_torque_clip_nm",
+    "dynamics_residual",
+    "contact_acceleration_residual",
+    "policy_horizon_s",
+    "prediction_error_mm",
+)
 
 from go2_control.centroidal import (
     pinocchio_from_state,
     state_from_pinocchio,
 )
 from go2_control.model import build_go2_simulation_model
-from go2_control.mpc_reference import standing_reference_from_mpc
+from go2_control.mpc_reference import (
+    OCS2_CONTACT_ORDER,
+    standing_reference_from_mpc,
+)
 from go2_control.simulation.mujoco_bridge import MujocoPinocchioBridge
 from go2_control.wbc import StandingWBC
 from go2_control.wbc.reference import joint_pd_feedback
@@ -122,7 +151,37 @@ def standing_height_goal(time):
 
     return 0.28
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without opening the MuJoCo viewer.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=20.0,
+        help="Simulation duration in seconds, at most 20.",
+    )
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        help="Optional path for per-step CSV output.",
+    )
+
+    args = parser.parse_args()
+
+    if not 0.0 < args.duration <= 20.0:
+        parser.error("--duration must be in (0, 20] seconds")
+
+    return args
+
+
 def main():
+    args = parse_args()
+
     root = Path(__file__).resolve().parents[2]
     scene = root / "third_party/unitree_mujoco/unitree_robots/go2/scene.xml"
 
@@ -178,13 +237,14 @@ def main():
 
     dt = mj_model.opt.timestep
     steps_per_policy = max(1, round(0.02 / dt))
-    total_steps = round(20.0 / dt)
+    total_steps = round(args.duration / dt)
     last_control = np.zeros(24)
     next_print = 0.0
     clipped_steps = 0
     viewer = None
     predicted_next_z = None
     prediction_error_mm = float("nan")
+    rows = []
     timings = {
         "plan": [],
         "mrt": [],
@@ -193,20 +253,21 @@ def main():
     }
 
     try:
-        viewer = mujoco.viewer.launch_passive(
-            mj_model,
-            mj_data,
-        )
+        if not args.headless:
+            viewer = mujoco.viewer.launch_passive(
+                mj_model,
+                mj_data,
+            )
 
-        # 镜头看向机器人。
-        viewer.cam.lookat[:] = mj_data.qpos[:3]
-        viewer.cam.distance = 1.2
-        viewer.cam.azimuth = 135
-        viewer.cam.elevation = -20
-        viewer.sync()
+            # 镜头看向机器人。
+            viewer.cam.lookat[:] = mj_data.qpos[:3]
+            viewer.cam.distance = 1.2
+            viewer.cam.azimuth = 135
+            viewer.cam.elevation = -20
+            viewer.sync()
 
         for step in range(total_steps):
-            if not viewer.is_running():
+            if viewer is not None and not viewer.is_running():
                 break
 
             loop_start = time.perf_counter()
@@ -375,6 +436,46 @@ def main():
             clipped_steps += int(np.any(np.abs(limited - controls) > 1e-9))
             mj_data.ctrl[:] = limited
 
+            # OCS2 force order: FL, FR, RL, RR.
+            mpc_forces = input_ref[:12].reshape(4,3)
+            # WBC uses a different internal contact order, so convert it to the
+            # OCS2 order before recording and comparing the forces.
+            wbc_force_by_name = dict(
+                zip(wbc.contact_frame_names, result.contact_forces)
+            )
+            wbc_forces_ocs2_order = np.array(
+                [
+                    wbc_force_by_name[name]
+                    for name in OCS2_CONTACT_ORDER
+                ]
+            )
+
+            reference_vz = float(
+                reference["desired_base_linear_velocity_world"][2]
+            )
+            actual_vz = float(mj_data.qvel[2])
+
+            rows.append(
+                [
+                    float(mj_data.time),
+                    float(target[8]),
+                    float(state_ref[8]),
+                    float(q[2]),
+                    float(q[2] - target[8]),
+                    float(q[2] - state_ref[8]),
+                    reference_vz,
+                    actual_vz,
+                    *mpc_forces[:, 2].tolist(),
+                    *wbc_forces_ocs2_order[:, 2].tolist(),
+                    float(np.max(np.abs(limited))),
+                    float(np.max(np.abs(feedback))),
+                    float(np.max(np.abs(limited - controls))),
+                    float(result.dynamics_residual_norm),
+                    float(result.contact_acceleration_residual_norm),
+                    float(times[-1] - mj_data.time),
+                    float(prediction_error_mm),
+                ]
+            )
             if mj_data.time >= next_print:
                 lookahead_time = mj_data.time + 0.2
                 if lookahead_time > times[-1]:
@@ -388,22 +489,8 @@ def main():
                     states[:, 8],
                 ))
 
-                # MuJoCo 浮动基线速度在世界坐标系表达。
-                actual_vz = float(mj_data.qvel[2])
-
-                # 适配器已将参考基座线速度转换到世界坐标系。
-                reference_vz = float(
-                    reference["desired_base_linear_velocity_world"][2]
-                )
-
-                # 世界系竖直接触合力 [N]：MPC 参考与 WBC 求解值。
-                # 两者都不是 MuJoCo 实际测得的接触力。
-                mpc_fz = float(
-                    np.sum(input_ref[:12].reshape(4, 3)[:, 2])
-                )
-                wbc_fz = float(
-                    np.sum(result.contact_forces[:, 2])
-                )
+                mpc_fz = float(np.sum(mpc_forces[:, 2]))
+                wbc_fz = float(np.sum(wbc_forces_ocs2_order[:, 2]))
 
                 print(
                     f"t={mj_data.time:5.2f} "
@@ -425,7 +512,8 @@ def main():
 
             # E. 执行力矩，推进真实的仿真动力学。
             mujoco.mj_step(mj_model, mj_data)
-            viewer.sync()
+            if viewer is not None:
+                viewer.sync()
             timings["loop"].append(time.perf_counter() - loop_start)
 
         print("\nFinal base position:", mj_data.qpos[:3])
@@ -464,6 +552,162 @@ def main():
                 "/",
                 len(loop_times),
             )
+        if not rows:
+            raise RuntimeError("No simulation samples were recorded")
+
+        records = np.asarray(rows, dtype=float)
+
+        if (
+            records.ndim != 2
+            or records.shape[1] != len(CSV_COLUMNS)
+        ):
+            raise RuntimeError(
+                "CSV row width does not match CSV_COLUMNS"
+            )
+
+        column = {
+            name: index
+            for index, name in enumerate(CSV_COLUMNS)
+        }
+
+        # Normal runs ignore the first two seconds of initialization.
+        # Short smoke tests use all available samples.
+        evaluation_start_s = (
+            2.0
+            if records[-1, column["time_s"]] >= 2.0
+            else 0.0
+        )
+        active = records[
+            records[:, column["time_s"]] >= evaluation_start_s
+        ]
+
+        prediction_errors = active[
+            :, column["prediction_error_mm"]
+        ]
+        prediction_errors = prediction_errors[
+            np.isfinite(prediction_errors)
+        ]
+
+        mpc_total_fz = np.sum(
+            active[
+                :,
+                column["mpc_fz_fl_n"]:
+                column["mpc_fz_rr_n"] + 1,
+            ],
+            axis=1,
+        )
+        wbc_total_fz = np.sum(
+            active[
+                :,
+                column["wbc_fz_fl_n"]:
+                column["wbc_fz_rr_n"] + 1,
+            ],
+            axis=1,
+        )
+
+        timing_summary_ms = {}
+        for name, samples in timings.items():
+            if not samples:
+                continue
+
+            values_ms = np.asarray(samples) * 1000.0
+            timing_summary_ms[name] = {
+                "calls": len(samples),
+                "mean": float(np.mean(values_ms)),
+                "p95": float(np.percentile(values_ms, 95)),
+                "maximum": float(np.max(values_ms)),
+            }
+
+        summary = {
+            "requested_duration_s": args.duration,
+            "actual_duration_s": float(mj_data.time),
+            "samples": len(records),
+            "simulation_timestep_s": float(dt),
+            "evaluation_start_s": evaluation_start_s,
+            "goal_height_rmse_mm": float(
+                1000.0 * np.sqrt(np.mean(
+                    active[:, column["measured_minus_goal_m"]] ** 2
+                ))
+            ),
+            "goal_height_max_error_mm": float(
+                1000.0 * np.max(np.abs(
+                    active[:, column["measured_minus_goal_m"]]
+                ))
+            ),
+            "mpc_tracking_rmse_mm": float(
+                1000.0 * np.sqrt(np.mean(
+                    active[:, column["measured_minus_mpc_m"]] ** 2
+                ))
+            ),
+            "mpc_tracking_max_error_mm": float(
+                1000.0 * np.max(np.abs(
+                    active[:, column["measured_minus_mpc_m"]]
+                ))
+            ),
+            "maximum_motor_torque_nm": float(np.max(
+                records[:, column["max_applied_torque_nm"]]
+            )),
+            "maximum_feedback_torque_nm": float(np.max(
+                records[:, column["max_feedback_torque_nm"]]
+            )),
+            "maximum_torque_clip_nm": float(np.max(
+                records[:, column["max_torque_clip_nm"]]
+            )),
+            "clipped_steps": int(np.count_nonzero(
+                records[:, column["max_torque_clip_nm"]] > 1e-9
+            )),
+            "maximum_dynamics_residual": float(np.max(
+                records[:, column["dynamics_residual"]]
+            )),
+            "maximum_contact_acceleration_residual": float(
+                np.max(records[
+                    :, column["contact_acceleration_residual"]
+                ])
+            ),
+            "minimum_policy_horizon_s": float(np.min(
+                records[:, column["policy_horizon_s"]]
+            )),
+            "prediction_rmse_mm": (
+                float(np.sqrt(np.mean(prediction_errors ** 2)))
+                if prediction_errors.size
+                else None
+            ),
+            "maximum_prediction_error_mm": (
+                float(np.max(np.abs(prediction_errors)))
+                if prediction_errors.size
+                else None
+            ),
+            "mean_mpc_total_fz_n": float(np.mean(mpc_total_fz)),
+            "mean_wbc_total_fz_n": float(np.mean(wbc_total_fz)),
+            "mean_total_fz_difference_n": float(np.mean(
+                np.abs(wbc_total_fz - mpc_total_fz)
+            )),
+            "final_base_position": mj_data.qpos[:3].tolist(),
+            "timing_ms": timing_summary_ms,
+        }
+
+        print("\nExperiment summary:")
+        print(json.dumps(summary, indent=2))
+
+        if args.csv is not None:
+            args.csv.parent.mkdir(parents=True, exist_ok=True)
+            np.savetxt(
+                args.csv,
+                records,
+                delimiter=",",
+                comments="",
+                header=",".join(CSV_COLUMNS),
+                fmt="%.10g",
+            )
+
+            summary_path = args.csv.with_suffix(".json")
+            summary_path.write_text(
+                json.dumps(summary, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            print(f"\nSaved {len(records)} samples to {args.csv}")
+            print(f"Saved summary to {summary_path}")
 
     finally:
         # 出错时停止推进仿真，而不是继续执行旧策略。
