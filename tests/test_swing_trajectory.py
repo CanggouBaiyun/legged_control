@@ -1,5 +1,6 @@
 import numpy as np
 
+from go2_control.wbc.swing_planner import InPlaceSwingPlanner
 from go2_control.wbc.swing_trajectory import (
     swing_foot_reference,
     vertical_lift_reference,
@@ -123,3 +124,36 @@ def test_swing_foot_reference_derivatives():
         acceleration,
         atol=1e-6,
     )
+
+
+def test_in_place_swing_planner_latches_two_feet_until_stance():
+    planner = InPlaceSwingPlanner()
+    interval = (1.0, 1.3)
+    first_positions = {
+        "FR_foot": np.array([0.20, -0.14, 0.022]),
+        "RL_foot": np.array([-0.20, 0.14, 0.022]),
+    }
+
+    for foot_name, position in first_positions.items():
+        planner.reference(foot_name, 1.05, interval, position)
+
+    # Later measurements must not reset either foot's swing trajectory.
+    changed_position = np.array([0.30, -0.10, 0.05])
+    fr_position, _, _ = planner.reference(
+        "FR_foot", 1.15, (1.0, 1.32), changed_position
+    )
+    rl_position, _, _ = planner.reference(
+        "RL_foot", 1.15, interval, changed_position
+    )
+    np.testing.assert_allclose(fr_position, [0.20, -0.14, 0.052])
+    np.testing.assert_allclose(rl_position, [-0.20, 0.14, 0.052])
+
+    assert planner.reference("FR_foot", 1.35, None, changed_position) is None
+    assert "FR_foot" not in planner.plans
+    assert "RL_foot" in planner.plans
+
+    # After stance, the next swing may latch a new measured position.
+    new_position, _, _ = planner.reference(
+        "FR_foot", 2.0, (2.0, 2.3), changed_position
+    )
+    np.testing.assert_allclose(new_position, changed_position)
