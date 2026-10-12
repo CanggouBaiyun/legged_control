@@ -15,6 +15,7 @@ from ocs2_msgs.msg import (
 from ocs2_msgs.srv import Reset
 from go2_mpc_bridge.srv import EvaluatePolicy
 
+SUPPORTED_CONTACT_MODES = {15, 9, 6}
 
 def query_mrt(node, client, policy, stamp, current_state):
     """Query the exact selected policy; never substitute another policy."""
@@ -84,7 +85,7 @@ def query_mrt(node, client, policy, stamp, current_state):
         if (
             response.reset_epoch != query.reset_epoch
             or response.policy_sequence != query.policy_sequence
-            or response.mode != 15
+            or response.mode not in SUPPORTED_CONTACT_MODES
         ):
             raise RuntimeError("MRT response policy ID or mode mismatch")
 
@@ -259,8 +260,8 @@ def main():
                         )
 
                     modes = list(policy.mode_schedule.mode_sequence)
-                    if not modes or any(mode != 15 for mode in modes):
-                        raise RuntimeError("Standing mode 15 required")
+                    if not modes or any(mode not in SUPPORTED_CONTACT_MODES for mode in modes):
+                        raise RuntimeError("Unsupported MPC contact mode")
 
                     times = list(policy.time_trajectory)
                     if (

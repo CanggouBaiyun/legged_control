@@ -29,19 +29,28 @@ def test_mpc_force_order():
         [0.0, 0.0, 40.0],  # RR
     ]).reshape(-1)
 
-    reference = standing_reference_from_mpc(
-        model,
-        model.createData(),
-        q,
-        state,
-        control,
-        ("FR_foot", "FL_foot", "RR_foot", "RL_foot"),
+    cases = (
+        (15, ("FR_foot", "FL_foot", "RR_foot", "RL_foot"),
+         [20.0, 10.0, 40.0, 30.0]),
+        (9, ("RR_foot", "FL_foot"), [40.0, 10.0]),
+        (6, ("RL_foot", "FR_foot"), [30.0, 20.0]),
     )
 
-    np.testing.assert_allclose(
-        reference["desired_contact_forces"][:, 2],
-        [20.0, 10.0, 40.0, 30.0],
-    )
+    for mode, contact_names, expected_forces in cases:
+        reference = standing_reference_from_mpc(
+            model,
+            model.createData(),
+            q,
+            state,
+            control,
+            contact_names,
+            mode=mode,
+        )
+
+        np.testing.assert_allclose(
+            reference["desired_contact_forces"][:, 2],
+            expected_forces,
+        )
 
 
 def test_wbc_accepts_mpc_standing_reference():

@@ -54,6 +54,7 @@ from go2_control.wbc.reference import (
 )
 from go2_control.mpc_reference import (
     OCS2_CONTACT_ORDER,
+    OCS2_MODE_CONTACTS,
     standing_reference_from_mpc,
 )
 from go2_control.simulation.mujoco_bridge import MujocoPinocchioBridge
@@ -124,9 +125,10 @@ def evaluate_policy(process, stamp, current_state):
 
     state = np.asarray(reply["state"], dtype=float)
     control = np.asarray(reply["input"], dtype=float)
+    mode = reply["mode"]
 
     if (
-        reply["mode"] != 15
+        mode not in OCS2_MODE_CONTACTS
         or state.shape != (24,)
         or control.shape != (24,)
         or not np.isfinite(state).all()
@@ -134,7 +136,7 @@ def evaluate_policy(process, stamp, current_state):
     ):
         raise RuntimeError("Invalid reference returned by MRT")
 
-    return state, control
+    return state, control, mode
 
 def standing_height_goal(time):
     """Smooth height goal: hold, lower, hold, rise, hold."""
@@ -353,13 +355,18 @@ def main():
                 v,
             )
 
-            state_ref, input_ref = timed_call(
+            state_ref, input_ref, mode = timed_call(
                 timings["mrt"],
                 evaluate_policy,
                 process,
                 mj_data.time,
                 current_mpc_state,
             )
+
+            if mode != 15:
+                raise RuntimeError(
+                    f"Standing simulation requires mode 15, got {mode}"
+                )
 
             last_control = input_ref.copy()
 
@@ -370,6 +377,7 @@ def main():
                 state_ref,
                 input_ref,
                 wbc.contact_frame_names,
+                mode=mode,
             )
 
             # 同一条策略上，用参考基座世界系速度的变化估计加速度
@@ -381,13 +389,18 @@ def main():
                     "Policy does not cover acceleration estimation"
                 )
 
-            future_state_ref, future_input_ref = timed_call(
+            future_state_ref, future_input_ref, future_mode = timed_call(
                 timings["mrt"],
                 evaluate_policy,
                 process,
                 future_time,
                 current_mpc_state,
             )
+
+            if future_mode != 15:
+                raise RuntimeError(
+                    f"Standing simulation requires mode 15, got {future_mode}"
+                )
 
             future_reference = standing_reference_from_mpc(
                 model,
@@ -396,6 +409,7 @@ def main():
                 future_state_ref,
                 future_input_ref,
                 wbc.contact_frame_names,
+                mode=future_mode,
             )
 
             current_velocity_world = reference[
