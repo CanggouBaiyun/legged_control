@@ -65,22 +65,22 @@ OCS2 orders the contacts as FL, FR, RL, RR. The adapter maps forces by frame nam
 
 ### OCS2–MRT–WBC standing
 
-[ocs2_wbc_standing.py](examples/mujoco/ocs2_wbc_standing.py) evaluates a full-centroidal Go2 MPC policy through the C++ MRT service, converts it to WBC references and applies the resulting torques in MuJoCo. The 20 s reference holds 0.28 m, lowers smoothly to 0.27 m, then returns to 0.28 m. Metrics exclude the first 2 s where stated.
+[ocs2_wbc_standing.py](examples/mujoco/ocs2_wbc_standing.py) evaluates a full-centroidal Go2 MPC policy through the C++ MRT service, converts it to WBC references and applies the resulting torques in MuJoCo. The 20 s reference holds 0.28 m, lowers smoothly to 0.27 m, then returns to 0.28 m. Fixed-foot IK generates matching joint-position targets. The foot-center targets sit 22 mm above the ground, matching the foot collision-sphere radius in this MuJoCo scene. Metrics exclude the first 2 s where stated.
 
 | Metric | Result |
 | --- | ---: |
 | Simulation steps / timestep | 10,000 / 2 ms |
-| Goal-height RMSE / maximum error | 6.013 / 10.776 mm |
-| WBC/MuJoCo tracking of MPC height, RMSE / maximum | 0.015 / 0.065 mm |
-| MRT one-step prediction RMSE / maximum error | 0.035 / 0.079 mm |
-| Maximum motor command / clipped steps | 8.200 Nm / 0 |
-| Maximum dynamics / contact residual | 1.71e-13 / 2.43e-15 |
-| Mean MPC / WBC total vertical force | 148.967 / 148.792 N |
-| Mean total vertical-force difference | 0.266 N |
+| Goal-height RMSE / maximum error | 2.617 / 5.936 mm |
+| WBC/MuJoCo tracking of MPC height, RMSE / maximum | 0.023 / 0.097 mm |
+| MRT one-step prediction RMSE / maximum error | 0.053 / 0.114 mm |
+| Maximum motor command / clipped steps | 8.237 Nm / 0 |
+| Maximum dynamics / contact residual | 1.99e-13 / 2.02e-15 |
+| Mean MPC / WBC total vertical force | 148.721 / 148.514 N |
+| Mean total vertical-force difference | 0.392 N |
 
-During the 0.27 m hold, the mean MPC height was 0.27914 m and MuJoCo followed it at 0.27916 m. The main height error therefore originates in the current MPC objective/reference behavior, while the WBC follows the supplied MPC reference closely.
+During the 8–12 s lower hold, the goal was 0.27000 m, the mean MPC height was 0.27317 m and MuJoCo measured 0.27318 m. The WBC tracks the supplied MPC reference closely; the remaining lower-hold offset of about 3.18 mm needs further investigation. For comparison, goal-height RMSE was 6.013 mm with the original base-only target and 7.861 mm when fixed-foot IK used the initially penetrating foot positions.
 
-WBC took 0.640 ms on average and 0.688 ms at p95. One MRT query took 0.255 ms on average; the experiment makes two queries per control step. MPC policy updates took 17.830 ms on average and 19.405 ms at p95, including a 611 ms first initialization. Because policy updates are requested synchronously, 1,006 of 10,000 loops exceeded the 2 ms simulation timestep. The hardware control path must move policy updates off the 500 Hz torque loop and pre-initialize generated libraries before enabling actuation.
+WBC took 0.634 ms on average and 0.689 ms at p95. One MRT query took 0.246 ms on average; the experiment makes two queries per control step. MPC policy updates took 18.377 ms on average and 19.742 ms at p95, including an 862 ms first initialization. Because policy updates are requested synchronously, 1,011 of 10,000 loops exceeded the 2 ms simulation timestep. The hardware control path must move policy updates off the 500 Hz torque loop and pre-initialize generated libraries before enabling actuation.
 
 See [OCS2 standing integration notes](docs/ocs2_standing.md) for the process layout, commands, data fields and remaining work.
 
@@ -214,7 +214,7 @@ env -u PYTHONPATH \
   /home/bot/miniconda3/envs/go2_control/bin/python \
   examples/mujoco/ocs2_wbc_standing.py \
   --headless --duration 20 \
-  --csv artifacts/ocs2_wbc_standing.csv
+  --csv artifacts/ocs2_wbc_standing_ground_feet.csv
 
 # Offline three-foot checks
 python examples/wbc/three_contact_kinematics.py
