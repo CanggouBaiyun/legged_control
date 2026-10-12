@@ -7,6 +7,11 @@ __pycache__/
 .coverage
 .venv/
 
+# Colcon-generated directories at repository root
+/log/
+/build/
+/install/
+
 # Generated reports
 artifacts/*
 !artifacts/.gitkeep
@@ -15,4 +20,3 @@ artifacts/*
 third_party/unitree_ros/
 third_party/unitree_mujoco/
 third_party/unitree_sdk2/
-

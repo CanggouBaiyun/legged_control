@@ -340,6 +340,7 @@ class StandingWBC:
         desired_swing_velocity: np.ndarray | None = None,
         desired_swing_acceleration: np.ndarray | None = None,
         normal_force_upper_bounds: np.ndarray | None = None,
+        desired_contact_forces: np.ndarray | None = None,
     ) -> StandingWBCResult:
         """Solve the standing WBC problem at the current state."""
 
@@ -478,12 +479,31 @@ class StandingWBC:
         )
 
         reference_decision = np.zeros(
-            self.number_of_decision_variables
+                    self.number_of_decision_variables
         )
+        
+        if desired_contact_forces is None:
+            force_reference = self.reference_contact_force
+        else:
+            forces = np.asarray(
+                desired_contact_forces, dtype = float
+            )
 
-        reference_decision[
-            self.contact_force_slice
-        ] = self.reference_contact_force
+            expected_shape = (
+                len(self.contact_frame_names), 3
+            )
+
+            if forces.shape != expected_shape:
+                raise ValueError(
+                    f"Expected contact forces with shape {expected_shape}"
+                )
+            if not np.all(np.isfinite(forces)):
+                raise ValueError("Contact forces must be finite")
+
+            force_reference = forces.reshape(-1)
+
+        reference_decision[self.contact_force_slice] = force_reference
+        
 
         reference_decision[:6] = (
             desired_base_acceleration
