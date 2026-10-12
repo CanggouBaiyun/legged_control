@@ -46,6 +46,14 @@ CSV_COLUMNS = (
     "swing_target_z_fr_m",
     "swing_target_z_rl_m",
     "swing_target_z_rr_m",
+    "mj_floor_fz_fl_n",
+    "mj_floor_fz_fr_n",
+    "mj_floor_fz_rl_n",
+    "mj_floor_fz_rr_n",
+    "stance_center_xy_speed_fl_mps",
+    "stance_center_xy_speed_fr_mps",
+    "stance_center_xy_speed_rl_mps",
+    "stance_center_xy_speed_rr_mps",
 )
 
 from go2_control.centroidal import (
@@ -78,6 +86,22 @@ def timed_call(samples, function, *args, **kwargs):
     result = function(*args, **kwargs)
     samples.append(time.perf_counter() - start)
     return result
+
+
+def floor_normal_forces(model, data, floor_id, foot_name_by_geom):
+    """Read MuJoCo's solved normal forces for named foot-floor contacts."""
+    forces = {name: 0.0 for name in foot_name_by_geom.values()}
+    wrench = np.zeros(6)
+    for contact_id in range(data.ncon):
+        contact = data.contact[contact_id]
+        geom1, geom2 = int(contact.geom1), int(contact.geom2)
+        foot_geom = geom2 if geom1 == floor_id else geom1 if geom2 == floor_id else -1
+        foot_name = foot_name_by_geom.get(foot_geom)
+        if foot_name is None or contact.efc_address < 0:
+            continue
+        mujoco.mj_contactForce(model, data, contact_id, wrench)
+        forces[foot_name] += float(wrench[0])
+    return forces
 
 
 def request_transport(process, message):
@@ -242,6 +266,17 @@ def main():
     bridge = MujocoPinocchioBridge(mj_model, model)
     wbc = StandingWBC(model)
     trot_wbc = TrotWBC(model) if args.allow_trot else None
+    floor_id = mujoco.mj_name2id(
+        mj_model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
+    )
+    foot_name_by_geom = {
+        mujoco.mj_name2id(
+            mj_model, mujoco.mjtObj.mjOBJ_GEOM, name.split("_")[0]
+        ): name
+        for name in OCS2_CONTACT_ORDER
+    }
+    if floor_id < 0 or -1 in foot_name_by_geom:
+        raise RuntimeError("Missing MuJoCo floor or named foot geom")
     mapping_data = model.createData()
 
     key = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -307,6 +342,9 @@ def main():
     next_print = 0.0
     clipped_steps = 0
     gait_command_sent = False
+    previous_feet_by_name = None
+    previous_stance = set()
+    previous_floor_forces = None
     viewer = None
     predicted_next_z = None
     prediction_error_mm = float("nan")
@@ -437,7 +475,10 @@ def main():
 
             swing_targets = {}
             if trot_wbc is not None:
-                feet_by_name = foot_positions(model, q)
+                feet_by_name = {
+                    name: np.asarray(position, dtype=float)
+                    for name, position in foot_positions(model, q).items()
+                }
                 wbc, swing_targets = trot_wbc.prepare(
                     mj_data.time,
                     mode,
@@ -584,8 +625,7 @@ def main():
             )
             actual_vz = float(mj_data.qvel[2])
 
-            rows.append(
-                [
+            row = [
                     float(mj_data.time),
                     float(mode),
                     float(target[8]),
@@ -613,8 +653,7 @@ def main():
                         if name in swing_targets else float("nan")
                         for name in OCS2_CONTACT_ORDER
                     ),
-                ]
-            )
+            ]
             if mj_data.time >= next_print:
                 lookahead_time = mj_data.time + 0.2
                 if lookahead_time > times[-1]:
@@ -652,6 +691,37 @@ def main():
 
             # E. 执行力矩，推进真实的仿真动力学。
             mujoco.mj_step(mj_model, mj_data)
+            if trot_wbc is not None:
+                # mj_step 的接触求解对应本步积分前的 q、v 和 mode。
+                floor_forces = floor_normal_forces(
+                    mj_model, mj_data, floor_id, foot_name_by_geom
+                )
+                stance_speeds = {}
+                for name in OCS2_CONTACT_ORDER:
+                    speed = float("nan")
+                    if (
+                        name in wbc.contact_frame_names
+                        and name in previous_stance
+                        and previous_feet_by_name is not None
+                        and previous_floor_forces[name] > 1.0
+                        and floor_forces[name] > 1.0
+                    ):
+                        speed = float(np.linalg.norm(
+                            feet_by_name[name][:2]
+                            - previous_feet_by_name[name][:2]
+                        ) / dt)
+                    stance_speeds[name] = speed
+                row.extend(floor_forces[name] for name in OCS2_CONTACT_ORDER)
+                row.extend(stance_speeds[name] for name in OCS2_CONTACT_ORDER)
+                previous_feet_by_name = {
+                    name: position.copy()
+                    for name, position in feet_by_name.items()
+                }
+                previous_stance = set(wbc.contact_frame_names)
+                previous_floor_forces = floor_forces
+            else:
+                row.extend([float("nan")] * 8)
+            rows.append(row)
             if viewer is not None:
                 viewer.sync()
             timings["loop"].append(time.perf_counter() - loop_start)
@@ -760,6 +830,10 @@ def main():
 
         swing_height_max = {}
         swing_tracking_rmse = {}
+        stance_contact_fraction = {}
+        mid_swing_contact_samples = {}
+        stance_center_speed_p95 = {}
+        maximum_floor_force = {}
         for name, key in zip(
             OCS2_CONTACT_ORDER, ("fl", "fr", "rl", "rr")
         ):
@@ -776,6 +850,36 @@ def main():
                 )))
                 if np.any(swing_samples) else None
             )
+            normal_force = active[:, column[f"mj_floor_fz_{key}_n"]]
+            stance = np.array([
+                name in OCS2_MODE_CONTACTS[int(mode)]
+                for mode in active[:, column["mode"]]
+            ])
+            measured_contact = normal_force > 1.0
+            stance_contact_fraction[name] = (
+                float(np.mean(measured_contact[stance]))
+                if np.any(stance) and np.isfinite(normal_force).any()
+                else None
+            )
+            mid_swing = (
+                active[:, column[f"swing_target_z_{key}_m"]] > 0.07
+            )
+            mid_swing_contact_samples[name] = (
+                int(np.count_nonzero(measured_contact & mid_swing))
+                if np.isfinite(normal_force).any() else None
+            )
+            center_speed = active[
+                :, column[f"stance_center_xy_speed_{key}_mps"]
+            ]
+            valid_speed = center_speed[np.isfinite(center_speed)]
+            stance_center_speed_p95[name] = (
+                float(np.percentile(valid_speed, 95))
+                if valid_speed.size else None
+            )
+            maximum_floor_force[name] = (
+                float(np.nanmax(normal_force))
+                if np.isfinite(normal_force).any() else None
+            )
 
         summary = {
             "requested_duration_s": args.duration,
@@ -789,6 +893,10 @@ def main():
             },
             "swing_foot_height_max_m": swing_height_max,
             "swing_foot_tracking_rmse_mm": swing_tracking_rmse,
+            "stance_floor_contact_fraction_over_1n": stance_contact_fraction,
+            "mid_swing_floor_contact_samples": mid_swing_contact_samples,
+            "stance_center_xy_speed_p95_mps": stance_center_speed_p95,
+            "maximum_floor_normal_force_n": maximum_floor_force,
             "simulation_timestep_s": float(dt),
             "evaluation_start_s": evaluation_start_s,
             "goal_height_rmse_mm": float(

@@ -15,6 +15,7 @@ __pycache__/
 # Generated reports
 artifacts/*
 !artifacts/.gitkeep
+MUJOCO_LOG.TXT
 
 # Official repositories are downloaded manually and pinned separately.
 third_party/unitree_ros/

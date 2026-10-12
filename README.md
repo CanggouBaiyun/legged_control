@@ -22,7 +22,7 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | OCS2 full-centroidal NMPC → MRT → WBC, fixed four-foot stance | 20 s closed-loop simulation verified |
 | ROS 2 MPC transport and C++ MRT policy query | Implemented and verified |
 | Trot gait command, MPC mode schedule and C++ MRT query | Modes 15/9/6 verified in a 20 s closed-loop simulation |
-| Mode-aware WBC and latched in-place swing targets | 20 s closed-loop trot verified; all four feet lifted |
+| Mode-aware WBC and latched in-place swing targets | 20 s closed-loop trot; all four feet lifted; floor contacts measured |
 | Translation, stopping, turning and disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
