@@ -6,7 +6,11 @@ from go2_control.model import (
     build_go2_simulation_model,
     nominal_configuration,
 )
-from go2_control.mpc_reference import mode_at_time, standing_reference_from_mpc
+from go2_control.mpc_reference import (
+    mode_at_time,
+    standing_reference_from_mpc,
+    swing_interval_at_time,
+)
 from go2_control.wbc import StandingWBC
 
 
@@ -116,3 +120,16 @@ def test_wbc_accepts_mpc_standing_reference():
         atol=1e-7,
         rtol=1e-7,
     )
+
+def test_swing_intervals_follow_diagonal_modes():
+    events = [1.00, 1.30, 1.35, 1.65]
+    modes = [15, 9, 15, 6, 15]
+
+    assert swing_interval_at_time(events, modes, 1.00, "FR_foot") is None
+    assert swing_interval_at_time(events, modes, 1.15, "FR_foot") == (1.00, 1.30)
+    assert swing_interval_at_time(events, modes, 1.15, "RL_foot") == (1.00, 1.30)
+    assert swing_interval_at_time(events, modes, 1.15, "FL_foot") is None
+    assert swing_interval_at_time(events, modes, 1.30, "FR_foot") == (1.00, 1.30)
+    assert swing_interval_at_time(events, modes, 1.35, "FR_foot") is None
+    assert swing_interval_at_time(events, modes, 1.50, "FL_foot") == (1.35, 1.65)
+    assert swing_interval_at_time(events, modes, 1.50, "RR_foot") == (1.35, 1.65)

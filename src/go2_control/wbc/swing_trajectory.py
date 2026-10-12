@@ -46,3 +46,47 @@ def vertical_lift_reference(
     acceleration = progress_acceleration * displacement
 
     return position, velocity, acceleration
+
+
+def swing_foot_reference(
+    time,
+    start_position,
+    end_position,
+    lift_off,
+    touch_down,
+    clearance=0.03,
+):
+    """Return world-frame foot position, velocity and acceleration."""
+    duration = touch_down - lift_off
+    if duration <= 0.0 or clearance < 0.0:
+        raise ValueError("Invalid swing duration or clearance")
+
+    start = np.asarray(start_position, dtype=float)
+    end = np.asarray(end_position, dtype=float)
+    if start.shape != (3,) or end.shape != (3,):
+        raise ValueError("Foot positions must have shape (3,)")
+
+    s = np.clip((time - lift_off) / duration, 0.0, 1.0)
+
+    # Quintic motion from start to end: zero velocity and acceleration
+    # at both ends.
+
+    progress = 10*s**3 - 15*s**4 + 6*s**5
+    progress_velocity = (30*s**2 - 60*s**3 + 30*s**4) / duration
+    progress_acceleration = (60*s - 180*s**2 + 120*s**3) / duration**2
+
+    # Smooth arc: zero height, velocity and acceleration at both ends.
+    arc = 64*s**3 * (1-s)**3
+    arc_velocity = (192*s**2 * (1-s)**2 * (1-2*s)) / duration
+    arc_acceleration = (384*s * (1-s) * (1-5*s+5*s**2)) / duration**2
+
+    displacement = end - start
+    lift = np.array([0.0, 0.0, clearance])
+
+    position = start + progress*displacement + arc*lift
+    velocity = progress_velocity*displacement + arc_velocity*lift
+    acceleration = (
+        progress_acceleration*displacement + arc_acceleration*lift
+    )
+
+    return position, velocity, acceleration

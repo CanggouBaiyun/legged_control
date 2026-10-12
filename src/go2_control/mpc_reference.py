@@ -23,6 +23,29 @@ def mode_at_time(event_times, mode_sequence, stamp):
     index = np.searchsorted(event_times, stamp, side="left")
     return int(mode_sequence[index])
 
+def swing_interval_at_time(event_times, mode_sequence, stamp, foot_name):
+    """Return (lift_off, touch_down), or None if the foot is in stance."""
+    if foot_name not in OCS2_CONTACT_ORDER:
+        raise ValueError(f"Unknown foot: {foot_name}")
+
+    index = int(np.searchsorted(event_times, stamp, side="left"))
+    mode = int(mode_sequence[index])
+
+    if foot_name in OCS2_MODE_CONTACTS[mode]:
+        return None
+
+    # An incomplete interval cannot define a full swing trajectory.
+    if index == 0 or index == len(event_times):
+        raise ValueError("Swing interval extends beyond the mode schedule")
+
+    lift_off = float(event_times[index - 1])
+    touch_down = float(event_times[index])
+    if touch_down <= lift_off:
+        raise ValueError("Swing interval has no duration")
+
+    return lift_off, touch_down
+
+
 def standing_reference_from_mpc(
     model,
     data,
