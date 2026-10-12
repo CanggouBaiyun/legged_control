@@ -65,22 +65,22 @@ OCS2 足端顺序为 FL、FR、RL、RR，WBC 顺序为 FR、FL、RR、RL。适�
 
 ### OCS2–MRT–WBC 站立
 
-[ocs2_wbc_standing.py](examples/mujoco/ocs2_wbc_standing.py) 通过 C++ MRT 服务查询 Go2 全质心 MPC 策略，将其转换为 WBC 参考，并在 MuJoCo 中施加求解力矩。20 s 参考轨迹从 0.28 m 平滑下降至 0.27 m，再回到 0.28 m；注明的误差统计排除最初 2 s。
+[ocs2_wbc_standing.py](examples/mujoco/ocs2_wbc_standing.py) 通过 C++ MRT 服务查询 Go2 全质心 MPC 策略，将其转换为 WBC 参考，并在 MuJoCo 中施加求解力矩。20 s 参考轨迹从 0.28 m 平滑下降至 0.27 m，再回到 0.28 m。固定足端 IK 同时生成匹配的关节位置目标；足端中心目标位于地面上方 22 mm，与当前 MuJoCo 场景的足端碰撞球半径一致。注明的误差统计排除最初 2 s。
 
 | 指标 | 结果 |
 | --- | ---: |
 | 仿真步数 / 步长 | 10,000 / 2 ms |
-| 目标高度 RMSE / 最大误差 | 6.013 / 10.776 mm |
-| WBC/MuJoCo 跟踪 MPC 高度 RMSE / 最大误差 | 0.015 / 0.065 mm |
-| MRT 单步预测 RMSE / 最大误差 | 0.035 / 0.079 mm |
-| 最大电机命令 / 力矩限幅次数 | 8.200 Nm / 0 |
-| 最大动力学 / 接触约束残差 | 1.71e-13 / 2.43e-15 |
-| MPC / WBC 平均竖直合力 | 148.967 / 148.792 N |
-| 平均竖直合力差 | 0.266 N |
+| 目标高度 RMSE / 最大误差 | 2.617 / 5.936 mm |
+| WBC/MuJoCo 跟踪 MPC 高度 RMSE / 最大误差 | 0.023 / 0.097 mm |
+| MRT 单步预测 RMSE / 最大误差 | 0.053 / 0.114 mm |
+| 最大电机命令 / 力矩限幅次数 | 8.237 Nm / 0 |
+| 最大动力学 / 接触约束残差 | 1.99e-13 / 2.02e-15 |
+| MPC / WBC 平均竖直合力 | 148.721 / 148.514 N |
+| 平均竖直合力差 | 0.392 N |
 
-在 0.27 m 保持阶段，MPC 平均高度为 0.27914 m，MuJoCo 实测平均高度为 0.27916 m。因此当前主要高度偏差来自 MPC 目标与优化行为，WBC 对 MPC 给定参考的跟踪已经很精确。
+在 8–12 s 的低位保持阶段，目标为 0.27000 m，MPC 平均高度为 0.27317 m，MuJoCo 实测平均高度为 0.27318 m。WBC 能紧密跟踪 MPC 参考；剩余约 3.18 mm 的低位偏差仍需分析。作为对比，原先只有基座高度目标时，目标高度 RMSE 为 6.013 mm；直接固定初始穿地足端位置的 IK 版本为 7.861 mm。
 
-WBC 平均耗时 0.640 ms，p95 为 0.688 ms；单次 MRT 查询平均 0.255 ms，每个控制周期查询两次。MPC 策略更新平均 17.830 ms、p95 为 19.405 ms，首次初始化为 611 ms。当前策略更新同步阻塞控制循环，10,000 次循环中有 1,006 次超过 2 ms 仿真步长。实机前必须将 MPC 更新移出 500 Hz 力矩循环，并在使能力矩前预热生成库。
+WBC 平均耗时 0.634 ms，p95 为 0.689 ms；单次 MRT 查询平均 0.246 ms，每个控制周期查询两次。MPC 策略更新平均 18.377 ms、p95 为 19.742 ms，首次初始化约 862 ms。当前策略更新同步阻塞控制循环，10,000 次循环中有 1,011 次超过 2 ms 仿真步长。实机前必须将 MPC 更新移出 500 Hz 力矩循环，并在使能力矩前预热生成库。
 
 进程关系、运行命令、数据字段和剩余工作见 [OCS2 站立集成记录](docs/ocs2_standing.md)。
 
@@ -214,7 +214,7 @@ env -u PYTHONPATH \
   /home/bot/miniconda3/envs/go2_control/bin/python \
   examples/mujoco/ocs2_wbc_standing.py \
   --headless --duration 20 \
-  --csv artifacts/ocs2_wbc_standing.csv
+  --csv artifacts/ocs2_wbc_standing_ground_feet.csv
 
 # 离线三足检查
 python examples/wbc/three_contact_kinematics.py

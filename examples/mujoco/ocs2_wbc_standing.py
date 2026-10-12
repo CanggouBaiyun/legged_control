@@ -11,6 +11,7 @@ import time
 import mujoco
 import mujoco.viewer
 import numpy as np
+import pinocchio as pin
 
 CSV_COLUMNS = (
     "time_s",
@@ -42,14 +43,21 @@ from go2_control.centroidal import (
     pinocchio_from_state,
     state_from_pinocchio,
 )
-from go2_control.model import build_go2_simulation_model
+from go2_control.model import (
+    build_go2_simulation_model,
+    foot_positions,
+    GO2_FOOT_FRAMES,
+)
+from go2_control.wbc.reference import (
+    FixedFootReference,
+    joint_pd_feedback,
+)
 from go2_control.mpc_reference import (
     OCS2_CONTACT_ORDER,
     standing_reference_from_mpc,
 )
 from go2_control.simulation.mujoco_bridge import MujocoPinocchioBridge
 from go2_control.wbc import StandingWBC
-from go2_control.wbc.reference import joint_pd_feedback
 
 
 def timed_call(samples, function, *args, **kwargs):
@@ -81,7 +89,7 @@ def request_transport(process, message):
 def request_policy(process, message):
     """Request a fresh MPC policy."""
     reply = request_transport(process, message)
-    
+
     times = np.asarray(reply["times"], dtype=float)
     states = np.asarray(reply["states"], dtype=float)
     inputs = np.asarray(reply["inputs"], dtype=float)
@@ -201,23 +209,36 @@ def main():
     mujoco.mj_forward(mj_model, mj_data)
 
     q, v = bridge.state(mj_data)
-    target = state_from_pinocchio(model, mapping_data, q, v)
-    target[:6] = 0.0
-    target[8] = 0.28
-
-    # 每0.05s提供一个目标节点，覆盖整个20s实验
-    target_times = np.linspace(0.0, 20.0, 401)
-
-    target_states = np.repeat(
-        target[np.newaxis, :],
-        len(target_times),
-        axis = 0,
+    # 以初始足端水平位置和地面接触高度构造固定足端目标
+    feet_by_name = foot_positions(model, q)
+    initial_feet = np.asarray(
+        [feet_by_name[name] for name in GO2_FOOT_FRAMES]
     )
+    # 当前场景的地面 z=0，足端碰撞球半径 0.022 m。
+    initial_feet[:, 2] = 0.022
+    fixed_foot_reference = FixedFootReference(
+        model, q, initial_feet
+    )
+    base_rotation = pin.XYZQUATToSE3(q[:7]).rotation
 
-    target_states[:, 8] = np.array([
-        standing_height_goal(stamp)
-        for stamp in target_times
-    ])
+    target_times = np.linspace(0.0, 20.0, 401)
+    target_states = []
+
+    for stamp in target_times:
+        base_position = q[:3].copy()
+        base_position[2] = standing_height_goal(stamp)
+
+        q_ref, v_ref = fixed_foot_reference.solve(
+            base_position,
+            base_rotation,
+            np.zeros(3),
+        )
+        target_states.append(
+            state_from_pinocchio(model, mapping_data, q_ref, v_ref)
+        )
+
+    target_states = np.asarray(target_states)
+    target = target_states[0].copy()
 
     # 子进程单独加载 ROS 环境，不污染当前 Conda 进程。
     transport = root / "examples/ocs2/standing_mpc_transport.py"

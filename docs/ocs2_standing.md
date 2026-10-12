@@ -71,29 +71,31 @@ env -u PYTHONPATH \
   /home/bot/miniconda3/envs/go2_control/bin/python \
   examples/mujoco/ocs2_wbc_standing.py \
   --headless --duration 20 \
-  --csv artifacts/ocs2_wbc_standing.csv
+  --csv artifacts/ocs2_wbc_standing_ground_feet.csv
 ```
 
 `PYTHONPATH` is removed only for the Conda Python process because the sourced ROS Jazzy environment exposes Python 3.12 packages, while `go2_control` uses Python 3.10. The ROS subprocess separately loads the Jazzy and OCS2 environments.
 
 ## Verified 20 s result
 
-The test used a 2 ms MuJoCo timestep and recorded 10,000 samples. The commanded base height held 0.28 m, transitioned to 0.27 m, held, and returned to 0.28 m.
+The test used a 2 ms MuJoCo timestep and recorded 10,000 samples. The commanded base height held 0.28 m, transitioned to 0.27 m, held, and returned to 0.28 m. Fixed-foot IK supplied joint-position targets for the height trajectory. The target foot centers were placed 0.022 m above the ground, matching the foot collision-sphere radius in this scene.
 
 | Metric | Result |
 | --- | ---: |
-| Goal-height RMSE / maximum error, after 2 s | 6.013 / 10.776 mm |
-| Measured tracking of MPC height, RMSE / maximum | 0.015 / 0.065 mm |
-| MRT one-step prediction RMSE / maximum error | 0.035 / 0.079 mm |
-| Maximum motor command / feedback magnitude | 8.200 / 2.340 Nm |
+| Goal-height RMSE / maximum error, after 2 s | 2.617 / 5.936 mm |
+| Measured tracking of MPC height, RMSE / maximum | 0.023 / 0.097 mm |
+| MRT one-step prediction RMSE / maximum error | 0.053 / 0.114 mm |
+| Maximum motor command / feedback magnitude | 8.237 / 2.344 Nm |
 | Torque-clipped steps | 0 |
-| Maximum dynamics residual | 1.71e-13 |
-| Maximum contact-acceleration residual | 2.43e-15 |
+| Maximum dynamics residual | 1.99e-13 |
+| Maximum contact-acceleration residual | 2.02e-15 |
 | Minimum policy horizon | 0.982 s |
-| Mean MPC / WBC total vertical force | 148.967 / 148.792 N |
-| Mean absolute total-force difference | 0.266 N |
+| Mean MPC / WBC total vertical force | 148.721 / 148.514 N |
+| Mean absolute total-force difference | 0.392 N |
 
-During the lower hold from 8 to 12 s, the goal was 0.27000 m, the mean MPC reference was 0.27914 m and the measured mean was 0.27916 m. The measured system therefore followed the MPC reference closely; tuning or correcting the MPC target behavior is the next height-control task.
+During the lower hold from 8 to 12 s, the goal was 0.27000 m, the mean MPC reference was 0.27317 m and the measured mean was 0.27318 m. The measured system followed the MPC reference closely. The remaining lower-hold error of about 3.18 mm still needs investigation.
+
+The original base-only target gave 6.013 mm goal-height RMSE. Adding fixed-foot IK while anchoring the feet at their initial positions made it 7.861 mm. At the initial 0.270 m base height, the foot frames were about 0.0052 m above the ground, while the collision spheres had 0.022 m radii. The resulting penetration made those initial positions unsuitable as fixed contact targets. With the contact-height targets, goal-height RMSE fell to 2.617 mm. At 10 s and 18 s, MPC terminal foot drift from the fixed target fell from about 18.1 mm to 1.3 mm, and the terminal base-height offset fell from about 8.4 mm to 1.6–1.7 mm.
 
 The CSV contains one expected non-finite pattern: `prediction_error_mm` is `nan` for the first 10 control steps, before the first 20 ms policy interval has elapsed and no previous prediction exists for comparison. The JSON summary filters those samples.
 
@@ -101,18 +103,18 @@ The CSV contains one expected non-finite pattern: `prediction_error_mm` is `nan`
 
 | Section | Calls | Mean | p95 | Maximum |
 | --- | ---: | ---: | ---: | ---: |
-| MPC policy request | 1,000 | 17.830 ms | 19.405 ms | 611.041 ms |
-| One MRT evaluation | 20,000 | 0.255 ms | 0.719 ms | 1.494 ms |
-| WBC solve | 10,000 | 0.640 ms | 0.688 ms | 2.879 ms |
-| Complete loop | 10,000 | 3.203 ms | 19.211 ms | 616.252 ms |
+| MPC policy request | 1,000 | 18.377 ms | 19.742 ms | 861.782 ms |
+| One MRT evaluation | 20,000 | 0.246 ms | 0.719 ms | 3.109 ms |
+| WBC solve | 10,000 | 0.634 ms | 0.689 ms | 1.264 ms |
+| Complete loop | 10,000 | 3.229 ms | 19.491 ms | 864.948 ms |
 
-The first MPC request includes generated-library initialization. Later 50 Hz policy updates remain close to the 20 ms update period. The simulation requests these policies synchronously inside the 500 Hz loop, so 1,006 of 10,000 iterations exceeded the 2 ms timestep. This does not affect the deterministic headless simulation result, but it is unsuitable for a hardware torque loop.
+The first MPC request includes generated-library initialization. Later 50 Hz policy updates remain close to the 20 ms update period. The simulation requests these policies synchronously inside the 500 Hz loop, so 1,011 of 10,000 iterations exceeded the 2 ms timestep. This does not affect the deterministic headless simulation result, but it is unsuitable for a hardware torque loop.
 
 Before hardware use, the 50 Hz MPC update must run asynchronously from the 500 Hz WBC and actuator loop. A real-time loop should read the latest complete policy without waiting, reject stale policies, pre-initialize generated libraries and enter a safe state on timeout.
 
 ## Next work
 
-1. Trace and correct the MPC height-target offset.
+1. Investigate the remaining roughly 3.18 mm lower-hold height offset.
 2. Decouple policy updates from the WBC loop and measure deadline misses again.
 3. Replace fixed mode 15 with a trot mode schedule.
 4. Generate swing-foot position, velocity and acceleration references from the schedule.
