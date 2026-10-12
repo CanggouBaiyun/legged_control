@@ -16,6 +16,10 @@ using PolicyMessage = ocs2_msgs::msg::MpcFlattenedController;
 using EvaluatePolicy = go2_mpc_bridge::srv::EvaluatePolicy;
 using PolicyKey = std::pair<uint64_t, uint64_t>;
 
+bool isSupportedContactMode(size_t mode) {
+  return mode == 15 || mode == 9 || mode == 6;
+}
+
 // 1. 使用官方接口解码、激活和求值策略。
 // 不调用 launchNodes()，不负责发布 observation 或 reset MPC。
 class PolicyEvaluator : public ocs2::MRT_ROS_Interface {
@@ -57,6 +61,7 @@ int main(int argc, char** argv) {
         [&](PolicyMessage::ConstSharedPtr message) {
           const auto& times = message->time_trajectory;
           const auto& modes = message->mode_schedule.mode_sequence;
+          const auto& events = message->mode_schedule.event_times;
 
           bool valid =
               message->reset_epoch != 0 &&
@@ -67,7 +72,19 @@ int main(int argc, char** argv) {
               message->state_trajectory.size() == times.size() &&
               message->input_trajectory.size() == times.size() &&
               message->data.size() == times.size() &&
-              !modes.empty() &&std::all_of(modes.begin(),modes.end(), [](auto mode) { return mode == 15; });
+              !modes.empty() &&
+              events.size() + 1 == modes.size() &&
+              std::all_of(modes.begin(), modes.end(), isSupportedContactMode);
+
+          if (valid) {
+            for (size_t i = 0; i < events.size(); ++i) {
+              if (!std::isfinite(events[i]) ||
+                  (i > 0 && events[i] < events[i - 1])) {
+                valid = false;
+                break;
+              }
+            }
+          }
 
           if (valid) {
             for (size_t i = 0; i < times.size(); ++i) {
@@ -85,7 +102,7 @@ int main(int argc, char** argv) {
           if (!valid) {
             RCLCPP_WARN(
                 node->get_logger(),
-                "Rejected policy outside the supported standing format");
+                "Rejected policy outside the supported Go2 contact modes");
             return;
           }
 
@@ -164,9 +181,9 @@ int main(int argc, char** argv) {
                 inputReference.size() != 24 ||
                 !stateReference.allFinite() ||
                 !inputReference.allFinite() ||
-                mode != 15) {
+                !isSupportedContactMode(mode)) {
               throw std::runtime_error(
-                  "Invalid MRT standing reference");
+                  "Invalid MRT Go2 reference");
             }
 
             for (int i = 0; i < 24; ++i) {

@@ -21,7 +21,7 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | FR lift, touchdown detection and four-foot support recovery | Complete cycle verified; automated regression test |
 | OCS2 full-centroidal NMPC → MRT → WBC, fixed four-foot stance | 20 s closed-loop simulation verified |
 | ROS 2 MPC transport and C++ MRT policy query | Implemented and verified |
-| Trot gait template and MPC mode-schedule transport | Added; closed-loop trot not yet verified |
+| Trot gait command, MPC mode schedule and C++ MRT query | Service accepts 15/9/6; mode 9 reached the simulation guard; closed-loop trot not yet verified |
 | Mode-aware swing intervals, foot trajectories and latched in-place targets | Offline tests passed; not yet connected to closed-loop trot |
 | Trot and disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
@@ -61,7 +61,7 @@ Height trajectory + fixed stance mode 15
                   MuJoCo
 ```
 
-OCS2 orders the contacts as FL, FR, RL, RR. The adapter maps forces by frame name into the WBC order FR, FL, RR, RL. Tests use distinct per-foot forces to detect ordering mistakes. The adapter and ROS transport recognize stance modes 15 (four feet), 9 (FL/RR) and 6 (FR/RL). A diagonal-stance WBC QP accepts and tracks two swing-foot tasks in an offline check. A `standing_trot` gait template is defined in [gait.info](config/ocs2/go2/gait.info), and the MPC transport passes its mode schedule to MuJoCo. The simulation checks MRT modes against that schedule using OCS2's switch-time rule; the standing controller still rejects modes 9 and 6. Offline helpers locate each foot's swing interval and generate a smooth foot path. The in-place planner latches each foot's lift-off and touchdown targets until it returns to stance, so policy updates do not reset an active swing. Closed-loop trot still needs contact-mode switching and these targets connected to the simulation loop.
+OCS2 orders the contacts as FL, FR, RL, RR. The adapter maps forces by frame name into the WBC order FR, FL, RR, RL. Tests use distinct per-foot forces to detect ordering mistakes. The adapter, ROS transport and C++ MRT service accept stance modes 15 (four feet), 9 (FL/RR) and 6 (FR/RL). A diagonal-stance WBC QP accepts and tracks two swing-foot tasks in an offline check. A `standing_trot` gait template is defined in [gait.info](config/ocs2/go2/gait.info), and the MPC transport passes its mode schedule to MuJoCo. A gait command reached the simulation as mode 9 and the standing-only guard stopped before applying its torque. Offline helpers locate each foot's swing interval and generate a smooth foot path. The in-place planner latches each foot's lift-off and touchdown targets until it returns to stance, so policy updates do not reset an active swing. Closed-loop trot still needs contact-mode switching and these targets connected to the simulation loop.
 
 ## Verified Results
 

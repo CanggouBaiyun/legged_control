@@ -76,6 +76,12 @@ env -u PYTHONPATH \
 
 `PYTHONPATH` is removed only for the Conda Python process because the sourced ROS Jazzy environment exposes Python 3.12 packages, while `go2_control` uses Python 3.10. The ROS subprocess separately loads the Jazzy and OCS2 environments.
 
+## Gait command transport check
+
+The `standing_trot` template in `config/ocs2/go2/gait.info` was sent through the ROS 2 gait command node. The MPC inserted it after the active policy horizon at simulation time 10.08 s in this run. The policy then contained mode 9 from 10.08 to 10.38 s, mode 15 from 10.38 to 10.43 s, mode 6 from 10.43 to 10.73 s, and another mode 15 from 10.73 to 10.78 s. The C++ MRT service returned mode 9; the standing simulation stopped at its explicit mode-15 guard before applying a two-foot-stance torque.
+
+This checks gait-command delivery, policy mode scheduling and MRT transport. It does not validate trot motion. The C++ MRT cache accepts modes 15, 9 and 6 and checks that event times are finite, ordered and one fewer than the modes. The standing simulation continues to reject modes 9 and 6 until WBC contact switching and swing references are integrated.
+
 ## Verified 20 s result
 
 The test used a 2 ms MuJoCo timestep and recorded 10,000 samples. The commanded base height held 0.28 m, transitioned to 0.27 m, held, and returned to 0.28 m. Fixed-foot IK supplied joint-position targets for the height trajectory. The target foot centers were placed 0.022 m above the ground, matching the foot collision-sphere radius in this scene.
@@ -116,7 +122,7 @@ Before hardware use, the 50 Hz MPC update must run asynchronously from the 500 H
 
 1. Investigate the remaining roughly 3.18 mm lower-hold height offset.
 2. Decouple policy updates from the WBC loop and measure deadline misses again.
-3. Replace fixed mode 15 with a trot mode schedule.
-4. Generate swing-foot position, velocity and acceleration references from the schedule.
+3. Select WBC stance feet from the transmitted trot mode schedule.
+4. Connect swing-foot references and align them with the MPC policy.
 5. Validate stepping in place before translation, stopping and turning.
 6. Add state estimation and the Unitree SDK2 interface only after simulation timing and safety gates are established.
