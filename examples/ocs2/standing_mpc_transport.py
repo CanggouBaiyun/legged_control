@@ -260,6 +260,16 @@ def main():
                         )
 
                     modes = list(policy.mode_schedule.mode_sequence)
+                    events = list(policy.mode_schedule.event_times)
+                    if(
+                        len(events) != len(modes) - 1
+                        or not all(math.isfinite(t) for t in events)
+                        or any(
+                            second < first
+                            for first, second in zip(events[:-1], events[1:])
+                        )
+                    ):
+                        raise RuntimeError("Invalid MPC mode schedule")
                     if not modes or any(mode not in SUPPORTED_CONTACT_MODES for mode in modes):
                         raise RuntimeError("Unsupported MPC contact mode")
 
@@ -282,6 +292,8 @@ def main():
                             list(item.data)
                             for item in policy.data
                         ],
+                        "mode_event_times": events,
+                        "mode_sequence": modes,
                     }
                     selected_policy = policy
                     last_sequence = policy.policy_sequence

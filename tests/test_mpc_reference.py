@@ -6,8 +6,21 @@ from go2_control.model import (
     build_go2_simulation_model,
     nominal_configuration,
 )
-from go2_control.mpc_reference import standing_reference_from_mpc
+from go2_control.mpc_reference import mode_at_time, standing_reference_from_mpc
 from go2_control.wbc import StandingWBC
+
+
+def test_mode_at_time_matches_ocs2_switch_boundary():
+    events = [0.30, 0.35, 0.35, 0.65]
+    modes = [15, 9, 15, 6, 15]
+
+    assert mode_at_time(events, modes, 0.29) == 15
+    assert mode_at_time(events, modes, 0.30) == 15
+    assert mode_at_time(events, modes, 0.31) == 9
+    assert mode_at_time(events, modes, 0.35) == 9
+    assert mode_at_time(events, modes, 0.36) == 6
+    assert mode_at_time(events, modes, 0.65) == 6
+    assert mode_at_time(events, modes, 0.66) == 15
 
 
 def test_mpc_force_order():

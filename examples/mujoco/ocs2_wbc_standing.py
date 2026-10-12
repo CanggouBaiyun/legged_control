@@ -55,6 +55,7 @@ from go2_control.wbc.reference import (
 from go2_control.mpc_reference import (
     OCS2_CONTACT_ORDER,
     OCS2_MODE_CONTACTS,
+    mode_at_time,
     standing_reference_from_mpc,
 )
 from go2_control.simulation.mujoco_bridge import MujocoPinocchioBridge
@@ -95,6 +96,13 @@ def request_policy(process, message):
     states = np.asarray(reply["states"], dtype=float)
     inputs = np.asarray(reply["inputs"], dtype=float)
 
+    mode_event_times = np.asarray(
+        reply["mode_event_times"], dtype=float
+    )
+    mode_sequence = np.asarray(
+        reply["mode_sequence"], dtype=int
+    )
+
     if (
         times.ndim != 1
         or len(times) < 2
@@ -105,10 +113,19 @@ def request_policy(process, message):
         or not np.isfinite(inputs).all()
         or not np.all(np.diff(times) >= 0.0)
         or not np.any(np.diff(times) > 0.0)
+        or mode_event_times.ndim != 1
+        or mode_sequence.ndim != 1
+        or len(mode_sequence) != len(mode_event_times) + 1
+        or not np.isfinite(mode_event_times).all()
+        or not np.all(np.diff(mode_event_times) >= 0.0)
+        or any(
+            mode not in OCS2_MODE_CONTACTS
+            for mode in mode_sequence
+        )
     ):
         raise RuntimeError("Invalid standing policy arrays")
 
-    return times, states, inputs
+    return times, states, inputs, mode_event_times, mode_sequence
 
 
 def evaluate_policy(process, stamp, current_state):
@@ -319,7 +336,13 @@ def main():
                 # observation 中使用实际关节速度。
                 observation_input[12:] = v[6:]
 
-                times, states, inputs = timed_call(
+                (
+                    times,
+                    states,
+                    inputs,
+                    mode_event_times,
+                    mode_sequence,
+                ) = timed_call(
                     timings["plan"],
                     request_policy,
                     process,
@@ -363,6 +386,15 @@ def main():
                 current_mpc_state,
             )
 
+            scheduled_mode = mode_at_time(
+                mode_event_times, mode_sequence, mj_data.time
+            )
+            if mode != scheduled_mode:
+                raise RuntimeError(
+                    f"MRT mode {mode} differs from policy schedule "
+                    f"mode {scheduled_mode} at {mj_data.time:.6f}s"
+                )
+
             if mode != 15:
                 raise RuntimeError(
                     f"Standing simulation requires mode 15, got {mode}"
@@ -396,6 +428,16 @@ def main():
                 future_time,
                 current_mpc_state,
             )
+
+            scheduled_future_mode = mode_at_time(
+                mode_event_times, mode_sequence, future_time
+            )
+            if future_mode != scheduled_future_mode:
+                raise RuntimeError(
+                    f"MRT future mode {future_mode} differs from "
+                    f"policy schedule mode {scheduled_future_mode} "
+                    f"at {future_time:.6f}s"
+                )
 
             if future_mode != 15:
                 raise RuntimeError(

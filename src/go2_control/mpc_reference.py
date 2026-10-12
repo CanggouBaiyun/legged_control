@@ -18,6 +18,11 @@ OCS2_MODE_CONTACTS = {
     6: ("FR_foot", "RL_foot"),      # 另一对角支撑
 }
 
+def mode_at_time(event_times, mode_sequence, stamp):
+    """Use the same event-time boundary rule as OCS2."""
+    index = np.searchsorted(event_times, stamp, side="left")
+    return int(mode_sequence[index])
+
 def standing_reference_from_mpc(
     model,
     data,
