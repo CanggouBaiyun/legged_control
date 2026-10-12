@@ -59,7 +59,7 @@ Height trajectory + fixed stance mode 15
                   MuJoCo
 ```
 
-OCS2 orders the contacts as FL, FR, RL, RR. The adapter maps forces by frame name into the WBC order FR, FL, RR, RL. Tests use distinct per-foot forces to detect ordering mistakes. The adapter and ROS transport now recognize stance modes 15 (four feet), 9 (FL/RR) and 6 (FR/RL); the standing simulation still rejects modes 9 and 6. Trot still requires a gait schedule, two-foot swing references and mode-dependent WBC contacts.
+OCS2 orders the contacts as FL, FR, RL, RR. The adapter maps forces by frame name into the WBC order FR, FL, RR, RL. Tests use distinct per-foot forces to detect ordering mistakes. The adapter and ROS transport now recognize stance modes 15 (four feet), 9 (FL/RR) and 6 (FR/RL); the standing simulation still rejects modes 9 and 6. A diagonal-stance WBC QP accepts and tracks two swing-foot tasks in an offline check. Trot still requires a gait schedule, time-varying swing references and contact-mode switching in the simulation loop.
 
 ## Verified Results
 
