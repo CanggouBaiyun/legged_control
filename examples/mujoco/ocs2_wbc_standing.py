@@ -15,6 +15,7 @@ import pinocchio as pin
 
 CSV_COLUMNS = (
     "time_s",
+    "mode",
     "goal_z_m",
     "mpc_z_m",
     "measured_z_m",
@@ -37,6 +38,14 @@ CSV_COLUMNS = (
     "contact_acceleration_residual",
     "policy_horizon_s",
     "prediction_error_mm",
+    "foot_z_fl_m",
+    "foot_z_fr_m",
+    "foot_z_rl_m",
+    "foot_z_rr_m",
+    "swing_target_z_fl_m",
+    "swing_target_z_fr_m",
+    "swing_target_z_rl_m",
+    "swing_target_z_rr_m",
 )
 
 from go2_control.centroidal import (
@@ -60,6 +69,7 @@ from go2_control.mpc_reference import (
 )
 from go2_control.simulation.mujoco_bridge import MujocoPinocchioBridge
 from go2_control.wbc import StandingWBC
+from go2_control.wbc.trot import TrotWBC
 
 
 def timed_call(samples, function, *args, **kwargs):
@@ -197,11 +207,25 @@ def parse_args():
         type=Path,
         help="Optional path for per-step CSV output.",
     )
+    parser.add_argument(
+        "--allow-trot",
+        action="store_true",
+        help="Enable mode-dependent stance contacts and swing tasks.",
+    )
+    parser.add_argument(
+        "--trot-at",
+        type=float,
+        help="Send standing_trot when simulation time reaches this value.",
+    )
 
     args = parser.parse_args()
 
     if not 0.0 < args.duration <= 20.0:
         parser.error("--duration must be in (0, 20] seconds")
+    if args.trot_at is not None and (
+        not args.allow_trot or not 0.0 < args.trot_at < args.duration
+    ):
+        parser.error("--trot-at requires --allow-trot and a time within the run")
 
     return args
 
@@ -217,6 +241,7 @@ def main():
     model = build_go2_simulation_model()
     bridge = MujocoPinocchioBridge(mj_model, model)
     wbc = StandingWBC(model)
+    trot_wbc = TrotWBC(model) if args.allow_trot else None
     mapping_data = model.createData()
 
     key = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -281,6 +306,7 @@ def main():
     last_control = np.zeros(24)
     next_print = 0.0
     clipped_steps = 0
+    gait_command_sent = False
     viewer = None
     predicted_next_z = None
     prediction_error_mm = float("nan")
@@ -336,6 +362,12 @@ def main():
                 # observation 中使用实际关节速度。
                 observation_input[12:] = v[6:]
 
+                send_gait = (
+                    args.trot_at is not None
+                    and not gait_command_sent
+                    and mj_data.time >= args.trot_at
+                )
+
                 (
                     times,
                     states,
@@ -356,8 +388,11 @@ def main():
                         "target": target.tolist(),
                         "target_times": target_times.tolist(),
                         "target_states": target_states.tolist(),
+                        **({"gait": "standing_trot"} if send_gait else {}),
                     },
                 )
+                if send_gait:
+                    gait_command_sent = True
 
                 next_policy_time = (
                     mj_data.time + steps_per_policy * dt
@@ -395,9 +430,20 @@ def main():
                     f"mode {scheduled_mode} at {mj_data.time:.6f}s"
                 )
 
-            if mode != 15:
+            if mode != 15 and trot_wbc is None:
                 raise RuntimeError(
                     f"Standing simulation requires mode 15, got {mode}"
+                )
+
+            swing_targets = {}
+            if trot_wbc is not None:
+                feet_by_name = foot_positions(model, q)
+                wbc, swing_targets = trot_wbc.prepare(
+                    mj_data.time,
+                    mode,
+                    mode_event_times,
+                    mode_sequence,
+                    feet_by_name,
                 )
 
             last_control = input_ref.copy()
@@ -439,10 +485,15 @@ def main():
                     f"at {future_time:.6f}s"
                 )
 
-            if future_mode != 15:
+            if future_mode != 15 and trot_wbc is None:
                 raise RuntimeError(
                     f"Standing simulation requires mode 15, got {future_mode}"
                 )
+
+            future_wbc = (
+                trot_wbc.controllers[future_mode]
+                if trot_wbc is not None else wbc
+            )
 
             future_reference = standing_reference_from_mpc(
                 model,
@@ -450,7 +501,7 @@ def main():
                 q,
                 future_state_ref,
                 future_input_ref,
-                wbc.contact_frame_names,
+                future_wbc.contact_frame_names,
                 mode=future_mode,
             )
 
@@ -479,6 +530,7 @@ def main():
                 wbc.solve,
                 q=q,
                 v=v,
+                swing_targets=swing_targets,
                 **reference,
             )
 
@@ -522,7 +574,7 @@ def main():
             )
             wbc_forces_ocs2_order = np.array(
                 [
-                    wbc_force_by_name[name]
+                    wbc_force_by_name.get(name, np.zeros(3))
                     for name in OCS2_CONTACT_ORDER
                 ]
             )
@@ -535,6 +587,7 @@ def main():
             rows.append(
                 [
                     float(mj_data.time),
+                    float(mode),
                     float(target[8]),
                     float(state_ref[8]),
                     float(q[2]),
@@ -551,6 +604,15 @@ def main():
                     float(result.contact_acceleration_residual_norm),
                     float(times[-1] - mj_data.time),
                     float(prediction_error_mm),
+                    *(
+                        [float(feet_by_name[name][2]) for name in OCS2_CONTACT_ORDER]
+                        if trot_wbc is not None else [float("nan")] * 4
+                    ),
+                    *(
+                        float(swing_targets[name][0][2])
+                        if name in swing_targets else float("nan")
+                        for name in OCS2_CONTACT_ORDER
+                    ),
                 ]
             )
             if mj_data.time >= next_print:
@@ -571,6 +633,7 @@ def main():
 
                 print(
                     f"t={mj_data.time:5.2f} "
+                    f"mode={mode} "
                     f"goal={target[8]:.4f} "
                     f"z={q[2]:.4f} "
                     f"plan+0.2={future_z:.4f} "
@@ -695,10 +758,37 @@ def main():
                 "maximum": float(np.max(values_ms)),
             }
 
+        swing_height_max = {}
+        swing_tracking_rmse = {}
+        for name, key in zip(
+            OCS2_CONTACT_ORDER, ("fl", "fr", "rl", "rr")
+        ):
+            actual_z = records[:, column[f"foot_z_{key}_m"]]
+            target_z = records[:, column[f"swing_target_z_{key}_m"]]
+            swing_samples = np.isfinite(target_z)
+            swing_height_max[name] = (
+                float(np.max(actual_z[swing_samples]))
+                if np.any(swing_samples) else None
+            )
+            swing_tracking_rmse[name] = (
+                float(1000.0 * np.sqrt(np.mean(
+                    (actual_z[swing_samples] - target_z[swing_samples]) ** 2
+                )))
+                if np.any(swing_samples) else None
+            )
+
         summary = {
             "requested_duration_s": args.duration,
             "actual_duration_s": float(mj_data.time),
             "samples": len(records),
+            "mode_samples": {
+                str(mode): int(np.count_nonzero(
+                    records[:, column["mode"]] == mode
+                ))
+                for mode in OCS2_MODE_CONTACTS
+            },
+            "swing_foot_height_max_m": swing_height_max,
+            "swing_foot_tracking_rmse_mm": swing_tracking_rmse,
             "simulation_timestep_s": float(dt),
             "evaluation_start_s": evaluation_start_s,
             "goal_height_rmse_mm": float(

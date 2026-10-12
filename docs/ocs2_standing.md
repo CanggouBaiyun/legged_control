@@ -80,7 +80,7 @@ env -u PYTHONPATH \
 
 The `standing_trot` template in `config/ocs2/go2/gait.info` was sent through the ROS 2 gait command node. The MPC inserted it after the active policy horizon at simulation time 10.08 s in this run. The policy then contained mode 9 from 10.08 to 10.38 s, mode 15 from 10.38 to 10.43 s, mode 6 from 10.43 to 10.73 s, and another mode 15 from 10.73 to 10.78 s. The C++ MRT service returned mode 9; the standing simulation stopped at its explicit mode-15 guard before applying a two-foot-stance torque.
 
-This checks gait-command delivery, policy mode scheduling and MRT transport. It does not validate trot motion. The C++ MRT cache accepts modes 15, 9 and 6 and checks that event times are finite, ordered and one fewer than the modes. The standing simulation continues to reject modes 9 and 6 until WBC contact switching and swing references are integrated.
+This was the initial transport-only check. The C++ MRT cache accepts modes 15, 9 and 6 and checks that event times are finite, ordered and one fewer than the modes. Mode-dependent WBC switching and swing targets were subsequently integrated behind `--allow-trot`; see [the 20 s in-place trot result](ocs2_trot.md). The default standing run still rejects modes 9 and 6.
 
 ## Verified 20 s result
 
@@ -122,7 +122,6 @@ Before hardware use, the 50 Hz MPC update must run asynchronously from the 500 H
 
 1. Investigate the remaining roughly 3.18 mm lower-hold height offset.
 2. Decouple policy updates from the WBC loop and measure deadline misses again.
-3. Select WBC stance feet from the transmitted trot mode schedule.
-4. Connect swing-foot references and align them with the MPC policy.
-5. Validate stepping in place before translation, stopping and turning.
+3. Align WBC swing-foot trajectories with the MPC swing constraints and verify touchdown forces.
+4. Validate low-speed translation, stopping and turning after the verified in-place trot.
 6. Add state estimation and the Unitree SDK2 interface only after simulation timing and safety gates are established.

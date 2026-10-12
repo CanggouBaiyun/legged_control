@@ -3,6 +3,7 @@ import json
 import math
 import sys
 import time
+from bisect import bisect_left
 
 import rclpy
 from ocs2_msgs.msg import (
@@ -11,6 +12,7 @@ from ocs2_msgs.msg import (
     MpcObservation,
     MpcState,
     MpcTargetTrajectories,
+    ModeSchedule,
 )
 from ocs2_msgs.srv import Reset
 from go2_mpc_bridge.srv import EvaluatePolicy
@@ -119,6 +121,11 @@ def main():
         "/legged_robot_mpc_observation",
         1,
     )
+    gait_publisher = node.create_publisher(
+        ModeSchedule,
+        "/legged_robot_mpc_mode_schedule",
+        1,
+    )
     policies = []
     subscription = node.create_subscription(
         MpcFlattenedController,
@@ -165,6 +172,23 @@ def main():
 
                 if action != "plan":
                     raise ValueError(f"Unknown request action: {action}")
+
+                gait = request.get("gait")
+                if gait is not None and gait != "standing_trot":
+                    raise ValueError(f"Unsupported gait command: {gait}")
+                if gait == "standing_trot":
+                    deadline = time.monotonic() + 3.0
+                    while (
+                        gait_publisher.get_subscription_count() == 0
+                        and time.monotonic() < deadline
+                    ):
+                        rclpy.spin_once(node, timeout_sec=0.01)
+                    if gait_publisher.get_subscription_count() == 0:
+                        raise RuntimeError("MPC gait receiver is unavailable")
+                    gait_publisher.publish(ModeSchedule(
+                        event_times=[0.0, 0.30, 0.35, 0.65, 0.70],
+                        mode_sequence=[9, 15, 6, 15],
+                    ))
                 
                 # 第一次请求：用站立目标初始化 MPC。
                 if epoch is None:
@@ -224,7 +248,12 @@ def main():
                 observation.time = stamp
                 observation.state = MpcState(value=request["state"])
                 observation.input = MpcInput(value=request["input"])
-                observation.mode = 15
+                if selected_policy is None:
+                    observation.mode = 15
+                else:
+                    schedule = selected_policy.mode_schedule
+                    phase = bisect_left(schedule.event_times, stamp)
+                    observation.mode = schedule.mode_sequence[phase]
 
                 deadline = time.monotonic() + 15.0
                 next_publish = 0.0

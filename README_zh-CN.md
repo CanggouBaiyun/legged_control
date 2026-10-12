@@ -4,7 +4,7 @@
 
 面向 Unitree Go2 的模型运动控制项目，使用 Pinocchio、MuJoCo 和基于 QP 的全身控制。目标架构参考 [legged_control](https://github.com/qiayuanl/legged_control)，包含 OCS2 NMPC、WBC、状态估计和机器人硬件接口。
 
-**当前范围：** 已完成 MuJoCo 站立、蹲起、移重和右前腿完整抬落脚闭环。Go2 全质心 OCS2 MPC 已通过 ROS 2 和 C++ MRT 策略查询服务驱动站立 WBC。trot、状态估计、Unitree SDK2 实机接口及实机安全仍待实现。
+**当前范围：** 已完成 MuJoCo 站立、蹲起、移重、右前腿完整抬落脚循环和原地 trot 闭环。Go2 全质心 OCS2 MPC 通过 ROS 2 和 C++ MRT 策略查询服务驱动按接触模式切换的 WBC。前进、停止、转向、状态估计、Unitree SDK2 接口及实机安全仍待实现。
 
 ## 当前状态
 
@@ -21,12 +21,12 @@
 | FR 抬升、触地确认与四足承重恢复 | 完整循环已验证，已加入自动回归测试 |
 | OCS2 全质心 NMPC → MRT → WBC 固定四足站立 | 已完成 20 s 闭环仿真验证 |
 | ROS 2 MPC 通信与 C++ MRT 策略查询 | 已实现并验证 |
-| trot 命令、MPC 模式时间表与 C++ MRT 查询 | 服务支持 15/9/6；模式 9 已到达仿真保护逻辑；trot 闭环尚未验证 |
-| 按模式查找摆动区间、生成轨迹并锁定原地落脚目标 | 离线测试通过；尚未接入 trot 闭环 |
-| trot 和抗扰恢复 | 计划中 |
+| trot 命令、MPC 模式时间表与 C++ MRT 查询 | 20 s 闭环仿真已运行模式 15/9/6 |
+| 按模式切换 WBC 和锁定原地摆动目标 | 20 s 原地 trot 闭环验证；四脚均有实际抬升 |
+| 前进、停止、转向和抗扰恢复 | 计划中 |
 | SDK2、状态估计和实机安全 | 计划中 |
 
-当前 OCS2 只验证固定四足站立，单腿循环仍使用脚本接触阶段。两者都不是连续行走步态，也不代表已经具备真机部署条件。
+OCS2 控制器已完成 MuJoCo 无窗口 20 s 原地 trot。单腿循环仍使用脚本接触阶段。当前 trot 结果尚不能证明前进、停止、转向或实机部署能力。
 
 ## 控制架构
 
@@ -61,7 +61,7 @@ WBC 和关节参考 IK 使用同一组基座、足端轨迹。关节 PD 在 QP �
            MuJoCo
 ```
 
-OCS2 足端顺序为 FL、FR、RL、RR，WBC 顺序为 FR、FL、RR、RL。适配器按足端名称转换接触力，测试使用每只脚不同的力检查顺序错误。适配器、ROS 传输层和 C++ MRT 服务已识别模式 15（四脚支撑）、9（FL/RR）和 6（FR/RL）。离线检查已验证对角支撑 WBC 的同一个 QP 能跟踪两只摆动脚。[gait.info](config/ocs2/go2/gait.info) 已定义 `standing_trot` 步态模板，MPC 传输层会把模式时间表交给 MuJoCo。步态命令已使模式 9 到达仿真，站立脚本在施加其力矩前主动停止。离线函数能查找摆动区间并生成平滑足端轨迹；原地踏步规划器会锁定每只脚的起摆和落脚目标，避免策略更新时重置正在进行的摆动。trot 闭环还需把接触模式切换和足端目标接入仿真循环。
+OCS2 足端顺序为 FL、FR、RL、RR，默认四足 WBC 顺序为 FR、FL、RR、RL。适配器按足端名称转换接触力，测试使用每只脚不同的力检查顺序错误。适配器、ROS 传输层和 C++ MRT 服务支持模式 15（四脚支撑）、9（FL/RR）和 6（FR/RL）。启用 `--allow-trot` 后，仿真按当前支撑脚选择 WBC，并向两只摆动脚提供锁定的轨迹目标。`--trot-at 3` 通过与键盘步态工具相同的 ROS 2 话题发送 `standing_trot` 时序；ROS 观测消息也会报告当前策略模式。详见[原地 trot 验证记录](docs/ocs2_trot.md)。
 
 ## 验证结果
 
@@ -228,14 +228,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_single_leg_cycle.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-最近一次已验证的回归结果为 **30 passed，4 warnings**，包含 MPC/WBC 足端顺序、MRT 通信边界、五次轨迹及 20 s 无窗口单腿循环检查。无窗口模式不会主动等待以匹配真实时间，耗时取决于计算速度。hppfcl/coal 和 OSQP 的依赖弃用提示与测试失败是两回事。
+最近一次已验证的回归结果为 **37 passed，6 warnings**，包含 MPC/WBC 足端顺序、MRT 通信边界、五次轨迹及 20 s 无窗口单腿循环检查。无窗口模式不会主动等待以匹配真实时间，耗时取决于计算速度。hppfcl/coal 和 OSQP 的依赖弃用提示与测试失败是两回事。
 
 循环 CSV 保存 FR 期望/实际坐标系高度和实际法向接触力。汇总中的高度误差指身体高度；`maximum_xy_drift_mm` 是相对世界原点的水平位移，包含主动移重，不是目标跟踪误差。
 
 ## 开发路线
 
 1. 修正剩余的 OCS2 高度目标偏差，并将 50 Hz MPC 更新与 500 Hz WBC 循环解耦。
-2. 加入 trot 接触时序与摆动轨迹，依次验证原地踏步、低速前进、停止和转向。
+2. 对齐 WBC 摆动轨迹与 OCS2 摆动约束，继续验证低速前进、停止和转向。
 3. 使用可重复的外力脉冲验证抗扰恢复。区分“不摔倒”“恢复姿态”和“回到固定世界位置”，记录外力、持续时间、作用点、恢复时间及约束违反情况。
 4. 将硬件频率组件迁移到 C++，加入 ROS 2 / SDK2、状态估计、接触判断、超时保护和急停处理。
 5. 在低能量悬空实机测试前，验证力矩、关节、姿态和通信丢失安全门限。
@@ -272,7 +272,7 @@ v0.5.0-mujoco-standing-squat
 v0.6.0-mujoco-single-leg-cycle
 ```
 
-`v0.6.0-mujoco-single-leg-cycle` 包含已验证的单腿抬落脚循环及回归测试。`feature/ocs2-integration` 已完成固定站立 OCS2–MRT–WBC 验证，下一项运动能力是 trot。
+`v0.6.0-mujoco-single-leg-cycle` 包含已验证的单腿抬落脚循环及回归测试。固定站立 OCS2–MRT–WBC 验证已从 `feature/ocs2-integration` 合并；20 s 原地 trot 已在 `feature/ocs2-trot` 验证。
 
 ## 许可证
 

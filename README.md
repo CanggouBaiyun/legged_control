@@ -4,7 +4,7 @@
 
 Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and QP-based whole-body control. The target architecture follows [legged_control](https://github.com/qiayuanl/legged_control): OCS2 NMPC, WBC, state estimation and a robot hardware interface.
 
-**Current scope:** closed-loop standing, squatting, load transfer and a complete right-front single-leg lift–touchdown cycle in MuJoCo. A Go2 full-centroidal OCS2 MPC now drives the standing WBC through ROS 2 and a C++ MRT policy-query service. Trot, state estimation, the Unitree SDK2 hardware interface and hardware safety remain to be implemented.
+**Current scope:** closed-loop standing, squatting, load transfer, a complete right-front single-leg cycle and in-place trot in MuJoCo. Go2 full-centroidal OCS2 MPC drives mode-dependent WBC through ROS 2 and a C++ MRT policy-query service. Translation, stopping, turning, state estimation, the Unitree SDK2 interface and hardware safety remain to be implemented.
 
 ## Status
 
@@ -21,12 +21,12 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | FR lift, touchdown detection and four-foot support recovery | Complete cycle verified; automated regression test |
 | OCS2 full-centroidal NMPC → MRT → WBC, fixed four-foot stance | 20 s closed-loop simulation verified |
 | ROS 2 MPC transport and C++ MRT policy query | Implemented and verified |
-| Trot gait command, MPC mode schedule and C++ MRT query | Service accepts 15/9/6; mode 9 reached the simulation guard; closed-loop trot not yet verified |
-| Mode-aware swing intervals, foot trajectories and latched in-place targets | Offline tests passed; not yet connected to closed-loop trot |
-| Trot and disturbance recovery | Planned |
+| Trot gait command, MPC mode schedule and C++ MRT query | Modes 15/9/6 verified in a 20 s closed-loop simulation |
+| Mode-aware WBC and latched in-place swing targets | 20 s closed-loop trot verified; all four feet lifted |
+| Translation, stopping, turning and disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
-The verified OCS2 mode is fixed four-foot stance. The single-leg cycle still uses scripted contact phases. Neither result is a walking gait or a hardware-ready controller.
+The OCS2 controller has completed a 20 s in-place trot in headless MuJoCo. The single-leg cycle still uses scripted contact phases. The trot result does not establish translation, stopping, turning or hardware readiness.
 
 ## Architecture
 
@@ -61,7 +61,7 @@ Height trajectory + fixed stance mode 15
                   MuJoCo
 ```
 
-OCS2 orders the contacts as FL, FR, RL, RR. The adapter maps forces by frame name into the WBC order FR, FL, RR, RL. Tests use distinct per-foot forces to detect ordering mistakes. The adapter, ROS transport and C++ MRT service accept stance modes 15 (four feet), 9 (FL/RR) and 6 (FR/RL). A diagonal-stance WBC QP accepts and tracks two swing-foot tasks in an offline check. A `standing_trot` gait template is defined in [gait.info](config/ocs2/go2/gait.info), and the MPC transport passes its mode schedule to MuJoCo. A gait command reached the simulation as mode 9 and the standing-only guard stopped before applying its torque. Offline helpers locate each foot's swing interval and generate a smooth foot path. The in-place planner latches each foot's lift-off and touchdown targets until it returns to stance, so policy updates do not reset an active swing. Closed-loop trot still needs contact-mode switching and these targets connected to the simulation loop.
+OCS2 orders the contacts as FL, FR, RL, RR; the default four-foot WBC uses FR, FL, RR, RL. The adapter maps forces by frame name, and tests use distinct per-foot forces to detect ordering mistakes. The adapter, ROS transport and C++ MRT service accept stance modes 15 (four feet), 9 (FL/RR) and 6 (FR/RL). With `--allow-trot`, the simulation selects a WBC for the active stance feet and gives both swing feet latched trajectories. `--trot-at 3` sends the `standing_trot` schedule through the same ROS 2 topic used by the keyboard gait tool. The ROS observation reports the active policy mode. See [in-place trot results](docs/ocs2_trot.md).
 
 ## Verified Results
 
@@ -228,14 +228,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_single_leg_cycle.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-Latest verified regression result: **30 passed, 4 warnings**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic trajectory checks and a headless 20 s single-leg cycle. Headless execution does not intentionally sleep to match wall time; runtime depends on the machine. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
+Latest verified regression result: **37 passed, 6 warnings**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic trajectory checks and a headless 20 s single-leg cycle. Headless execution does not intentionally sleep to match wall time; runtime depends on the machine. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
 
 Cycle CSV logs include FR desired/actual frame height and actual normal contact force. Summary height errors refer to the base; `maximum_xy_drift_mm` measures displacement from the world origin, including the intentional base shift, not target-tracking error.
 
 ## Roadmap
 
 1. Correct the remaining OCS2 height-target offset and separate 50 Hz MPC updates from the 500 Hz WBC loop.
-2. Add trot contact scheduling and swing references; validate stepping in place, low-speed translation, stopping and turning.
+2. Align the WBC swing path with the OCS2 swing constraints; validate low-speed translation, stopping and turning.
 3. Test disturbance recovery with repeatable force pulses. Distinguish staying upright, recovering pose and returning to a fixed world-position target; record force, duration, application point, recovery time and constraint violations.
 4. Move hardware-rate components to C++ and add the ROS 2 / SDK2 interface, state estimation, contact detection, watchdogs and emergency-stop handling.
 5. Validate torque, joint, orientation and communication-loss safety gates before low-energy suspended hardware tests.
@@ -272,7 +272,7 @@ v0.5.0-mujoco-standing-squat
 v0.6.0-mujoco-single-leg-cycle
 ```
 
-`v0.6.0-mujoco-single-leg-cycle` contains the verified lift–touchdown cycle and its regression test. Fixed-stance OCS2–MRT–WBC integration is now verified on `feature/ocs2-integration`; trot is the next locomotion milestone.
+`v0.6.0-mujoco-single-leg-cycle` contains the verified lift–touchdown cycle and its regression test. Fixed-stance OCS2–MRT–WBC integration was merged from `feature/ocs2-integration`; 20 s in-place trot is verified on `feature/ocs2-trot`.
 
 ## License
 

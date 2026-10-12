@@ -4,6 +4,7 @@ import pinocchio as pin
 from go2_control.centroidal import state_from_pinocchio
 from go2_control.model import (
     build_go2_simulation_model,
+    foot_positions,
     nominal_configuration,
 )
 from go2_control.mpc_reference import (
@@ -12,6 +13,7 @@ from go2_control.mpc_reference import (
     swing_interval_at_time,
 )
 from go2_control.wbc import StandingWBC
+from go2_control.wbc.trot import TrotWBC
 
 
 def test_mode_at_time_matches_ocs2_switch_boundary():
@@ -133,3 +135,35 @@ def test_swing_intervals_follow_diagonal_modes():
     assert swing_interval_at_time(events, modes, 1.35, "FR_foot") is None
     assert swing_interval_at_time(events, modes, 1.50, "FL_foot") == (1.35, 1.65)
     assert swing_interval_at_time(events, modes, 1.50, "RR_foot") == (1.35, 1.65)
+
+
+def test_trot_wbc_switches_contacts_and_keeps_swing_latched():
+    model = build_go2_simulation_model()
+    feet = foot_positions(model, nominal_configuration(model))
+    adapter = TrotWBC(model)
+    events = [1.00, 1.30, 1.35, 1.65]
+    modes = [15, 9, 15, 6, 15]
+
+    controller, targets = adapter.prepare(1.15, 9, events, modes, feet)
+    assert set(controller.contact_frame_names) == {"FL_foot", "RR_foot"}
+    assert set(targets) == {"FR_foot", "RL_foot"}
+
+    changed = {name: position + np.array([0.1, 0.0, 0.0])
+               for name, position in feet.items()}
+    controller, targets = adapter.prepare(
+        1.16, 9, events[1:], modes[1:], changed
+    )
+    assert set(controller.contact_frame_names) == {"FL_foot", "RR_foot"}
+    for name in targets:
+        np.testing.assert_allclose(
+            targets[name][0][:2], feet[name][:2], atol=1e-12
+        )
+
+    controller, targets = adapter.prepare(1.32, 15, events, modes, feet)
+    assert len(controller.contact_frame_names) == 4
+    assert targets == {}
+    assert adapter.swing_planner.plans == {}
+
+    controller, targets = adapter.prepare(1.50, 6, events, modes, feet)
+    assert set(controller.contact_frame_names) == {"FR_foot", "RL_foot"}
+    assert set(targets) == {"FL_foot", "RR_foot"}
