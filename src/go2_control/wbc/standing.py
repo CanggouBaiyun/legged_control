@@ -341,6 +341,10 @@ class StandingWBC:
         desired_swing_acceleration: np.ndarray | None = None,
         normal_force_upper_bounds: np.ndarray | None = None,
         desired_contact_forces: np.ndarray | None = None,
+        swing_targets: dict[
+            str,
+            tuple[np.ndarray, np.ndarray | None, np.ndarray | None],
+        ] | None = None,
     ) -> StandingWBCResult:
         """Solve the standing WBC problem at the current state."""
 
@@ -516,7 +520,22 @@ class StandingWBC:
         #保留原来的目标函数，本次求解按需添加摆动脚任务。
         quadratic_cost = self.quadratic_cost.copy()
 
+        if swing_targets is not None and swing_foot_name is not None:
+            raise ValueError("Use either swing_targets or swing_foot_name")
+
+        targets = dict(swing_targets or {})
         if swing_foot_name is not None:
+            targets[swing_foot_name] = (
+                desired_swing_position,
+                desired_swing_velocity,
+                desired_swing_acceleration,
+            )
+
+        for swing_foot_name, (
+            desired_swing_position,
+            desired_swing_velocity,
+            desired_swing_acceleration,
+        ) in targets.items():
             if swing_foot_name in self.contact_frame_names:
                 raise ValueError(
                     "Swing foot cannot also be a stance foot"

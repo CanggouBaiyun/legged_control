@@ -4,10 +4,29 @@ import pinocchio as pin
 from go2_control.centroidal import state_from_pinocchio
 from go2_control.model import (
     build_go2_simulation_model,
+    foot_positions,
     nominal_configuration,
 )
-from go2_control.mpc_reference import standing_reference_from_mpc
+from go2_control.mpc_reference import (
+    mode_at_time,
+    standing_reference_from_mpc,
+    swing_interval_at_time,
+)
 from go2_control.wbc import StandingWBC
+from go2_control.wbc.trot import TrotWBC
+
+
+def test_mode_at_time_matches_ocs2_switch_boundary():
+    events = [0.30, 0.35, 0.35, 0.65]
+    modes = [15, 9, 15, 6, 15]
+
+    assert mode_at_time(events, modes, 0.29) == 15
+    assert mode_at_time(events, modes, 0.30) == 15
+    assert mode_at_time(events, modes, 0.31) == 9
+    assert mode_at_time(events, modes, 0.35) == 9
+    assert mode_at_time(events, modes, 0.36) == 6
+    assert mode_at_time(events, modes, 0.65) == 6
+    assert mode_at_time(events, modes, 0.66) == 15
 
 
 def test_mpc_force_order():
@@ -29,19 +48,28 @@ def test_mpc_force_order():
         [0.0, 0.0, 40.0],  # RR
     ]).reshape(-1)
 
-    reference = standing_reference_from_mpc(
-        model,
-        model.createData(),
-        q,
-        state,
-        control,
-        ("FR_foot", "FL_foot", "RR_foot", "RL_foot"),
+    cases = (
+        (15, ("FR_foot", "FL_foot", "RR_foot", "RL_foot"),
+         [20.0, 10.0, 40.0, 30.0]),
+        (9, ("RR_foot", "FL_foot"), [40.0, 10.0]),
+        (6, ("RL_foot", "FR_foot"), [30.0, 20.0]),
     )
 
-    np.testing.assert_allclose(
-        reference["desired_contact_forces"][:, 2],
-        [20.0, 10.0, 40.0, 30.0],
-    )
+    for mode, contact_names, expected_forces in cases:
+        reference = standing_reference_from_mpc(
+            model,
+            model.createData(),
+            q,
+            state,
+            control,
+            contact_names,
+            mode=mode,
+        )
+
+        np.testing.assert_allclose(
+            reference["desired_contact_forces"][:, 2],
+            expected_forces,
+        )
 
 
 def test_wbc_accepts_mpc_standing_reference():
@@ -94,3 +122,48 @@ def test_wbc_accepts_mpc_standing_reference():
         atol=1e-7,
         rtol=1e-7,
     )
+
+def test_swing_intervals_follow_diagonal_modes():
+    events = [1.00, 1.30, 1.35, 1.65]
+    modes = [15, 9, 15, 6, 15]
+
+    assert swing_interval_at_time(events, modes, 1.00, "FR_foot") is None
+    assert swing_interval_at_time(events, modes, 1.15, "FR_foot") == (1.00, 1.30)
+    assert swing_interval_at_time(events, modes, 1.15, "RL_foot") == (1.00, 1.30)
+    assert swing_interval_at_time(events, modes, 1.15, "FL_foot") is None
+    assert swing_interval_at_time(events, modes, 1.30, "FR_foot") == (1.00, 1.30)
+    assert swing_interval_at_time(events, modes, 1.35, "FR_foot") is None
+    assert swing_interval_at_time(events, modes, 1.50, "FL_foot") == (1.35, 1.65)
+    assert swing_interval_at_time(events, modes, 1.50, "RR_foot") == (1.35, 1.65)
+
+
+def test_trot_wbc_switches_contacts_and_keeps_swing_latched():
+    model = build_go2_simulation_model()
+    feet = foot_positions(model, nominal_configuration(model))
+    adapter = TrotWBC(model)
+    events = [1.00, 1.30, 1.35, 1.65]
+    modes = [15, 9, 15, 6, 15]
+
+    controller, targets = adapter.prepare(1.15, 9, events, modes, feet)
+    assert set(controller.contact_frame_names) == {"FL_foot", "RR_foot"}
+    assert set(targets) == {"FR_foot", "RL_foot"}
+
+    changed = {name: position + np.array([0.1, 0.0, 0.0])
+               for name, position in feet.items()}
+    controller, targets = adapter.prepare(
+        1.16, 9, events[1:], modes[1:], changed
+    )
+    assert set(controller.contact_frame_names) == {"FL_foot", "RR_foot"}
+    for name in targets:
+        np.testing.assert_allclose(
+            targets[name][0][:2], feet[name][:2], atol=1e-12
+        )
+
+    controller, targets = adapter.prepare(1.32, 15, events, modes, feet)
+    assert len(controller.contact_frame_names) == 4
+    assert targets == {}
+    assert adapter.swing_planner.plans == {}
+
+    controller, targets = adapter.prepare(1.50, 6, events, modes, feet)
+    assert set(controller.contact_frame_names) == {"FR_foot", "RL_foot"}
+    assert set(targets) == {"FL_foot", "RR_foot"}

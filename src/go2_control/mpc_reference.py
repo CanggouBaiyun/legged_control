@@ -12,6 +12,39 @@ OCS2_CONTACT_ORDER = (
     "RL_foot",
     "RR_foot",
 )
+OCS2_MODE_CONTACTS = {
+    15: OCS2_CONTACT_ORDER,         # 四脚支撑
+    9: ("FL_foot", "RR_foot"),      # 对角支撑
+    6: ("FR_foot", "RL_foot"),      # 另一对角支撑
+}
+
+def mode_at_time(event_times, mode_sequence, stamp):
+    """Use the same event-time boundary rule as OCS2."""
+    index = np.searchsorted(event_times, stamp, side="left")
+    return int(mode_sequence[index])
+
+def swing_interval_at_time(event_times, mode_sequence, stamp, foot_name):
+    """Return (lift_off, touch_down), or None if the foot is in stance."""
+    if foot_name not in OCS2_CONTACT_ORDER:
+        raise ValueError(f"Unknown foot: {foot_name}")
+
+    index = int(np.searchsorted(event_times, stamp, side="left"))
+    mode = int(mode_sequence[index])
+
+    if foot_name in OCS2_MODE_CONTACTS[mode]:
+        return None
+
+    # An incomplete interval cannot define a full swing trajectory.
+    if index == 0 or index == len(event_times):
+        raise ValueError("Swing interval extends beyond the mode schedule")
+
+    lift_off = float(event_times[index - 1])
+    touch_down = float(event_times[index])
+    if touch_down <= lift_off:
+        raise ValueError("Swing interval has no duration")
+
+    return lift_off, touch_down
+
 
 def standing_reference_from_mpc(
     model,
@@ -22,9 +55,10 @@ def standing_reference_from_mpc(
     contact_frame_names,
     mode = 15,
 ):
-    """Convert one evaluated MPC reference; four-foot stance only."""
-    if mode != 15:
-        raise ValueError("This adapter currently supports stance mode only")
+    """Convert one evaluated MPC reference for the selected stance feet."""
+    expected_contacts = OCS2_MODE_CONTACTS.get(mode)
+    if expected_contacts is None:
+        raise ValueError(f"Unsupported OCS2 mode: {mode}")
 
     state = np.asarray(state_reference, dtype=float)
     control = np.asarray(input_reference, dtype=float)
@@ -38,10 +72,13 @@ def standing_reference_from_mpc(
     contact_names = tuple(contact_frame_names)
 
     if(
-        len(contact_names) != 4
-        or set(contact_names) != set(OCS2_CONTACT_ORDER)
+        len(contact_names) != len(expected_contacts)
+        or set(contact_names) != set(expected_contacts)
     ):
-        raise ValueError("Expected the four Go2 stance feet")
+        raise ValueError(
+            f"Mode {mode} requires stance feet {expected_contacts}, "
+            f"got {contact_names}"
+        )
 
     # Recover reference configuration and velocity from momentum
     # and the reference joint velocities.

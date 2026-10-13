@@ -15,6 +15,7 @@ import pinocchio as pin
 
 CSV_COLUMNS = (
     "time_s",
+    "mode",
     "goal_z_m",
     "mpc_z_m",
     "measured_z_m",
@@ -37,6 +38,22 @@ CSV_COLUMNS = (
     "contact_acceleration_residual",
     "policy_horizon_s",
     "prediction_error_mm",
+    "foot_z_fl_m",
+    "foot_z_fr_m",
+    "foot_z_rl_m",
+    "foot_z_rr_m",
+    "swing_target_z_fl_m",
+    "swing_target_z_fr_m",
+    "swing_target_z_rl_m",
+    "swing_target_z_rr_m",
+    "mj_floor_fz_fl_n",
+    "mj_floor_fz_fr_n",
+    "mj_floor_fz_rl_n",
+    "mj_floor_fz_rr_n",
+    "stance_center_xy_speed_fl_mps",
+    "stance_center_xy_speed_fr_mps",
+    "stance_center_xy_speed_rl_mps",
+    "stance_center_xy_speed_rr_mps",
 )
 
 from go2_control.centroidal import (
@@ -54,10 +71,13 @@ from go2_control.wbc.reference import (
 )
 from go2_control.mpc_reference import (
     OCS2_CONTACT_ORDER,
+    OCS2_MODE_CONTACTS,
+    mode_at_time,
     standing_reference_from_mpc,
 )
 from go2_control.simulation.mujoco_bridge import MujocoPinocchioBridge
 from go2_control.wbc import StandingWBC
+from go2_control.wbc.trot import TrotWBC
 
 
 def timed_call(samples, function, *args, **kwargs):
@@ -66,6 +86,22 @@ def timed_call(samples, function, *args, **kwargs):
     result = function(*args, **kwargs)
     samples.append(time.perf_counter() - start)
     return result
+
+
+def floor_normal_forces(model, data, floor_id, foot_name_by_geom):
+    """Read MuJoCo's solved normal forces for named foot-floor contacts."""
+    forces = {name: 0.0 for name in foot_name_by_geom.values()}
+    wrench = np.zeros(6)
+    for contact_id in range(data.ncon):
+        contact = data.contact[contact_id]
+        geom1, geom2 = int(contact.geom1), int(contact.geom2)
+        foot_geom = geom2 if geom1 == floor_id else geom1 if geom2 == floor_id else -1
+        foot_name = foot_name_by_geom.get(foot_geom)
+        if foot_name is None or contact.efc_address < 0:
+            continue
+        mujoco.mj_contactForce(model, data, contact_id, wrench)
+        forces[foot_name] += float(wrench[0])
+    return forces
 
 
 def request_transport(process, message):
@@ -94,6 +130,13 @@ def request_policy(process, message):
     states = np.asarray(reply["states"], dtype=float)
     inputs = np.asarray(reply["inputs"], dtype=float)
 
+    mode_event_times = np.asarray(
+        reply["mode_event_times"], dtype=float
+    )
+    mode_sequence = np.asarray(
+        reply["mode_sequence"], dtype=int
+    )
+
     if (
         times.ndim != 1
         or len(times) < 2
@@ -104,10 +147,19 @@ def request_policy(process, message):
         or not np.isfinite(inputs).all()
         or not np.all(np.diff(times) >= 0.0)
         or not np.any(np.diff(times) > 0.0)
+        or mode_event_times.ndim != 1
+        or mode_sequence.ndim != 1
+        or len(mode_sequence) != len(mode_event_times) + 1
+        or not np.isfinite(mode_event_times).all()
+        or not np.all(np.diff(mode_event_times) >= 0.0)
+        or any(
+            mode not in OCS2_MODE_CONTACTS
+            for mode in mode_sequence
+        )
     ):
         raise RuntimeError("Invalid standing policy arrays")
 
-    return times, states, inputs
+    return times, states, inputs, mode_event_times, mode_sequence
 
 
 def evaluate_policy(process, stamp, current_state):
@@ -124,9 +176,10 @@ def evaluate_policy(process, stamp, current_state):
 
     state = np.asarray(reply["state"], dtype=float)
     control = np.asarray(reply["input"], dtype=float)
+    mode = reply["mode"]
 
     if (
-        reply["mode"] != 15
+        mode not in OCS2_MODE_CONTACTS
         or state.shape != (24,)
         or control.shape != (24,)
         or not np.isfinite(state).all()
@@ -134,7 +187,7 @@ def evaluate_policy(process, stamp, current_state):
     ):
         raise RuntimeError("Invalid reference returned by MRT")
 
-    return state, control
+    return state, control, mode
 
 def standing_height_goal(time):
     """Smooth height goal: hold, lower, hold, rise, hold."""
@@ -178,11 +231,25 @@ def parse_args():
         type=Path,
         help="Optional path for per-step CSV output.",
     )
+    parser.add_argument(
+        "--allow-trot",
+        action="store_true",
+        help="Enable mode-dependent stance contacts and swing tasks.",
+    )
+    parser.add_argument(
+        "--trot-at",
+        type=float,
+        help="Send standing_trot when simulation time reaches this value.",
+    )
 
     args = parser.parse_args()
 
     if not 0.0 < args.duration <= 20.0:
         parser.error("--duration must be in (0, 20] seconds")
+    if args.trot_at is not None and (
+        not args.allow_trot or not 0.0 < args.trot_at < args.duration
+    ):
+        parser.error("--trot-at requires --allow-trot and a time within the run")
 
     return args
 
@@ -198,6 +265,18 @@ def main():
     model = build_go2_simulation_model()
     bridge = MujocoPinocchioBridge(mj_model, model)
     wbc = StandingWBC(model)
+    trot_wbc = TrotWBC(model) if args.allow_trot else None
+    floor_id = mujoco.mj_name2id(
+        mj_model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
+    )
+    foot_name_by_geom = {
+        mujoco.mj_name2id(
+            mj_model, mujoco.mjtObj.mjOBJ_GEOM, name.split("_")[0]
+        ): name
+        for name in OCS2_CONTACT_ORDER
+    }
+    if floor_id < 0 or -1 in foot_name_by_geom:
+        raise RuntimeError("Missing MuJoCo floor or named foot geom")
     mapping_data = model.createData()
 
     key = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -262,6 +341,10 @@ def main():
     last_control = np.zeros(24)
     next_print = 0.0
     clipped_steps = 0
+    gait_command_sent = False
+    previous_feet_by_name = None
+    previous_stance = set()
+    previous_floor_forces = None
     viewer = None
     predicted_next_z = None
     prediction_error_mm = float("nan")
@@ -317,7 +400,19 @@ def main():
                 # observation 中使用实际关节速度。
                 observation_input[12:] = v[6:]
 
-                times, states, inputs = timed_call(
+                send_gait = (
+                    args.trot_at is not None
+                    and not gait_command_sent
+                    and mj_data.time >= args.trot_at
+                )
+
+                (
+                    times,
+                    states,
+                    inputs,
+                    mode_event_times,
+                    mode_sequence,
+                ) = timed_call(
                     timings["plan"],
                     request_policy,
                     process,
@@ -331,8 +426,11 @@ def main():
                         "target": target.tolist(),
                         "target_times": target_times.tolist(),
                         "target_states": target_states.tolist(),
+                        **({"gait": "standing_trot"} if send_gait else {}),
                     },
                 )
+                if send_gait:
+                    gait_command_sent = True
 
                 next_policy_time = (
                     mj_data.time + steps_per_policy * dt
@@ -353,13 +451,41 @@ def main():
                 v,
             )
 
-            state_ref, input_ref = timed_call(
+            state_ref, input_ref, mode = timed_call(
                 timings["mrt"],
                 evaluate_policy,
                 process,
                 mj_data.time,
                 current_mpc_state,
             )
+
+            scheduled_mode = mode_at_time(
+                mode_event_times, mode_sequence, mj_data.time
+            )
+            if mode != scheduled_mode:
+                raise RuntimeError(
+                    f"MRT mode {mode} differs from policy schedule "
+                    f"mode {scheduled_mode} at {mj_data.time:.6f}s"
+                )
+
+            if mode != 15 and trot_wbc is None:
+                raise RuntimeError(
+                    f"Standing simulation requires mode 15, got {mode}"
+                )
+
+            swing_targets = {}
+            if trot_wbc is not None:
+                feet_by_name = {
+                    name: np.asarray(position, dtype=float)
+                    for name, position in foot_positions(model, q).items()
+                }
+                wbc, swing_targets = trot_wbc.prepare(
+                    mj_data.time,
+                    mode,
+                    mode_event_times,
+                    mode_sequence,
+                    feet_by_name,
+                )
 
             last_control = input_ref.copy()
 
@@ -370,6 +496,7 @@ def main():
                 state_ref,
                 input_ref,
                 wbc.contact_frame_names,
+                mode=mode,
             )
 
             # 同一条策略上，用参考基座世界系速度的变化估计加速度
@@ -381,12 +508,32 @@ def main():
                     "Policy does not cover acceleration estimation"
                 )
 
-            future_state_ref, future_input_ref = timed_call(
+            future_state_ref, future_input_ref, future_mode = timed_call(
                 timings["mrt"],
                 evaluate_policy,
                 process,
                 future_time,
                 current_mpc_state,
+            )
+
+            scheduled_future_mode = mode_at_time(
+                mode_event_times, mode_sequence, future_time
+            )
+            if future_mode != scheduled_future_mode:
+                raise RuntimeError(
+                    f"MRT future mode {future_mode} differs from "
+                    f"policy schedule mode {scheduled_future_mode} "
+                    f"at {future_time:.6f}s"
+                )
+
+            if future_mode != 15 and trot_wbc is None:
+                raise RuntimeError(
+                    f"Standing simulation requires mode 15, got {future_mode}"
+                )
+
+            future_wbc = (
+                trot_wbc.controllers[future_mode]
+                if trot_wbc is not None else wbc
             )
 
             future_reference = standing_reference_from_mpc(
@@ -395,7 +542,8 @@ def main():
                 q,
                 future_state_ref,
                 future_input_ref,
-                wbc.contact_frame_names,
+                future_wbc.contact_frame_names,
+                mode=future_mode,
             )
 
             current_velocity_world = reference[
@@ -423,6 +571,7 @@ def main():
                 wbc.solve,
                 q=q,
                 v=v,
+                swing_targets=swing_targets,
                 **reference,
             )
 
@@ -466,7 +615,7 @@ def main():
             )
             wbc_forces_ocs2_order = np.array(
                 [
-                    wbc_force_by_name[name]
+                    wbc_force_by_name.get(name, np.zeros(3))
                     for name in OCS2_CONTACT_ORDER
                 ]
             )
@@ -476,9 +625,9 @@ def main():
             )
             actual_vz = float(mj_data.qvel[2])
 
-            rows.append(
-                [
+            row = [
                     float(mj_data.time),
+                    float(mode),
                     float(target[8]),
                     float(state_ref[8]),
                     float(q[2]),
@@ -495,8 +644,16 @@ def main():
                     float(result.contact_acceleration_residual_norm),
                     float(times[-1] - mj_data.time),
                     float(prediction_error_mm),
-                ]
-            )
+                    *(
+                        [float(feet_by_name[name][2]) for name in OCS2_CONTACT_ORDER]
+                        if trot_wbc is not None else [float("nan")] * 4
+                    ),
+                    *(
+                        float(swing_targets[name][0][2])
+                        if name in swing_targets else float("nan")
+                        for name in OCS2_CONTACT_ORDER
+                    ),
+            ]
             if mj_data.time >= next_print:
                 lookahead_time = mj_data.time + 0.2
                 if lookahead_time > times[-1]:
@@ -515,6 +672,7 @@ def main():
 
                 print(
                     f"t={mj_data.time:5.2f} "
+                    f"mode={mode} "
                     f"goal={target[8]:.4f} "
                     f"z={q[2]:.4f} "
                     f"plan+0.2={future_z:.4f} "
@@ -533,6 +691,37 @@ def main():
 
             # E. 执行力矩，推进真实的仿真动力学。
             mujoco.mj_step(mj_model, mj_data)
+            if trot_wbc is not None:
+                # mj_step 的接触求解对应本步积分前的 q、v 和 mode。
+                floor_forces = floor_normal_forces(
+                    mj_model, mj_data, floor_id, foot_name_by_geom
+                )
+                stance_speeds = {}
+                for name in OCS2_CONTACT_ORDER:
+                    speed = float("nan")
+                    if (
+                        name in wbc.contact_frame_names
+                        and name in previous_stance
+                        and previous_feet_by_name is not None
+                        and previous_floor_forces[name] > 1.0
+                        and floor_forces[name] > 1.0
+                    ):
+                        speed = float(np.linalg.norm(
+                            feet_by_name[name][:2]
+                            - previous_feet_by_name[name][:2]
+                        ) / dt)
+                    stance_speeds[name] = speed
+                row.extend(floor_forces[name] for name in OCS2_CONTACT_ORDER)
+                row.extend(stance_speeds[name] for name in OCS2_CONTACT_ORDER)
+                previous_feet_by_name = {
+                    name: position.copy()
+                    for name, position in feet_by_name.items()
+                }
+                previous_stance = set(wbc.contact_frame_names)
+                previous_floor_forces = floor_forces
+            else:
+                row.extend([float("nan")] * 8)
+            rows.append(row)
             if viewer is not None:
                 viewer.sync()
             timings["loop"].append(time.perf_counter() - loop_start)
@@ -639,10 +828,75 @@ def main():
                 "maximum": float(np.max(values_ms)),
             }
 
+        swing_height_max = {}
+        swing_tracking_rmse = {}
+        stance_contact_fraction = {}
+        mid_swing_contact_samples = {}
+        stance_center_speed_p95 = {}
+        maximum_floor_force = {}
+        for name, key in zip(
+            OCS2_CONTACT_ORDER, ("fl", "fr", "rl", "rr")
+        ):
+            actual_z = records[:, column[f"foot_z_{key}_m"]]
+            target_z = records[:, column[f"swing_target_z_{key}_m"]]
+            swing_samples = np.isfinite(target_z)
+            swing_height_max[name] = (
+                float(np.max(actual_z[swing_samples]))
+                if np.any(swing_samples) else None
+            )
+            swing_tracking_rmse[name] = (
+                float(1000.0 * np.sqrt(np.mean(
+                    (actual_z[swing_samples] - target_z[swing_samples]) ** 2
+                )))
+                if np.any(swing_samples) else None
+            )
+            normal_force = active[:, column[f"mj_floor_fz_{key}_n"]]
+            stance = np.array([
+                name in OCS2_MODE_CONTACTS[int(mode)]
+                for mode in active[:, column["mode"]]
+            ])
+            measured_contact = normal_force > 1.0
+            stance_contact_fraction[name] = (
+                float(np.mean(measured_contact[stance]))
+                if np.any(stance) and np.isfinite(normal_force).any()
+                else None
+            )
+            mid_swing = (
+                active[:, column[f"swing_target_z_{key}_m"]] > 0.07
+            )
+            mid_swing_contact_samples[name] = (
+                int(np.count_nonzero(measured_contact & mid_swing))
+                if np.isfinite(normal_force).any() else None
+            )
+            center_speed = active[
+                :, column[f"stance_center_xy_speed_{key}_mps"]
+            ]
+            valid_speed = center_speed[np.isfinite(center_speed)]
+            stance_center_speed_p95[name] = (
+                float(np.percentile(valid_speed, 95))
+                if valid_speed.size else None
+            )
+            maximum_floor_force[name] = (
+                float(np.nanmax(normal_force))
+                if np.isfinite(normal_force).any() else None
+            )
+
         summary = {
             "requested_duration_s": args.duration,
             "actual_duration_s": float(mj_data.time),
             "samples": len(records),
+            "mode_samples": {
+                str(mode): int(np.count_nonzero(
+                    records[:, column["mode"]] == mode
+                ))
+                for mode in OCS2_MODE_CONTACTS
+            },
+            "swing_foot_height_max_m": swing_height_max,
+            "swing_foot_tracking_rmse_mm": swing_tracking_rmse,
+            "stance_floor_contact_fraction_over_1n": stance_contact_fraction,
+            "mid_swing_floor_contact_samples": mid_swing_contact_samples,
+            "stance_center_xy_speed_p95_mps": stance_center_speed_p95,
+            "maximum_floor_normal_force_n": maximum_floor_force,
             "simulation_timestep_s": float(dt),
             "evaluation_start_s": evaluation_start_s,
             "goal_height_rmse_mm": float(

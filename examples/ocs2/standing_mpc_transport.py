@@ -3,6 +3,7 @@ import json
 import math
 import sys
 import time
+from bisect import bisect_left
 
 import rclpy
 from ocs2_msgs.msg import (
@@ -11,10 +12,12 @@ from ocs2_msgs.msg import (
     MpcObservation,
     MpcState,
     MpcTargetTrajectories,
+    ModeSchedule,
 )
 from ocs2_msgs.srv import Reset
 from go2_mpc_bridge.srv import EvaluatePolicy
 
+SUPPORTED_CONTACT_MODES = {15, 9, 6}
 
 def query_mrt(node, client, policy, stamp, current_state):
     """Query the exact selected policy; never substitute another policy."""
@@ -84,7 +87,7 @@ def query_mrt(node, client, policy, stamp, current_state):
         if (
             response.reset_epoch != query.reset_epoch
             or response.policy_sequence != query.policy_sequence
-            or response.mode != 15
+            or response.mode not in SUPPORTED_CONTACT_MODES
         ):
             raise RuntimeError("MRT response policy ID or mode mismatch")
 
@@ -116,6 +119,11 @@ def main():
     publisher = node.create_publisher(
         MpcObservation,
         "/legged_robot_mpc_observation",
+        1,
+    )
+    gait_publisher = node.create_publisher(
+        ModeSchedule,
+        "/legged_robot_mpc_mode_schedule",
         1,
     )
     policies = []
@@ -164,6 +172,23 @@ def main():
 
                 if action != "plan":
                     raise ValueError(f"Unknown request action: {action}")
+
+                gait = request.get("gait")
+                if gait is not None and gait != "standing_trot":
+                    raise ValueError(f"Unsupported gait command: {gait}")
+                if gait == "standing_trot":
+                    deadline = time.monotonic() + 3.0
+                    while (
+                        gait_publisher.get_subscription_count() == 0
+                        and time.monotonic() < deadline
+                    ):
+                        rclpy.spin_once(node, timeout_sec=0.01)
+                    if gait_publisher.get_subscription_count() == 0:
+                        raise RuntimeError("MPC gait receiver is unavailable")
+                    gait_publisher.publish(ModeSchedule(
+                        event_times=[0.0, 0.30, 0.35, 0.65, 0.70],
+                        mode_sequence=[9, 15, 6, 15],
+                    ))
                 
                 # 第一次请求：用站立目标初始化 MPC。
                 if epoch is None:
@@ -223,7 +248,12 @@ def main():
                 observation.time = stamp
                 observation.state = MpcState(value=request["state"])
                 observation.input = MpcInput(value=request["input"])
-                observation.mode = 15
+                if selected_policy is None:
+                    observation.mode = 15
+                else:
+                    schedule = selected_policy.mode_schedule
+                    phase = bisect_left(schedule.event_times, stamp)
+                    observation.mode = schedule.mode_sequence[phase]
 
                 deadline = time.monotonic() + 15.0
                 next_publish = 0.0
@@ -259,8 +289,18 @@ def main():
                         )
 
                     modes = list(policy.mode_schedule.mode_sequence)
-                    if not modes or any(mode != 15 for mode in modes):
-                        raise RuntimeError("Standing mode 15 required")
+                    events = list(policy.mode_schedule.event_times)
+                    if(
+                        len(events) != len(modes) - 1
+                        or not all(math.isfinite(t) for t in events)
+                        or any(
+                            second < first
+                            for first, second in zip(events[:-1], events[1:])
+                        )
+                    ):
+                        raise RuntimeError("Invalid MPC mode schedule")
+                    if not modes or any(mode not in SUPPORTED_CONTACT_MODES for mode in modes):
+                        raise RuntimeError("Unsupported MPC contact mode")
 
                     times = list(policy.time_trajectory)
                     if (
@@ -281,6 +321,8 @@ def main():
                             list(item.data)
                             for item in policy.data
                         ],
+                        "mode_event_times": events,
+                        "mode_sequence": modes,
                     }
                     selected_policy = policy
                     last_sequence = policy.policy_sequence
