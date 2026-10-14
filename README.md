@@ -22,7 +22,7 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | OCS2 full-centroidal NMPC → MRT → WBC, fixed four-foot stance | 20 s closed-loop simulation verified |
 | ROS 2 MPC transport and C++ MRT policy query | Implemented and verified |
 | Trot gait command, MPC mode schedule and C++ MRT query | Modes 15/9/6 verified in a 20 s closed-loop simulation |
-| Mode-aware WBC and latched in-place swing targets | 20 s closed-loop trot; all four feet lifted; floor contacts measured |
+| Mode-aware WBC and latched in-place swing targets | 20 s closed-loop trot; all four feet lifted; vertical swing reference aligned with OCS2 parameters and floor contacts measured |
 | Translation, stopping, turning and disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
@@ -228,14 +228,14 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_single_leg_cycle.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-Latest verified regression result: **37 passed, 6 warnings**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic trajectory checks and a headless 20 s single-leg cycle. Headless execution does not intentionally sleep to match wall time; runtime depends on the machine. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
+Latest verified regression result: **38 passed, 6 warnings**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic and OCS2 vertical swing trajectory checks, and a headless 20 s single-leg cycle. Headless execution does not intentionally sleep to match wall time; runtime depends on the machine. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
 
 Cycle CSV logs include FR desired/actual frame height and actual normal contact force. Summary height errors refer to the base; `maximum_xy_drift_mm` measures displacement from the world origin, including the intentional base shift, not target-tracking error.
 
 ## Roadmap
 
 1. Correct the remaining OCS2 height-target offset and separate 50 Hz MPC updates from the 500 Hz WBC loop.
-2. Align the WBC swing path with the OCS2 swing constraints; validate low-speed translation, stopping and turning.
+2. Build on the aligned vertical swing reference by adding forward foothold planning; validate low-speed translation, stopping and turning.
 3. Test disturbance recovery with repeatable force pulses. Distinguish staying upright, recovering pose and returning to a fixed world-position target; record force, duration, application point, recovery time and constraint violations.
 4. Move hardware-rate components to C++ and add the ROS 2 / SDK2 interface, state estimation, contact detection, watchdogs and emergency-stop handling.
 5. Validate torque, joint, orientation and communication-loss safety gates before low-energy suspended hardware tests.
