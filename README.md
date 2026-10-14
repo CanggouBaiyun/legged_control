@@ -26,12 +26,15 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | Low-speed forward trot | 20 s headless run at 0.03 m/s with a 0.09 m displacement target; forward motion measured for all four feet, contact-point slip still to be checked |
 | Trot to four-foot stance | Stance command at 15 s; mode 15 sustained from 16.020 s in a 20 s headless run |
 | In-place yaw turn | Initial 20 s headless runs for ±10° targets; final measured +9.77° / -9.79°; left-turn foot XY direction verified, with endpoint errors and touchdown slip transients recorded |
+| MPC-derived swing references | Optional `--swing-reference=mpc`; first 20 s +10° turn measured 9.91°, loaded contact tangent-speed peak 60.43 mm/s; forward and reverse runs pending |
 | Disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
 The OCS2 controller has completed a 20 s in-place trot and a headless low-speed forward run with measured forward swing for all four feet and a return to four-foot stance. Adding angular-acceleration feedforward improved a 10° yaw-turn experiment from 4.26° to 9.77° at the last recorded sample; a -10° run measured -9.79°. Transient lag remains, with approximately 2.31° goal-tracking RMSE during 8–12 s in both directions. Left-turn foot XY tracking RMSE is 2.87–4.39 mm; loaded contact tangent-speed p95 during 8–12 s is 2.34–2.78 mm/s, with an FR touchdown peak of 149.01 mm/s later in the run. These measurements do not establish slip-free locomotion. The single-leg cycle still uses scripted contact phases; hardware readiness remains unverified. See the [forward trot notes](docs/ocs2_forward_trot.md) and [yaw-turn results](docs/ocs2_trot_yaw.md).
 
 ## Architecture
+
+The OCS2 simulation offers two swing-reference sources. The default `planner` uses latched foot trajectories. With `--swing-reference=mpc`, WBC foot position and velocity targets come from the same MRT policy as the joint PD references; foot acceleration feedforward is estimated using the existing future policy query within the same swing phase. This optional path has completed a first left-turn run; forward and reverse motion remain to be validated. Current-policy tracking errors cannot be compared directly with fixed planner targets because MPC replans from measured states. See the [comparison](docs/ocs2_trot_yaw.md).
 
 Implemented scripted-motion simulation path:
 

@@ -211,6 +211,26 @@ def floor_contact_tangent_speeds(model, data, floor_id, foot_name_by_geom):
 
     return speeds, translation_speeds, rotation_speeds
 
+def mpc_foot_references(model, data, state, control):
+    """Read world-frame foot positions and velocities from one MPC point."""
+    q_ref, v_ref = pinocchio_from_state(
+        model, data, state, control[12:]
+    )
+    pin.forwardKinematics(model, data, q_ref, v_ref)
+    pin.updateFramePlacements(model, data)
+
+    references = {}
+    for name in OCS2_CONTACT_ORDER:
+        frame_id = model.getFrameId(name)
+        position = data.oMf[frame_id].translation.copy()
+        velocity = pin.getFrameVelocity(
+            model, data, frame_id,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+        ).linear.copy()
+        references[name] = (position, velocity)
+
+    return references
+
 def joint_pd_swing_reference_deltas(
     model, data, q, v, q_ref, v_ref, swing_targets,
 ):
@@ -460,6 +480,12 @@ def parse_args():
         default=1.0,
         help="Scale the extra joint PD torque between 0 and 1.",
     )
+    parser.add_argument(
+        "--swing-reference",
+        choices=("planner", "mpc"),
+        default="planner",
+        help="Select the source of WBC swing-foot references.",
+    )
     args = parser.parse_args()
 
     if not 0.0 < args.duration <= 20.0:
@@ -481,6 +507,8 @@ def parse_args():
         parser.error("--turn-angle-deg must be finite")
     if not 0.0 <= args.joint_pd_scale <= 1.0:
         parser.error("--joint-pd-scale must be in [0, 1]")
+    if args.swing_reference == "mpc" and not args.allow_trot:
+        parser.error("--swing-reference mpc requires --allow-trot")
     return args
 
 
@@ -516,6 +544,7 @@ def main():
         raise RuntimeError("Missing MuJoCo floor or named foot geom")
     mapping_data = model.createData()
     pd_reference_data = model.createData()
+    mpc_foot_data = model.createData()
 
     key = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
     if key < 0:
@@ -774,14 +803,17 @@ def main():
                     name: np.asarray(position, dtype=float)
                     for name, position in foot_positions(model, q).items()
                 }
-                wbc, swing_targets = trot_wbc.prepare(
-                    mj_data.time,
-                    mode,
-                    mode_event_times,
-                    mode_sequence,
-                    feet_by_name,
-                    base_position=q[:3],
-                )
+                if args.swing_reference == "planner":
+                    wbc, swing_targets = trot_wbc.prepare(
+                        mj_data.time,
+                        mode,
+                        mode_event_times,
+                        mode_sequence,
+                        feet_by_name,
+                        base_position=q[:3],
+                    )
+                else:
+                    wbc = trot_wbc.controllers[mode]
 
             last_control = input_ref.copy()
 
@@ -873,6 +905,39 @@ def main():
             reference["desired_base_angular_acceleration_local"] = (
                 angular_acceleration_ff_local
             )
+            if args.swing_reference == "mpc" and mode != 15:
+                current_feet = mpc_foot_references(
+                    model, mpc_foot_data, state_ref, input_ref
+                )
+                future_feet = mpc_foot_references(
+                    model, mpc_foot_data,
+                    future_state_ref, future_input_ref,
+                )
+
+                swing_targets = {}
+                for name in OCS2_CONTACT_ORDER:
+                    if name in wbc.contact_frame_names:
+                        continue
+
+                    position, velocity = current_feet[name]
+                    acceleration = np.zeros(3)
+
+                    # 在同一摆动阶段内估计前馈，避免跨触地跳变求导。
+                    if name not in future_wbc.contact_frame_names:
+                        acceleration = (
+                            future_feet[name][1] - velocity
+                        ) / acceleration_interval
+
+                    if not (
+                        np.isfinite(position).all()
+                        and np.isfinite(velocity).all()
+                        and np.isfinite(acceleration).all()
+                    ):
+                        raise RuntimeError("Non-finite MPC swing reference")
+
+                    swing_targets[name] = (
+                        position, velocity, acceleration
+                    )
             # C. WBC 必须用实测 q、v 求解。
             result = timed_call(
                 timings["wbc"],
@@ -1262,6 +1327,7 @@ def main():
         summary = {
             "requested_duration_s": args.duration,
             "joint_pd_scale": args.joint_pd_scale,
+            "swing_reference": args.swing_reference,
             "actual_duration_s": float(mj_data.time),
             "samples": len(records),
             "mode_samples": {
