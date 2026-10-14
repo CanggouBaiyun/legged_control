@@ -49,6 +49,14 @@ CSV_COLUMNS = (
     "swing_target_z_fr_m",
     "swing_target_z_rl_m",
     "swing_target_z_rr_m",
+    "foot_x_fl_m",
+    "foot_x_fr_m",
+    "foot_x_rl_m",
+    "foot_x_rr_m",
+    "swing_target_x_fl_m",
+    "swing_target_x_fr_m",
+    "swing_target_x_rl_m",
+    "swing_target_x_rr_m",
     "mj_floor_fz_fl_n",
     "mj_floor_fz_fr_n",
     "mj_floor_fz_rl_n",
@@ -677,6 +685,7 @@ def main():
             )
             actual_vz = float(mj_data.qvel[2])
 
+
             row = [
                     float(mj_data.time),
                     float(mode),
@@ -705,6 +714,15 @@ def main():
                     ),
                     *(
                         float(swing_targets[name][0][2])
+                        if name in swing_targets else float("nan")
+                        for name in OCS2_CONTACT_ORDER
+                    ),
+                    *(
+                        [float(feet_by_name[name][0]) for name in OCS2_CONTACT_ORDER]
+                        if trot_wbc is not None else [float("nan")] * 4
+                    ),
+                    *(
+                        float(swing_targets[name][0][0])
                         if name in swing_targets else float("nan")
                         for name in OCS2_CONTACT_ORDER
                     ),
