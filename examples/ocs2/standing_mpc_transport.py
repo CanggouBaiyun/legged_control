@@ -174,9 +174,9 @@ def main():
                     raise ValueError(f"Unknown request action: {action}")
 
                 gait = request.get("gait")
-                if gait is not None and gait != "standing_trot":
+                if gait not in (None, "standing_trot", "stance"):
                     raise ValueError(f"Unsupported gait command: {gait}")
-                if gait == "standing_trot":
+                if gait is not None :
                     deadline = time.monotonic() + 3.0
                     while (
                         gait_publisher.get_subscription_count() == 0
@@ -185,10 +185,19 @@ def main():
                         rclpy.spin_once(node, timeout_sec=0.01)
                     if gait_publisher.get_subscription_count() == 0:
                         raise RuntimeError("MPC gait receiver is unavailable")
-                    gait_publisher.publish(ModeSchedule(
-                        event_times=[0.0, 0.30, 0.35, 0.65, 0.70],
-                        mode_sequence=[9, 15, 6, 15],
-                    ))
+
+                    if gait == "standing_trot":
+                        schedule = ModeSchedule(
+                            event_times = [0.0, 0.30, 0.35, 0.65, 0.70],
+                            mode_sequence = [9,15,6,15],
+                        )
+                    else:
+                        schedule = ModeSchedule(
+                            event_times = [0.0, 0.5],
+                            mode_sequence=[15],
+                        )
+
+                    gait_publisher.publish(schedule)
                 
                 # 第一次请求：用站立目标初始化 MPC。
                 if epoch is None:
