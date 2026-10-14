@@ -4,7 +4,7 @@
 
 Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and QP-based whole-body control. The target architecture follows [legged_control](https://github.com/qiayuanl/legged_control): OCS2 NMPC, WBC, state estimation and a robot hardware interface.
 
-**Current scope:** closed-loop standing, squatting, load transfer, a complete right-front single-leg cycle and in-place trot in MuJoCo, plus initial low-speed forward and per-foot horizontal-motion validation. Go2 full-centroidal OCS2 MPC drives mode-dependent WBC through ROS 2 and a C++ MRT policy-query service. Contact-point slip, switching from trot to standing, turning, state estimation, the Unitree SDK2 interface and hardware safety remain to be verified or implemented.
+**Current scope:** closed-loop standing, squatting, load transfer, a complete right-front single-leg cycle and in-place trot in MuJoCo, plus initial low-speed forward, per-foot horizontal-motion and return-to-stance validation. Go2 full-centroidal OCS2 MPC drives mode-dependent WBC through ROS 2 and a C++ MRT policy-query service. Contact-point slip, turning, state estimation, the Unitree SDK2 interface and hardware safety remain to be verified or implemented.
 
 ## Status
 
@@ -24,10 +24,11 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | Trot gait command, MPC mode schedule and C++ MRT query | Modes 15/9/6 verified in a 20 s closed-loop simulation |
 | Mode-aware WBC and latched in-place swing targets | 20 s closed-loop trot; all four feet lifted; vertical swing reference aligned with OCS2 parameters and floor contacts measured |
 | Low-speed forward trot | 20 s headless run at 0.03 m/s with a 0.09 m displacement target; forward motion measured for all four feet, contact-point slip still to be checked |
-| Stopping, turning and disturbance recovery | Planned |
+| Trot to four-foot stance | Stance command at 15 s; mode 15 sustained from 16.020 s in a 20 s headless run |
+| Turning and disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
-The OCS2 controller has completed a 20 s in-place trot and a headless low-speed forward run with measured forward swing for all four feet. The single-leg cycle still uses scripted contact phases. Contact-point slip, switching from trot to standing, turning and hardware readiness remain unverified. See the [forward trot notes](docs/ocs2_forward_trot.md).
+The OCS2 controller has completed a 20 s in-place trot and a headless low-speed forward run with measured forward swing for all four feet and a return to four-foot stance. The single-leg cycle still uses scripted contact phases. Contact-point slip, turning and hardware readiness remain unverified. See the [forward trot notes](docs/ocs2_forward_trot.md).
 
 ## Architecture
 
@@ -236,7 +237,7 @@ Cycle CSV logs include FR desired/actual frame height and actual normal contact 
 ## Roadmap
 
 1. Correct the remaining OCS2 height-target offset and separate 50 Hz MPC updates from the 500 Hz WBC loop.
-2. Build on the aligned vertical swing reference by adding forward foothold planning; validate low-speed translation, stopping and turning.
+2. Build on the low-speed forward and return-to-stance results by measuring contact-point slip, improving forward foothold planning and validating turning.
 3. Test disturbance recovery with repeatable force pulses. Distinguish staying upright, recovering pose and returning to a fixed world-position target; record force, duration, application point, recovery time and constraint violations.
 4. Move hardware-rate components to C++ and add the ROS 2 / SDK2 interface, state estimation, contact detection, watchdogs and emergency-stop handling.
 5. Validate torque, joint, orientation and communication-loss safety gates before low-energy suspended hardware tests.

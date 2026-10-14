@@ -277,6 +277,11 @@ def parse_args():
         help="Send standing_trot when simulation time reaches this value.",
     )
     parser.add_argument(
+        "--stop-trot-at",
+        type=float,
+        help="Send the four-foot stance gait at this simulation time.",
+    )
+    parser.add_argument(
         "--forward",
         action="store_true",
         help="Use the short forward-motion target during trot.",
@@ -292,6 +297,11 @@ def parse_args():
         parser.error("--trot-at requires --allow-trot and a time within the run")
     if args.forward and (not args.allow_trot or args.trot_at is None):
         parser.error("--forward requires --allow-trot and --trot-at")
+    if args.stop_trot_at is not None and (
+        args.trot_at is None
+        or not args.trot_at < args.stop_trot_at < args.duration
+    ):
+        parser.error("--stop-trot-at must be after --trot-at and before the run ends")
 
     return args
 
@@ -398,6 +408,7 @@ def main():
     next_print = 0.0
     clipped_steps = 0
     gait_command_sent = False
+    stance_command_sent = False
     previous_feet_by_name = None
     previous_stance = set()
     previous_floor_forces = None
@@ -466,6 +477,18 @@ def main():
                     and mj_data.time >= args.trot_at
                 )
 
+                send_stance = (
+                    args.stop_trot_at is not None
+                    and gait_command_sent
+                    and not stance_command_sent
+                    and mj_data.time >= args.stop_trot_at
+                )
+                gait_command = None
+                if send_gait:
+                    gait_command = "standing_trot"
+                elif send_stance:
+                    gait_command = "stance"
+
                 (
                     times,
                     states,
@@ -486,11 +509,14 @@ def main():
                         "target": target.tolist(),
                         "target_times": target_times.tolist(),
                         "target_states": target_states.tolist(),
-                        **({"gait": "standing_trot"} if send_gait else {}),
+                        **({"gait": gait_command} if gait_command is not None else {}),
                     },
                 )
                 if send_gait:
                     gait_command_sent = True
+
+                if send_stance:
+                    stance_command_sent = True
 
                 next_policy_time = (
                     mj_data.time + steps_per_policy * dt
