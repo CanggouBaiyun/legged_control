@@ -10,7 +10,8 @@ from go2_control.wbc.swing_planner import InPlaceSwingPlanner
 
 
 class TrotWBC:
-    def __init__(self, model):
+    def __init__(self, model, forward_goal = None):
+        self.forward_goal = forward_goal
         self.controllers = {
             mode: StandingWBC(model, contact_frame_names=contacts)
             for mode, contacts in OCS2_MODE_CONTACTS.items()
@@ -45,9 +46,13 @@ class TrotWBC:
 
             if interval is None:
                 raise RuntimeError(f"Missing swing interval for {foot_name}")
-
+            step_displacement_x = 0.0
+            if self.forward_goal is not None:
+                swing_midpoint = 0.5 * (interval[0] + interval[1])
+                _, forward_velocity = self.forward_goal(swing_midpoint)
+                step_displacement_x = 0.70 * forward_velocity
             swing_targets[foot_name] = self.swing_planner.reference(
-                foot_name, time, interval, feet_by_name[foot_name]
+                foot_name, time, interval, feet_by_name[foot_name], step_displacement_x=step_displacement_x,
             )
 
         return controller, swing_targets

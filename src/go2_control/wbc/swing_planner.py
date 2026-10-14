@@ -11,7 +11,7 @@ class InPlaceSwingPlanner:
         self.clearance = clearance
         self.plans = {}
 
-    def reference(self, foot_name, time, interval, measured_position):
+    def reference(self, foot_name, time, interval, measured_position, step_displacement_x = 0.0):
         # interval=None 表示这只脚已进入支撑状态。
         if interval is None:
             self.plans.pop(foot_name, None)
@@ -22,6 +22,7 @@ class InPlaceSwingPlanner:
             lift_off, touch_down = interval
             start = np.asarray(measured_position, dtype=float).copy()
             end = start.copy()
+            end[0] += step_displacement_x
             end[2] = self.touchdown_height
             self.plans[foot_name] = (
                 lift_off, touch_down, start, end
