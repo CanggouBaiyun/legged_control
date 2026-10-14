@@ -60,6 +60,14 @@ CSV_COLUMNS = (
     "swing_target_x_fr_m",
     "swing_target_x_rl_m",
     "swing_target_x_rr_m",
+    "foot_y_fl_m",
+    "foot_y_fr_m",
+    "foot_y_rl_m",
+    "foot_y_rr_m",
+    "swing_target_y_fl_m",
+    "swing_target_y_fr_m",
+    "swing_target_y_rl_m",
+    "swing_target_y_rr_m",
     "mj_floor_fz_fl_n",
     "mj_floor_fz_fr_n",
     "mj_floor_fz_rl_n",
@@ -68,6 +76,10 @@ CSV_COLUMNS = (
     "stance_center_xy_speed_fr_mps",
     "stance_center_xy_speed_rl_mps",
     "stance_center_xy_speed_rr_mps",
+    "mj_contact_tangent_speed_fl_mps",
+    "mj_contact_tangent_speed_fr_mps",
+    "mj_contact_tangent_speed_rl_mps",
+    "mj_contact_tangent_speed_rr_mps",
 )
 
 from go2_control.centroidal import (
@@ -117,6 +129,61 @@ def floor_normal_forces(model, data, floor_id, foot_name_by_geom):
         forces[foot_name] += float(wrench[0])
     return forces
 
+def floor_contact_tangent_speeds(model, data, floor_id, foot_name_by_geom):
+    """Relative tangent speed at loaded MuJoCo foot-floor contacts."""
+    speeds = {
+        name: float("nan") for name in foot_name_by_geom.values()
+    }
+    wrench = np.zeros(6)
+    foot_motion = np.zeros(6)
+    floor_motion = np.zeros(6)
+
+    # 返回顺序为角速度、线速度；0 表示使用世界系方向。
+    mujoco.mj_objectVelocity(
+        model, data, mujoco.mjtObj.mjOBJ_GEOM,
+        floor_id, floor_motion, 0,
+    )
+
+    for contact_id in range(data.ncon):
+        contact = data.contact[contact_id]
+        geom1, geom2 = int(contact.geom1), int(contact.geom2)
+        foot_geom = (
+            geom2 if geom1 == floor_id
+            else geom1 if geom2 == floor_id
+            else -1
+        )
+        foot_name = foot_name_by_geom.get(foot_geom)
+        if foot_name is None or contact.efc_address < 0:
+            continue
+
+        mujoco.mj_contactForce(model, data, contact_id, wrench)
+        if wrench[0] <= 1.0:
+            continue
+
+        mujoco.mj_objectVelocity(
+            model, data, mujoco.mjtObj.mjOBJ_GEOM,
+            foot_geom, foot_motion, 0,
+        )
+        foot_point_velocity = foot_motion[3:] + np.cross(
+            foot_motion[:3],
+            contact.pos - data.geom_xpos[foot_geom],
+        )
+        floor_point_velocity = floor_motion[3:] + np.cross(
+            floor_motion[:3],
+            contact.pos - data.geom_xpos[floor_id],
+        )
+        relative_velocity = foot_point_velocity - floor_point_velocity
+
+        # 接触坐标系第一行为法向，后两行为切向。
+        tangent_axes = contact.frame.reshape(3, 3)[1:]
+        speed = float(np.linalg.norm(tangent_axes @ relative_velocity))
+
+        previous = speeds[foot_name]
+        speeds[foot_name] = (
+            max(previous, speed) if np.isfinite(previous) else speed
+        )
+
+    return speeds
 
 def request_transport(process, message):
     """Send one request to the ROS subprocess and receive its response."""
@@ -839,6 +906,15 @@ def main():
                         if name in swing_targets else float("nan")
                         for name in OCS2_CONTACT_ORDER
                     ),
+                    *(
+                        [float(feet_by_name[name][1]) for name in OCS2_CONTACT_ORDER]
+                        if trot_wbc is not None else [float("nan")] * 4
+                    ),
+                    *(
+                        float(swing_targets[name][0][1])
+                        if name in swing_targets else float("nan")
+                        for name in OCS2_CONTACT_ORDER
+                    ),
             ]
             if mj_data.time >= next_print:
                 lookahead_time = mj_data.time + 0.2
@@ -916,8 +992,15 @@ def main():
                             - previous_feet_by_name[name][:2]
                         ) / dt)
                     stance_speeds[name] = speed
+                contact_tangent_speeds = floor_contact_tangent_speeds(
+                    mj_model, mj_data, floor_id, foot_name_by_geom
+                )
                 row.extend(floor_forces[name] for name in OCS2_CONTACT_ORDER)
                 row.extend(stance_speeds[name] for name in OCS2_CONTACT_ORDER)
+                row.extend(
+                    contact_tangent_speeds[name]
+                    for name in OCS2_CONTACT_ORDER
+                )
                 previous_feet_by_name = {
                     name: position.copy()
                     for name, position in feet_by_name.items()
@@ -925,7 +1008,7 @@ def main():
                 previous_stance = set(wbc.contact_frame_names)
                 previous_floor_forces = floor_forces
             else:
-                row.extend([float("nan")] * 8)
+                row.extend([float("nan")] * 12)
             rows.append(row)
             if viewer is not None:
                 viewer.sync()
