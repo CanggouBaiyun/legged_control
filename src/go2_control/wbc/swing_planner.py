@@ -11,7 +11,7 @@ class InPlaceSwingPlanner:
         self.clearance = clearance
         self.plans = {}
 
-    def reference(self, foot_name, time, interval, measured_position, step_displacement_x = 0.0):
+    def reference(self, foot_name, time, interval, measured_position, step_displacement_x = 0.0, step_displacement_xy=None):
         # interval=None 表示这只脚已进入支撑状态。
         if interval is None:
             self.plans.pop(foot_name, None)
@@ -22,7 +22,15 @@ class InPlaceSwingPlanner:
             lift_off, touch_down = interval
             start = np.asarray(measured_position, dtype=float).copy()
             end = start.copy()
-            end[0] += step_displacement_x
+            if step_displacement_xy is None:
+                end[0] += step_displacement_x
+            else:
+                displacement_xy = np.asarray(
+                    step_displacement_xy, dtype=float
+                )
+                if displacement_xy.shape != (2,):
+                    raise ValueError("Expected step_displacement_xy shape (2,)")
+                end[:2] += displacement_xy
             end[2] = self.touchdown_height
             self.plans[foot_name] = (
                 lift_off, touch_down, start, end

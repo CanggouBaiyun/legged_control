@@ -15,6 +15,7 @@ def compute_base_acceleration_task(
     maximum_linear_acceleration,
     maximum_angular_acceleration,
     desired_linear_acceleration_world=None,
+    desired_angular_acceleration_local=None,
 ):
     """Compute base acceleration from trajectory feedforward and pose PD."""
 
@@ -73,8 +74,13 @@ def compute_base_acceleration_task(
         desired_angular_velocity_local - current_angular_velocity_local
     )
 
+    if desired_angular_acceleration_local is None:
+        desired_angular_acceleration_local = np.zeros(3)
+
     desired_angular_acceleration_local = (
-        orientation_kp * orientation_error_local + orientation_kd * angular_velocity_error_local
+        np.asarray(desired_angular_acceleration_local, dtype=float)
+        + orientation_kp * orientation_error_local 
+        + orientation_kd * angular_velocity_error_local
     )
 
     desired_angular_acceleration_local = np.clip(

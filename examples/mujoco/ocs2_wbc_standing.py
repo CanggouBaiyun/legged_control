@@ -19,6 +19,9 @@ CSV_COLUMNS = (
     "goal_x_m",
     "mpc_x_m",
     "measured_x_m",
+    "goal_yaw_rad",
+    "mpc_yaw_rad",
+    "measured_yaw_rad",
     "goal_z_m",
     "mpc_z_m",
     "measured_z_m",
@@ -57,6 +60,14 @@ CSV_COLUMNS = (
     "swing_target_x_fr_m",
     "swing_target_x_rl_m",
     "swing_target_x_rr_m",
+    "foot_y_fl_m",
+    "foot_y_fr_m",
+    "foot_y_rl_m",
+    "foot_y_rr_m",
+    "swing_target_y_fl_m",
+    "swing_target_y_fr_m",
+    "swing_target_y_rl_m",
+    "swing_target_y_rr_m",
     "mj_floor_fz_fl_n",
     "mj_floor_fz_fr_n",
     "mj_floor_fz_rl_n",
@@ -65,6 +76,25 @@ CSV_COLUMNS = (
     "stance_center_xy_speed_fr_mps",
     "stance_center_xy_speed_rl_mps",
     "stance_center_xy_speed_rr_mps",
+    "mj_contact_tangent_speed_fl_mps",
+    "mj_contact_tangent_speed_fr_mps",
+    "mj_contact_tangent_speed_rl_mps",
+    "mj_contact_tangent_speed_rr_mps",
+    "mj_contact_translation_speed_fl_mps",
+    "mj_contact_translation_speed_fr_mps",
+    "mj_contact_translation_speed_rl_mps",
+    "mj_contact_translation_speed_rr_mps",
+    "mj_contact_rotation_speed_fl_mps",
+    "mj_contact_rotation_speed_fr_mps",
+    "mj_contact_rotation_speed_rl_mps",
+    "mj_contact_rotation_speed_rr_mps",
+)
+
+CSV_COLUMNS += tuple(
+    f"pd_swing_{kind}_delta_{axis}_{leg}_{unit}"
+    for kind, unit in (("position", "m"), ("velocity", "mps"))
+    for axis in ("x", "y", "z")
+    for leg in ("fl", "fr", "rl", "rr")
 )
 
 from go2_control.centroidal import (
@@ -113,6 +143,130 @@ def floor_normal_forces(model, data, floor_id, foot_name_by_geom):
         mujoco.mj_contactForce(model, data, contact_id, wrench)
         forces[foot_name] += float(wrench[0])
     return forces
+
+def floor_contact_tangent_speeds(model, data, floor_id, foot_name_by_geom):
+    """Return total, translation and rotation tangent-speed magnitudes."""
+    speeds = {
+        name: float("nan") for name in foot_name_by_geom.values()
+    }
+    translation_speeds = speeds.copy()
+    rotation_speeds = speeds.copy()
+    wrench = np.zeros(6)
+    foot_motion = np.zeros(6)
+    floor_motion = np.zeros(6)
+
+    # 返回顺序为角速度、线速度；0 表示使用世界系方向。
+    mujoco.mj_objectVelocity(
+        model, data, mujoco.mjtObj.mjOBJ_GEOM,
+        floor_id, floor_motion, 0,
+    )
+
+    for contact_id in range(data.ncon):
+        contact = data.contact[contact_id]
+        geom1, geom2 = int(contact.geom1), int(contact.geom2)
+        foot_geom = (
+            geom2 if geom1 == floor_id
+            else geom1 if geom2 == floor_id
+            else -1
+        )
+        foot_name = foot_name_by_geom.get(foot_geom)
+        if foot_name is None or contact.efc_address < 0:
+            continue
+
+        mujoco.mj_contactForce(model, data, contact_id, wrench)
+        if wrench[0] <= 1.0:
+            continue
+
+        mujoco.mj_objectVelocity(
+            model, data, mujoco.mjtObj.mjOBJ_GEOM,
+            foot_geom, foot_motion, 0,
+        )
+        translation_velocity = foot_motion[3:] - floor_motion[3:]
+        rotation_velocity = (
+            np.cross(
+                foot_motion[:3],
+                contact.pos - data.geom_xpos[foot_geom],
+            )
+            - np.cross(
+                floor_motion[:3],
+                contact.pos - data.geom_xpos[floor_id],
+            )
+        )
+        relative_velocity = translation_velocity + rotation_velocity
+
+        # 接触坐标系第一行为法向，后两行为切向。
+        tangent_axes = contact.frame.reshape(3, 3)[1:]
+        speed = float(np.linalg.norm(tangent_axes @ relative_velocity))
+
+        previous = speeds[foot_name]
+        # Keep all three magnitudes from the same selected contact.
+        if not np.isfinite(previous) or speed > previous:
+            speeds[foot_name] = speed
+            translation_speeds[foot_name] = float(np.linalg.norm(
+                tangent_axes @ translation_velocity
+            ))
+            rotation_speeds[foot_name] = float(np.linalg.norm(
+                tangent_axes @ rotation_velocity
+            ))
+
+    return speeds, translation_speeds, rotation_speeds
+
+def mpc_foot_references(model, data, state, control):
+    """Read world-frame foot positions and velocities from one MPC point."""
+    q_ref, v_ref = pinocchio_from_state(
+        model, data, state, control[12:]
+    )
+    pin.forwardKinematics(model, data, q_ref, v_ref)
+    pin.updateFramePlacements(model, data)
+
+    references = {}
+    for name in OCS2_CONTACT_ORDER:
+        frame_id = model.getFrameId(name)
+        position = data.oMf[frame_id].translation.copy()
+        velocity = pin.getFrameVelocity(
+            model, data, frame_id,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED
+        ).linear.copy()
+        references[name] = (position, velocity)
+
+    return references
+
+def joint_pd_swing_reference_deltas(
+    model, data, q, v, q_ref, v_ref, swing_targets,
+):
+    """Compare joint PD references with WBC swing targets."""
+    deltas = np.full((6, 4), np.nan)
+    if not swing_targets:
+        return deltas.ravel().tolist()
+
+    # 保留实测基座，只替换电机关节的位置和速度。
+    q_target = q.copy()
+    q_target[7:] = q_ref[7:]
+    v_target = v.copy()
+    v_target[6:] = v_ref[6:]
+
+    pin.forwardKinematics(model, data, q_target, v_target)
+    pin.updateFramePlacements(model, data)
+
+    for index, name in enumerate(OCS2_CONTACT_ORDER):
+        if name not in swing_targets:
+            continue
+
+        target_position, target_velocity, _ = swing_targets[name]
+        if target_velocity is None:
+            target_velocity = np.zeros(3)
+
+        frame_id = model.getFrameId(name)
+        pd_position = data.oMf[frame_id].translation
+        pd_velocity = pin.getFrameVelocity(
+            model, data, frame_id,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        ).linear
+
+        deltas[:3, index] = pd_position - target_position
+        deltas[3:, index] = pd_velocity - target_velocity
+
+    return deltas.ravel().tolist()
 
 
 def request_transport(process, message):
@@ -247,6 +401,29 @@ def forward_motion_goal(time):
 
     return 3.0 * speed, 0.0
 
+def turn_yaw_goal(time, angle_deg=10.0):
+    """Return desired yaw and yaw rate for a signed turn."""
+    rate = np.deg2rad(angle_deg / 3.0)
+
+    if time <= 8.0:
+        return 0.0, 0.0
+
+    if time < 9.0:
+        u = time - 8.0
+        yaw_rate = rate * (3.0 * u**2 - 2.0 * u**3)
+        yaw = rate * (u**3 - 0.5 * u**4)
+        return yaw, yaw_rate
+
+    if time < 11.0:
+        return 0.5 * rate + rate * (time - 9.0), rate
+
+    if time < 12.0:
+        u = time - 11.0
+        yaw_rate = rate * (1.0 - 3.0 * u**2 + 2.0 * u**3)
+        yaw = rate * (2.5 + u - u**3 + 0.5 * u**4)
+        return yaw, yaw_rate
+
+    return 3.0 * rate, 0.0
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -286,7 +463,29 @@ def parse_args():
         action="store_true",
         help="Use the short forward-motion target during trot.",
     )
-
+    parser.add_argument(
+        "--turn",
+        action="store_true",
+        help="Use the short in-place yaw-turn target during trot.",
+    )
+    parser.add_argument(
+        "--turn-angle-deg",
+        type=float,
+        default=10.0,
+        help="Signed turn angle in degrees: positive left, negative right.",
+    )
+    parser.add_argument(
+        "--joint-pd-scale",
+        type=float,
+        default=1.0,
+        help="Scale the extra joint PD torque between 0 and 1.",
+    )
+    parser.add_argument(
+        "--swing-reference",
+        choices=("planner", "mpc"),
+        default="planner",
+        help="Select the source of WBC swing-foot references.",
+    )
     args = parser.parse_args()
 
     if not 0.0 < args.duration <= 20.0:
@@ -295,6 +494,8 @@ def parse_args():
         not args.allow_trot or not 0.0 < args.trot_at < args.duration
     ):
         parser.error("--trot-at requires --allow-trot and a time within the run")
+    if args.turn and (not args.allow_trot or args.trot_at is None):
+        parser.error("--turn requires --allow-trot and --trot-at")
     if args.forward and (not args.allow_trot or args.trot_at is None):
         parser.error("--forward requires --allow-trot and --trot-at")
     if args.stop_trot_at is not None and (
@@ -302,13 +503,21 @@ def parse_args():
         or not args.trot_at < args.stop_trot_at < args.duration
     ):
         parser.error("--stop-trot-at must be after --trot-at and before the run ends")
-
+    if not np.isfinite(args.turn_angle_deg):
+        parser.error("--turn-angle-deg must be finite")
+    if not 0.0 <= args.joint_pd_scale <= 1.0:
+        parser.error("--joint-pd-scale must be in [0, 1]")
+    if args.swing_reference == "mpc" and not args.allow_trot:
+        parser.error("--swing-reference mpc requires --allow-trot")
     return args
 
 
 def main():
     args = parse_args()
 
+    def yaw_goal(stamp):
+        return turn_yaw_goal(stamp, angle_deg=args.turn_angle_deg)
+    
     root = Path(__file__).resolve().parents[2]
     scene = root / "third_party/unitree_mujoco/unitree_robots/go2/scene.xml"
 
@@ -317,7 +526,11 @@ def main():
     model = build_go2_simulation_model()
     bridge = MujocoPinocchioBridge(mj_model, model)
     wbc = StandingWBC(model)
-    trot_wbc = TrotWBC(model, forward_goal=forward_motion_goal if args.forward else None) if args.allow_trot else None
+    trot_wbc = TrotWBC(
+        model, 
+        forward_goal=forward_motion_goal if args.forward else None,
+        yaw_goal=yaw_goal if args.turn else None,                
+    ) if args.allow_trot else None
     floor_id = mujoco.mj_name2id(
         mj_model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
     )
@@ -330,6 +543,8 @@ def main():
     if floor_id < 0 or -1 in foot_name_by_geom:
         raise RuntimeError("Missing MuJoCo floor or named foot geom")
     mapping_data = model.createData()
+    pd_reference_data = model.createData()
+    mpc_foot_data = model.createData()
 
     key = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
     if key < 0:
@@ -360,21 +575,42 @@ def main():
         displacement, forward_velocity = (
             forward_motion_goal(stamp) if args.forward else (0.0, 0.0)
         )
-        
+        yaw_delta, yaw_rate = (
+            yaw_goal(stamp) if args.turn else (0.0, 0.0)
+        )
+
         base_position = q[:3].copy()
         base_position[0] = initial_base_x + displacement
         base_position[2] = standing_height_goal(stamp)
 
-        # 这里的四脚位置是用于生成可达的名义关节姿态，非滑动命令
+        yaw_rotation = pin.rpy.rpyToMatrix(
+            np.array([0.0, 0.0, yaw_delta])
+        )
+        target_rotation = yaw_rotation @ base_rotation
+
+        # 让名义足端随机身朝向旋转，保持合理的关节姿态参考。
+        # 实际支撑脚仍由 WBC 的接触约束固定在世界坐标中。
         nominal_feet = initial_feet.copy()
-        nominal_feet[:, 0] += displacement
-        nominal_foot_velocities = np.zeros((4,3))
-        nominal_foot_velocities[:, 0] = forward_velocity
+        relative_feet_xy = initial_feet[:, :2] - q[:2]
+        nominal_feet[:, :2] = (
+            base_position[:2]
+            + (yaw_rotation[:2, :2] @ relative_feet_xy.T).T
+        )
+
+        angular_velocity_world = np.array([0.0, 0.0, yaw_rate])
+        nominal_foot_velocities = np.tile(
+            np.array([forward_velocity, 0.0, 0.0]), (4, 1)
+        )
+        nominal_foot_velocities += np.cross(
+            angular_velocity_world,
+            nominal_feet - base_position,
+        )
 
         q_ref, v_ref = fixed_foot_reference.solve(
             base_position,
-            base_rotation,
+            target_rotation,
             np.array([forward_velocity, 0.0, 0.0]),
+            angular_velocity_local=target_rotation.T @ angular_velocity_world,
             foot_positions_world=nominal_feet,
             foot_velocities_world=nominal_foot_velocities,
         )
@@ -451,7 +687,9 @@ def main():
             )
             target[6] = initial_base_x + displacement
             target[8] = standing_height_goal(mj_data.time)
-
+            target[9] = np.interp(
+                mj_data.time, target_times, target_states[:, 9]
+            )
             if (
                 not np.isfinite(q).all()
                 or not np.isfinite(v).all()
@@ -565,13 +803,17 @@ def main():
                     name: np.asarray(position, dtype=float)
                     for name, position in foot_positions(model, q).items()
                 }
-                wbc, swing_targets = trot_wbc.prepare(
-                    mj_data.time,
-                    mode,
-                    mode_event_times,
-                    mode_sequence,
-                    feet_by_name,
-                )
+                if args.swing_reference == "planner":
+                    wbc, swing_targets = trot_wbc.prepare(
+                        mj_data.time,
+                        mode,
+                        mode_event_times,
+                        mode_sequence,
+                        feet_by_name,
+                        base_position=q[:3],
+                    )
+                else:
+                    wbc = trot_wbc.controllers[mode]
 
             last_control = input_ref.copy()
 
@@ -650,7 +892,52 @@ def main():
                 )
 
             reference["desired_base_linear_acceleration_world"] = acceleration_ff_world
+            angular_acceleration_ff_local = (
+                future_reference["desired_base_angular_velocity_local"]
+                - reference["desired_base_angular_velocity_local"]
+            ) / acceleration_interval
 
+            if not np.isfinite(angular_acceleration_ff_local).all():
+                raise RuntimeError(
+                    "Non-finite base angular acceleration feedforward"
+                )
+
+            reference["desired_base_angular_acceleration_local"] = (
+                angular_acceleration_ff_local
+            )
+            if args.swing_reference == "mpc" and mode != 15:
+                current_feet = mpc_foot_references(
+                    model, mpc_foot_data, state_ref, input_ref
+                )
+                future_feet = mpc_foot_references(
+                    model, mpc_foot_data,
+                    future_state_ref, future_input_ref,
+                )
+
+                swing_targets = {}
+                for name in OCS2_CONTACT_ORDER:
+                    if name in wbc.contact_frame_names:
+                        continue
+
+                    position, velocity = current_feet[name]
+                    acceleration = np.zeros(3)
+
+                    # 在同一摆动阶段内估计前馈，避免跨触地跳变求导。
+                    if name not in future_wbc.contact_frame_names:
+                        acceleration = (
+                            future_feet[name][1] - velocity
+                        ) / acceleration_interval
+
+                    if not (
+                        np.isfinite(position).all()
+                        and np.isfinite(velocity).all()
+                        and np.isfinite(acceleration).all()
+                    ):
+                        raise RuntimeError("Non-finite MPC swing reference")
+
+                    swing_targets[name] = (
+                        position, velocity, acceleration
+                    )
             # C. WBC 必须用实测 q、v 求解。
             result = timed_call(
                 timings["wbc"],
@@ -675,7 +962,11 @@ def main():
             q_ref, v_ref = pinocchio_from_state(
                 model, mapping_data, state_ref, input_ref[12:]
             )
-            feedback = joint_pd_feedback(
+            pd_swing_deltas = joint_pd_swing_reference_deltas(
+                model, pd_reference_data,
+                q, v, q_ref, v_ref, swing_targets,
+            )
+            feedback = args.joint_pd_scale * joint_pd_feedback(
                 model, q, v, q_ref, v_ref, kp=20.0, kd=1.0
             )
             torque = result.motor_torques + feedback
@@ -710,7 +1001,9 @@ def main():
                 reference["desired_base_linear_velocity_world"][2]
             )
             actual_vz = float(mj_data.qvel[2])
-
+            measured_yaw = pin.rpy.matrixToRpy(
+                pin.XYZQUATToSE3(q[:7]).rotation
+            )[2]
 
             row = [
                     float(mj_data.time),
@@ -718,6 +1011,9 @@ def main():
                     float(target[6]),
                     float(state_ref[6]),
                     float(q[0]),
+                    float(target[9]),
+                    float(state_ref[9]),
+                    float(measured_yaw),
                     float(target[8]),
                     float(state_ref[8]),
                     float(q[2]),
@@ -752,6 +1048,15 @@ def main():
                         if name in swing_targets else float("nan")
                         for name in OCS2_CONTACT_ORDER
                     ),
+                    *(
+                        [float(feet_by_name[name][1]) for name in OCS2_CONTACT_ORDER]
+                        if trot_wbc is not None else [float("nan")] * 4
+                    ),
+                    *(
+                        float(swing_targets[name][0][1])
+                        if name in swing_targets else float("nan")
+                        for name in OCS2_CONTACT_ORDER
+                    ),
             ]
             if mj_data.time >= next_print:
                 lookahead_time = mj_data.time + 0.2
@@ -765,6 +1070,16 @@ def main():
                     times,
                     states[:, 8],
                 ))
+                future_yaw = float(np.interp(
+                    lookahead_time,
+                    times,
+                    states[:, 9],
+                ))
+                yaw_change = np.arctan2(
+                    np.sin(future_yaw - state_ref[9]),
+                    np.cos(future_yaw - state_ref[9]),
+                )
+                planned_yaw_rate_deg_s = np.rad2deg(yaw_change) / 0.2
 
                 mpc_fz = float(np.sum(mpc_forces[:, 2]))
                 wbc_fz = float(np.sum(wbc_forces_ocs2_order[:, 2]))
@@ -772,6 +1087,12 @@ def main():
                 print(
                     f"t={mj_data.time:5.2f} "
                     f"mode={mode} "
+                    f"yaw_goal={np.rad2deg(target[9]):.2f} "
+                    f"yaw_mpc={np.rad2deg(state_ref[9]):.2f} "
+                    f"yaw={np.rad2deg(measured_yaw):.2f} "
+                    f"yaw+0.2={np.rad2deg(future_yaw):.2f} "
+                    f"yaw_end={np.rad2deg(states[-1, 9]):.2f} "
+                    f"yaw_rate_plan={planned_yaw_rate_deg_s:+.2f} "
                     f"x_goal={target[6]:.4f} "
                     f"x_mpc={state_ref[6]:.4f} "
                     f"x={q[0]:.4f} "
@@ -813,8 +1134,27 @@ def main():
                             - previous_feet_by_name[name][:2]
                         ) / dt)
                     stance_speeds[name] = speed
+                (
+                    contact_tangent_speeds,
+                    contact_translation_speeds,
+                    contact_rotation_speeds,
+                ) = floor_contact_tangent_speeds(
+                    mj_model, mj_data, floor_id, foot_name_by_geom
+                )
                 row.extend(floor_forces[name] for name in OCS2_CONTACT_ORDER)
                 row.extend(stance_speeds[name] for name in OCS2_CONTACT_ORDER)
+                row.extend(
+                    contact_tangent_speeds[name]
+                    for name in OCS2_CONTACT_ORDER
+                )
+                row.extend(
+                    contact_translation_speeds[name]
+                    for name in OCS2_CONTACT_ORDER
+                )
+                row.extend(
+                    contact_rotation_speeds[name]
+                    for name in OCS2_CONTACT_ORDER
+                )
                 previous_feet_by_name = {
                     name: position.copy()
                     for name, position in feet_by_name.items()
@@ -822,7 +1162,8 @@ def main():
                 previous_stance = set(wbc.contact_frame_names)
                 previous_floor_forces = floor_forces
             else:
-                row.extend([float("nan")] * 8)
+                row.extend([float("nan")] * 20)
+            row.extend(pd_swing_deltas)
             rows.append(row)
             if viewer is not None:
                 viewer.sync()
@@ -985,6 +1326,8 @@ def main():
 
         summary = {
             "requested_duration_s": args.duration,
+            "joint_pd_scale": args.joint_pd_scale,
+            "swing_reference": args.swing_reference,
             "actual_duration_s": float(mj_data.time),
             "samples": len(records),
             "mode_samples": {

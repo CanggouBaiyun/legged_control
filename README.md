@@ -4,7 +4,7 @@
 
 Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and QP-based whole-body control. The target architecture follows [legged_control](https://github.com/qiayuanl/legged_control): OCS2 NMPC, WBC, state estimation and a robot hardware interface.
 
-**Current scope:** closed-loop standing, squatting, load transfer, a complete right-front single-leg cycle and in-place trot in MuJoCo, plus initial low-speed forward, per-foot horizontal-motion and return-to-stance validation. Go2 full-centroidal OCS2 MPC drives mode-dependent WBC through ROS 2 and a C++ MRT policy-query service. Contact-point slip, turning, state estimation, the Unitree SDK2 interface and hardware safety remain to be verified or implemented.
+**Current scope:** closed-loop standing, squatting, load transfer, a complete right-front single-leg cycle and in-place trot in MuJoCo, plus initial low-speed forward, ±10° yaw turns and return-to-stance validation. Go2 full-centroidal OCS2 MPC drives mode-dependent WBC through ROS 2 and a C++ MRT policy-query service. Turning foot motion and contact-point tangent speeds are recorded; transient tracking lag and touchdown slip remain to be investigated. State estimation, the Unitree SDK2 interface and hardware safety remain to be implemented.
 
 ## Status
 
@@ -25,12 +25,16 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | Mode-aware WBC and latched in-place swing targets | 20 s closed-loop trot; all four feet lifted; vertical swing reference aligned with OCS2 parameters and floor contacts measured |
 | Low-speed forward trot | 20 s headless run at 0.03 m/s with a 0.09 m displacement target; forward motion measured for all four feet, contact-point slip still to be checked |
 | Trot to four-foot stance | Stance command at 15 s; mode 15 sustained from 16.020 s in a 20 s headless run |
-| Turning and disturbance recovery | Planned |
+| In-place yaw turn | Initial 20 s headless runs for ±10° targets; final measured +9.77° / -9.79°; left-turn foot XY direction verified, with endpoint errors and touchdown slip transients recorded |
+| MPC-derived swing references | Optional `--swing-reference=mpc`; 20 s left/right turns and forward/stop runs verified: +9.91° / −9.86° for ±10° goals, final x 0.09090 m for a 0.09 m goal, actual forward swing for all feet |
+| Disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
-The OCS2 controller has completed a 20 s in-place trot and a headless low-speed forward run with measured forward swing for all four feet and a return to four-foot stance. The single-leg cycle still uses scripted contact phases. Contact-point slip, turning and hardware readiness remain unverified. See the [forward trot notes](docs/ocs2_forward_trot.md).
+The OCS2 controller has completed a 20 s in-place trot and a headless low-speed forward run with measured forward swing for all four feet and a return to four-foot stance. Adding angular-acceleration feedforward improved a 10° yaw-turn experiment from 4.26° to 9.77° at the last recorded sample; a -10° run measured -9.79°. Transient lag remains, with approximately 2.31° goal-tracking RMSE during 8–12 s in both directions. Left-turn foot XY tracking RMSE is 2.87–4.39 mm; loaded contact tangent-speed p95 during 8–12 s is 2.34–2.78 mm/s, with an FR touchdown peak of 149.01 mm/s later in the run. These measurements do not establish slip-free locomotion. The single-leg cycle still uses scripted contact phases; hardware readiness remains unverified. See the [forward trot notes](docs/ocs2_forward_trot.md) and [yaw-turn results](docs/ocs2_trot_yaw.md).
 
 ## Architecture
+
+The OCS2 simulation offers two swing-reference sources. The default `planner` uses latched foot trajectories. With `--swing-reference=mpc`, WBC foot position and velocity targets come from the same MRT policy as the joint PD references; foot acceleration feedforward is estimated using the existing future policy query within the same swing phase. This optional path has completed left/right turns and low-speed forward/stop validation, with measured forward swing for all feet. Current-policy tracking errors cannot be compared directly with fixed planner targets because MPC replans from measured states. Synchronous loop timing still exceeds the 2 ms timestep on many steps; real-time execution remains pending. See the [turning comparison](docs/ocs2_trot_yaw.md) and [forward results](docs/ocs2_forward_trot.md).
 
 Implemented scripted-motion simulation path:
 
@@ -230,7 +234,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_single_leg_cycle.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-Latest verified regression result: **38 passed, 6 warnings**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic and OCS2 vertical swing trajectory checks, and a headless 20 s single-leg cycle. Headless execution does not intentionally sleep to match wall time; runtime depends on the machine. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
+Latest verified regression result (2026-10-14, after the MPC swing-reference integration): **38 passed, 6 warnings in 13.95 s**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic and OCS2 vertical swing trajectory checks, and a headless 20 s single-leg cycle. The new MPC swing-reference path was additionally validated through separate 20 s left-turn, right-turn and forward/stop runs. Headless execution does not intentionally sleep to match wall time; runtime depends on the machine. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
 
 Cycle CSV logs include FR desired/actual frame height and actual normal contact force. Summary height errors refer to the base; `maximum_xy_drift_mm` measures displacement from the world origin, including the intentional base shift, not target-tracking error.
 
