@@ -90,3 +90,62 @@ def swing_foot_reference(
     )
 
     return position, velocity, acceleration
+
+def _cubic_segment(time, t0, t1, p0, p1, v0, v1):
+    duration = t1 - t0
+    s = np.clip((time - t0) / duration, 0.0, 1.0)
+
+    position = (
+        (2*s**3 - 3*s**2 + 1) * p0
+        + (s**3 - 2*s**2 + s) * duration * v0
+        + (-2*s**3 + 3*s**2) * p1
+        + (s**3 - s**2) * duration * v1
+    )
+    velocity = (
+        (6*s - 6*s**2) * (p1 - p0) / duration
+        + (3*s**2 - 4*s + 1) * v0
+        + (3*s**2 - 2*s) * v1
+    )
+    acceleration = (
+        (6 - 12*s) * (p1 - p0) / duration**2
+        + (6*s - 4) * v0 / duration
+        + (6*s - 2) * v1 / duration
+    )
+    return position, velocity, acceleration
+
+def ocs2_swing_foot_reference(
+    time, start_position, end_position, lift_off, touch_down,
+    clearance=0.1, lift_off_velocity=0.2,
+    touch_down_velocity=-0.4, swing_time_scale=0.15,
+):
+    # 水平方向沿用现有五次轨迹；下面单独替换竖直方向。
+    position, velocity, acceleration = swing_foot_reference(
+        time, start_position, end_position,
+        lift_off, touch_down, clearance=0.0,
+    )
+
+    start = np.asarray(start_position, dtype=float)
+    end = np.asarray(end_position, dtype=float)
+    duration = touch_down - lift_off
+    scale = min(1.0, duration / swing_time_scale)
+    middle = (lift_off + touch_down) / 2.0
+    peak_z = min(start[2], end[2]) + scale * clearance
+
+    if time < middle:
+        z, vz, az = _cubic_segment(
+            time, lift_off, middle,
+            start[2], peak_z,
+            scale * lift_off_velocity, 0.0,
+        )
+    else:
+        z, vz, az = _cubic_segment(
+            time, middle, touch_down,
+            peak_z, end[2],
+            0.0, scale * touch_down_velocity,
+        )
+
+    position[2] = z
+    velocity[2] = vz
+    acceleration[2] = az
+    return position, velocity, acceleration
+

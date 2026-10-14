@@ -5,6 +5,7 @@ from go2_control.wbc.swing_trajectory import (
     swing_foot_reference,
     vertical_lift_reference,
 )
+from go2_control.wbc.swing_trajectory import ocs2_swing_foot_reference
 
 def test_lift_starts_at_rest():
     initial = np.array([0.2, -0.14, 0.02])
@@ -157,3 +158,19 @@ def test_in_place_swing_planner_latches_two_feet_until_stance():
         "FR_foot", 2.0, (2.0, 2.3), changed_position
     )
     np.testing.assert_allclose(new_position, changed_position)
+
+
+def test_ocs2_swing_vertical_boundary_conditions():
+    start = np.array([0.20, -0.14, 0.022])
+    end = start.copy()
+
+    for time, expected_z, expected_vz in (
+        (1.00, 0.022, 0.2),
+        (1.15, 0.122, 0.0),
+        (1.30, 0.022, -0.4),
+    ):
+        position, velocity, _ = ocs2_swing_foot_reference(
+            time, start, end, 1.0, 1.3,
+        )
+        np.testing.assert_allclose(position[2], expected_z, atol=1e-12)
+        np.testing.assert_allclose(velocity[2], expected_vz, atol=1e-12)

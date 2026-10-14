@@ -1,6 +1,6 @@
 import numpy as np
 
-from go2_control.wbc.swing_trajectory import swing_foot_reference
+from go2_control.wbc.swing_trajectory import ocs2_swing_foot_reference
 
 
 class InPlaceSwingPlanner:
@@ -28,7 +28,7 @@ class InPlaceSwingPlanner:
             )
 
         lift_off, touch_down, start, end = self.plans[foot_name]
-        return swing_foot_reference(
+        return ocs2_swing_foot_reference(
             time, start, end, lift_off, touch_down,
             clearance=self.clearance,
         )
