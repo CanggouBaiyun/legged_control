@@ -16,6 +16,9 @@ import pinocchio as pin
 CSV_COLUMNS = (
     "time_s",
     "mode",
+    "goal_x_m",
+    "mpc_x_m",
+    "measured_x_m",
     "goal_z_m",
     "mpc_z_m",
     "measured_z_m",
@@ -212,6 +215,30 @@ def standing_height_goal(time):
 
     return 0.28
 
+def forward_motion_goal(time):
+    """Return desired world-X displacement and velocity for a short walk."""
+    speed = 0.03 # m/s
+
+    if time <= 8.0:
+        return 0.0, 0.0
+
+    if time < 9.0:
+        u = time - 8.0
+        velocity = speed * (3.0 * u**2 - 2.0 * u**3)
+        displacement = speed * (u**3 - 0.5 * u**4)
+        return displacement, velocity
+
+    if time < 11.0:
+        return 0.5 * speed + speed * (time - 9.0), speed
+
+    if time < 12.0:
+        u = time - 11.0
+        velocity = speed * (1.0 - 3.0 * u**2 + 2.0 * u**3)
+        displacement = speed * (2.5 + u - u**3 + 0.5 * u**4)
+        return displacement, velocity
+
+    return 3.0 * speed, 0.0
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -241,6 +268,11 @@ def parse_args():
         type=float,
         help="Send standing_trot when simulation time reaches this value.",
     )
+    parser.add_argument(
+        "--forward",
+        action="store_true",
+        help="Use the short forward-motion target during trot.",
+    )
 
     args = parser.parse_args()
 
@@ -250,6 +282,8 @@ def parse_args():
         not args.allow_trot or not 0.0 < args.trot_at < args.duration
     ):
         parser.error("--trot-at requires --allow-trot and a time within the run")
+    if args.forward and (not args.allow_trot or args.trot_at is None):
+        parser.error("--forward requires --allow-trot and --trot-at")
 
     return args
 
@@ -265,7 +299,7 @@ def main():
     model = build_go2_simulation_model()
     bridge = MujocoPinocchioBridge(mj_model, model)
     wbc = StandingWBC(model)
-    trot_wbc = TrotWBC(model) if args.allow_trot else None
+    trot_wbc = TrotWBC(model, forward_goal=forward_motion_goal if args.forward else None) if args.allow_trot else None
     floor_id = mujoco.mj_name2id(
         mj_model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
     )
@@ -295,6 +329,7 @@ def main():
     )
     # 当前场景的地面 z=0，足端碰撞球半径 0.022 m。
     initial_feet[:, 2] = 0.022
+    initial_base_x = float(q[0])
     fixed_foot_reference = FixedFootReference(
         model, q, initial_feet
     )
@@ -304,13 +339,26 @@ def main():
     target_states = []
 
     for stamp in target_times:
+        displacement, forward_velocity = (
+            forward_motion_goal(stamp) if args.forward else (0.0, 0.0)
+        )
+        
         base_position = q[:3].copy()
+        base_position[0] = initial_base_x + displacement
         base_position[2] = standing_height_goal(stamp)
+
+        # 这里的四脚位置是用于生成可达的名义关节姿态，非滑动命令
+        nominal_feet = initial_feet.copy()
+        nominal_feet[:, 0] += displacement
+        nominal_foot_velocities = np.zeros((4,3))
+        nominal_foot_velocities[:, 0] = forward_velocity
 
         q_ref, v_ref = fixed_foot_reference.solve(
             base_position,
             base_rotation,
-            np.zeros(3),
+            np.array([forward_velocity, 0.0, 0.0]),
+            foot_positions_world=nominal_feet,
+            foot_velocities_world=nominal_foot_velocities,
         )
         target_states.append(
             state_from_pinocchio(model, mapping_data, q_ref, v_ref)
@@ -379,6 +427,10 @@ def main():
             # A. 实测状态：来自 MuJoCo，不来自 MPC 预测。
             q, v = bridge.state(mj_data)
             # 当前目标用于日志；完整时间表在首次请求时交给 MPC。
+            displacement, _ = (
+                forward_motion_goal(mj_data.time) if args.forward else (0.0, 0.0)
+            )
+            target[6] = initial_base_x + displacement
             target[8] = standing_height_goal(mj_data.time)
 
             if (
@@ -628,6 +680,9 @@ def main():
             row = [
                     float(mj_data.time),
                     float(mode),
+                    float(target[6]),
+                    float(state_ref[6]),
+                    float(q[0]),
                     float(target[8]),
                     float(state_ref[8]),
                     float(q[2]),
@@ -673,6 +728,9 @@ def main():
                 print(
                     f"t={mj_data.time:5.2f} "
                     f"mode={mode} "
+                    f"x_goal={target[6]:.4f} "
+                    f"x_mpc={state_ref[6]:.4f} "
+                    f"x={q[0]:.4f} "
                     f"goal={target[8]:.4f} "
                     f"z={q[2]:.4f} "
                     f"plan+0.2={future_z:.4f} "

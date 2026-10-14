@@ -4,7 +4,7 @@
 
 Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and QP-based whole-body control. The target architecture follows [legged_control](https://github.com/qiayuanl/legged_control): OCS2 NMPC, WBC, state estimation and a robot hardware interface.
 
-**Current scope:** closed-loop standing, squatting, load transfer, a complete right-front single-leg cycle and in-place trot in MuJoCo. Go2 full-centroidal OCS2 MPC drives mode-dependent WBC through ROS 2 and a C++ MRT policy-query service. Translation, stopping, turning, state estimation, the Unitree SDK2 interface and hardware safety remain to be implemented.
+**Current scope:** closed-loop standing, squatting, load transfer, a complete right-front single-leg cycle and in-place trot in MuJoCo, plus an initial low-speed forward simulation. Go2 full-centroidal OCS2 MPC drives mode-dependent WBC through ROS 2 and a C++ MRT policy-query service. Forward foot motion still needs quantitative checks; switching from trot to standing, turning, state estimation, the Unitree SDK2 interface and hardware safety remain to be implemented.
 
 ## Status
 
@@ -23,10 +23,11 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | ROS 2 MPC transport and C++ MRT policy query | Implemented and verified |
 | Trot gait command, MPC mode schedule and C++ MRT query | Modes 15/9/6 verified in a 20 s closed-loop simulation |
 | Mode-aware WBC and latched in-place swing targets | 20 s closed-loop trot; all four feet lifted; vertical swing reference aligned with OCS2 parameters and floor contacts measured |
-| Translation, stopping, turning and disturbance recovery | Planned |
+| Low-speed forward trot | Initial 20 s headless run at 0.03 m/s with a 0.09 m displacement target; foot progression and slip still need checking |
+| Stopping, turning and disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
-The OCS2 controller has completed a 20 s in-place trot in headless MuJoCo. The single-leg cycle still uses scripted contact phases. The trot result does not establish translation, stopping, turning or hardware readiness.
+The OCS2 controller has completed a 20 s in-place trot and an initial headless low-speed forward run in MuJoCo. The single-leg cycle still uses scripted contact phases. Forward foot progression and contact-point slip need further checks; stopping, turning and hardware readiness remain unverified. See the [forward trot notes](docs/ocs2_forward_trot.md).
 
 ## Architecture
 
