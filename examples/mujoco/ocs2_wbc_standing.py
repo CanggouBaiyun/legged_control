@@ -250,9 +250,9 @@ def forward_motion_goal(time):
 
     return 3.0 * speed, 0.0
 
-def turn_yaw_goal(time):
-    """Return desired yaw and yaw rate for a 10-degree left turn."""
-    rate = np.deg2rad(10.0 / 3.0)
+def turn_yaw_goal(time, angle_deg=10.0):
+    """Return desired yaw and yaw rate for a signed turn."""
+    rate = np.deg2rad(angle_deg / 3.0)
 
     if time <= 8.0:
         return 0.0, 0.0
@@ -317,6 +317,12 @@ def parse_args():
         action="store_true",
         help="Use the short in-place yaw-turn target during trot.",
     )
+    parser.add_argument(
+        "--turn-angle-deg",
+        type=float,
+        default=10.0,
+        help="Signed turn angle in degrees: positive left, negative right.",
+    )
     args = parser.parse_args()
 
     if not 0.0 < args.duration <= 20.0:
@@ -334,13 +340,17 @@ def parse_args():
         or not args.trot_at < args.stop_trot_at < args.duration
     ):
         parser.error("--stop-trot-at must be after --trot-at and before the run ends")
-
+    if not np.isfinite(args.turn_angle_deg):
+        parser.error("--turn-angle-deg must be finite")
     return args
 
 
 def main():
     args = parse_args()
 
+    def yaw_goal(stamp):
+        return turn_yaw_goal(stamp, angle_deg=args.turn_angle_deg)
+    
     root = Path(__file__).resolve().parents[2]
     scene = root / "third_party/unitree_mujoco/unitree_robots/go2/scene.xml"
 
@@ -352,7 +362,7 @@ def main():
     trot_wbc = TrotWBC(
         model, 
         forward_goal=forward_motion_goal if args.forward else None,
-        yaw_goal=turn_yaw_goal if args.turn else None,                
+        yaw_goal=yaw_goal if args.turn else None,                
     ) if args.allow_trot else None
     floor_id = mujoco.mj_name2id(
         mj_model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
@@ -397,7 +407,7 @@ def main():
             forward_motion_goal(stamp) if args.forward else (0.0, 0.0)
         )
         yaw_delta, yaw_rate = (
-            turn_yaw_goal(stamp) if args.turn else (0.0, 0.0)
+            yaw_goal(stamp) if args.turn else (0.0, 0.0)
         )
 
         base_position = q[:3].copy()
