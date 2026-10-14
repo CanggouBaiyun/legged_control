@@ -26,7 +26,7 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | Low-speed forward trot | 20 s headless run at 0.03 m/s with a 0.09 m displacement target; forward motion measured for all four feet, contact-point slip still to be checked |
 | Trot to four-foot stance | Stance command at 15 s; mode 15 sustained from 16.020 s in a 20 s headless run |
 | In-place yaw turn | Initial 20 s headless runs for ±10° targets; final measured +9.77° / -9.79°; left-turn foot XY direction verified, with endpoint errors and touchdown slip transients recorded |
-| MPC-derived swing references | Optional `--swing-reference=mpc`; first 20 s +10° turn measured 9.91°, loaded contact tangent-speed peak 60.43 mm/s; forward and reverse runs pending |
+| MPC-derived swing references | Optional `--swing-reference=mpc`; 20 s left/right turns and forward/stop runs verified: +9.91° / −9.86° for ±10° goals, final x 0.09090 m for a 0.09 m goal, actual forward swing for all feet |
 | Disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
@@ -34,7 +34,7 @@ The OCS2 controller has completed a 20 s in-place trot and a headless low-speed 
 
 ## Architecture
 
-The OCS2 simulation offers two swing-reference sources. The default `planner` uses latched foot trajectories. With `--swing-reference=mpc`, WBC foot position and velocity targets come from the same MRT policy as the joint PD references; foot acceleration feedforward is estimated using the existing future policy query within the same swing phase. This optional path has completed a first left-turn run; forward and reverse motion remain to be validated. Current-policy tracking errors cannot be compared directly with fixed planner targets because MPC replans from measured states. See the [comparison](docs/ocs2_trot_yaw.md).
+The OCS2 simulation offers two swing-reference sources. The default `planner` uses latched foot trajectories. With `--swing-reference=mpc`, WBC foot position and velocity targets come from the same MRT policy as the joint PD references; foot acceleration feedforward is estimated using the existing future policy query within the same swing phase. This optional path has completed left/right turns and low-speed forward/stop validation, with measured forward swing for all feet. Current-policy tracking errors cannot be compared directly with fixed planner targets because MPC replans from measured states. Synchronous loop timing still exceeds the 2 ms timestep on many steps; real-time execution remains pending. See the [turning comparison](docs/ocs2_trot_yaw.md) and [forward results](docs/ocs2_forward_trot.md).
 
 Implemented scripted-motion simulation path:
 
@@ -234,7 +234,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_single_leg_cycle.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-Latest verified regression result: **38 passed, 6 warnings**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic and OCS2 vertical swing trajectory checks, and a headless 20 s single-leg cycle. Headless execution does not intentionally sleep to match wall time; runtime depends on the machine. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
+Latest verified regression result (2026-10-14, after the MPC swing-reference integration): **38 passed, 6 warnings in 13.95 s**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic and OCS2 vertical swing trajectory checks, and a headless 20 s single-leg cycle. The new MPC swing-reference path was additionally validated through separate 20 s left-turn, right-turn and forward/stop runs. Headless execution does not intentionally sleep to match wall time; runtime depends on the machine. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
 
 Cycle CSV logs include FR desired/actual frame height and actual normal contact force. Summary height errors refer to the base; `maximum_xy_drift_mm` measures displacement from the world origin, including the intentional base shift, not target-tracking error.
 
