@@ -25,11 +25,11 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | Mode-aware WBC and latched in-place swing targets | 20 s closed-loop trot; all four feet lifted; vertical swing reference aligned with OCS2 parameters and floor contacts measured |
 | Low-speed forward trot | 20 s headless run at 0.03 m/s with a 0.09 m displacement target; forward motion measured for all four feet, contact-point slip still to be checked |
 | Trot to four-foot stance | Stance command at 15 s; mode 15 sustained from 16.020 s in a 20 s headless run |
-| In-place yaw turn | First 20 s headless run completed; 10° target, 4.27° measured at the last recorded sample; tracking remains unresolved |
+| In-place yaw turn | Initial 20 s headless validation with angular-acceleration feedforward; 10° target, 9.77° measured at the last sample; transient lag, reverse turn and contact-point slip remain to be checked |
 | Disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
-The OCS2 controller has completed a 20 s in-place trot and a headless low-speed forward run with measured forward swing for all four feet and a return to four-foot stance. The first yaw-turn experiment completed, but measured only 4.27° against a 10° target; yaw tracking remains unresolved. The single-leg cycle still uses scripted contact phases. Contact-point slip and hardware readiness remain unverified. See the [forward trot notes](docs/ocs2_forward_trot.md) and [yaw-turn results](docs/ocs2_trot_yaw.md).
+The OCS2 controller has completed a 20 s in-place trot and a headless low-speed forward run with measured forward swing for all four feet and a return to four-foot stance. Adding angular-acceleration feedforward improved a 10° yaw-turn experiment from 4.26° to 9.77° at the last recorded sample; transient lag remains, with 2.31° goal-tracking RMSE during 8–12 s. The single-leg cycle still uses scripted contact phases. Contact-point slip, reverse turning and hardware readiness remain unverified. See the [forward trot notes](docs/ocs2_forward_trot.md) and [yaw-turn results](docs/ocs2_trot_yaw.md).
 
 ## Architecture
 

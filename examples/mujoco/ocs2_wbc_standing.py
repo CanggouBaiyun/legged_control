@@ -710,7 +710,19 @@ def main():
                 )
 
             reference["desired_base_linear_acceleration_world"] = acceleration_ff_world
+            angular_acceleration_ff_local = (
+                future_reference["desired_base_angular_velocity_local"]
+                - reference["desired_base_angular_velocity_local"]
+            ) / acceleration_interval
 
+            if not np.isfinite(angular_acceleration_ff_local).all():
+                raise RuntimeError(
+                    "Non-finite base angular acceleration feedforward"
+                )
+
+            reference["desired_base_angular_acceleration_local"] = (
+                angular_acceleration_ff_local
+            )
             # C. WBC 必须用实测 q、v 求解。
             result = timed_call(
                 timings["wbc"],
@@ -830,6 +842,16 @@ def main():
                     times,
                     states[:, 8],
                 ))
+                future_yaw = float(np.interp(
+                    lookahead_time,
+                    times,
+                    states[:, 9],
+                ))
+                yaw_change = np.arctan2(
+                    np.sin(future_yaw - state_ref[9]),
+                    np.cos(future_yaw - state_ref[9]),
+                )
+                planned_yaw_rate_deg_s = np.rad2deg(yaw_change) / 0.2
 
                 mpc_fz = float(np.sum(mpc_forces[:, 2]))
                 wbc_fz = float(np.sum(wbc_forces_ocs2_order[:, 2]))
@@ -837,6 +859,12 @@ def main():
                 print(
                     f"t={mj_data.time:5.2f} "
                     f"mode={mode} "
+                    f"yaw_goal={np.rad2deg(target[9]):.2f} "
+                    f"yaw_mpc={np.rad2deg(state_ref[9]):.2f} "
+                    f"yaw={np.rad2deg(measured_yaw):.2f} "
+                    f"yaw+0.2={np.rad2deg(future_yaw):.2f} "
+                    f"yaw_end={np.rad2deg(states[-1, 9]):.2f} "
+                    f"yaw_rate_plan={planned_yaw_rate_deg_s:+.2f} "
                     f"x_goal={target[6]:.4f} "
                     f"x_mpc={state_ref[6]:.4f} "
                     f"x={q[0]:.4f} "
