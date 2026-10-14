@@ -90,6 +90,13 @@ CSV_COLUMNS = (
     "mj_contact_rotation_speed_rr_mps",
 )
 
+CSV_COLUMNS += tuple(
+    f"pd_swing_{kind}_delta_{axis}_{leg}_{unit}"
+    for kind, unit in (("position", "m"), ("velocity", "mps"))
+    for axis in ("x", "y", "z")
+    for leg in ("fl", "fr", "rl", "rr")
+)
+
 from go2_control.centroidal import (
     pinocchio_from_state,
     state_from_pinocchio,
@@ -203,6 +210,44 @@ def floor_contact_tangent_speeds(model, data, floor_id, foot_name_by_geom):
             ))
 
     return speeds, translation_speeds, rotation_speeds
+
+def joint_pd_swing_reference_deltas(
+    model, data, q, v, q_ref, v_ref, swing_targets,
+):
+    """Compare joint PD references with WBC swing targets."""
+    deltas = np.full((6, 4), np.nan)
+    if not swing_targets:
+        return deltas.ravel().tolist()
+
+    # 保留实测基座，只替换电机关节的位置和速度。
+    q_target = q.copy()
+    q_target[7:] = q_ref[7:]
+    v_target = v.copy()
+    v_target[6:] = v_ref[6:]
+
+    pin.forwardKinematics(model, data, q_target, v_target)
+    pin.updateFramePlacements(model, data)
+
+    for index, name in enumerate(OCS2_CONTACT_ORDER):
+        if name not in swing_targets:
+            continue
+
+        target_position, target_velocity, _ = swing_targets[name]
+        if target_velocity is None:
+            target_velocity = np.zeros(3)
+
+        frame_id = model.getFrameId(name)
+        pd_position = data.oMf[frame_id].translation
+        pd_velocity = pin.getFrameVelocity(
+            model, data, frame_id,
+            pin.ReferenceFrame.LOCAL_WORLD_ALIGNED,
+        ).linear
+
+        deltas[:3, index] = pd_position - target_position
+        deltas[3:, index] = pd_velocity - target_velocity
+
+    return deltas.ravel().tolist()
+
 
 def request_transport(process, message):
     """Send one request to the ROS subprocess and receive its response."""
@@ -470,6 +515,7 @@ def main():
     if floor_id < 0 or -1 in foot_name_by_geom:
         raise RuntimeError("Missing MuJoCo floor or named foot geom")
     mapping_data = model.createData()
+    pd_reference_data = model.createData()
 
     key = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_KEY, "home")
     if key < 0:
@@ -851,6 +897,10 @@ def main():
             q_ref, v_ref = pinocchio_from_state(
                 model, mapping_data, state_ref, input_ref[12:]
             )
+            pd_swing_deltas = joint_pd_swing_reference_deltas(
+                model, pd_reference_data,
+                q, v, q_ref, v_ref, swing_targets,
+            )
             feedback = args.joint_pd_scale * joint_pd_feedback(
                 model, q, v, q_ref, v_ref, kp=20.0, kd=1.0
             )
@@ -1048,6 +1098,7 @@ def main():
                 previous_floor_forces = floor_forces
             else:
                 row.extend([float("nan")] * 20)
+            row.extend(pd_swing_deltas)
             rows.append(row)
             if viewer is not None:
                 viewer.sync()
