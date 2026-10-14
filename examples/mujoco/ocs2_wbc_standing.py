@@ -409,6 +409,12 @@ def parse_args():
         default=10.0,
         help="Signed turn angle in degrees: positive left, negative right.",
     )
+    parser.add_argument(
+        "--joint-pd-scale",
+        type=float,
+        default=1.0,
+        help="Scale the extra joint PD torque between 0 and 1.",
+    )
     args = parser.parse_args()
 
     if not 0.0 < args.duration <= 20.0:
@@ -428,6 +434,8 @@ def parse_args():
         parser.error("--stop-trot-at must be after --trot-at and before the run ends")
     if not np.isfinite(args.turn_angle_deg):
         parser.error("--turn-angle-deg must be finite")
+    if not 0.0 <= args.joint_pd_scale <= 1.0:
+        parser.error("--joint-pd-scale must be in [0, 1]")
     return args
 
 
@@ -843,7 +851,7 @@ def main():
             q_ref, v_ref = pinocchio_from_state(
                 model, mapping_data, state_ref, input_ref[12:]
             )
-            feedback = joint_pd_feedback(
+            feedback = args.joint_pd_scale * joint_pd_feedback(
                 model, q, v, q_ref, v_ref, kp=20.0, kd=1.0
             )
             torque = result.motor_torques + feedback
@@ -1202,6 +1210,7 @@ def main():
 
         summary = {
             "requested_duration_s": args.duration,
+            "joint_pd_scale": args.joint_pd_scale,
             "actual_duration_s": float(mj_data.time),
             "samples": len(records),
             "mode_samples": {
