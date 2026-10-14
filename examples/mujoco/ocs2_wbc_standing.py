@@ -19,6 +19,9 @@ CSV_COLUMNS = (
     "goal_x_m",
     "mpc_x_m",
     "measured_x_m",
+    "goal_yaw_rad",
+    "mpc_yaw_rad",
+    "measured_yaw_rad",
     "goal_z_m",
     "mpc_z_m",
     "measured_z_m",
@@ -247,6 +250,29 @@ def forward_motion_goal(time):
 
     return 3.0 * speed, 0.0
 
+def turn_yaw_goal(time):
+    """Return desired yaw and yaw rate for a 10-degree left turn."""
+    rate = np.deg2rad(10.0 / 3.0)
+
+    if time <= 8.0:
+        return 0.0, 0.0
+
+    if time < 9.0:
+        u = time - 8.0
+        yaw_rate = rate * (3.0 * u**2 - 2.0 * u**3)
+        yaw = rate * (u**3 - 0.5 * u**4)
+        return yaw, yaw_rate
+
+    if time < 11.0:
+        return 0.5 * rate + rate * (time - 9.0), rate
+
+    if time < 12.0:
+        u = time - 11.0
+        yaw_rate = rate * (1.0 - 3.0 * u**2 + 2.0 * u**3)
+        yaw = rate * (2.5 + u - u**3 + 0.5 * u**4)
+        return yaw, yaw_rate
+
+    return 3.0 * rate, 0.0
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -286,7 +312,11 @@ def parse_args():
         action="store_true",
         help="Use the short forward-motion target during trot.",
     )
-
+    parser.add_argument(
+        "--turn",
+        action="store_true",
+        help="Use the short in-place yaw-turn target during trot.",
+    )
     args = parser.parse_args()
 
     if not 0.0 < args.duration <= 20.0:
@@ -295,6 +325,8 @@ def parse_args():
         not args.allow_trot or not 0.0 < args.trot_at < args.duration
     ):
         parser.error("--trot-at requires --allow-trot and a time within the run")
+    if args.turn and (not args.allow_trot or args.trot_at is None):
+        parser.error("--turn requires --allow-trot and --trot-at")
     if args.forward and (not args.allow_trot or args.trot_at is None):
         parser.error("--forward requires --allow-trot and --trot-at")
     if args.stop_trot_at is not None and (
@@ -317,7 +349,11 @@ def main():
     model = build_go2_simulation_model()
     bridge = MujocoPinocchioBridge(mj_model, model)
     wbc = StandingWBC(model)
-    trot_wbc = TrotWBC(model, forward_goal=forward_motion_goal if args.forward else None) if args.allow_trot else None
+    trot_wbc = TrotWBC(
+        model, 
+        forward_goal=forward_motion_goal if args.forward else None,
+        yaw_goal=turn_yaw_goal if args.turn else None,                
+    ) if args.allow_trot else None
     floor_id = mujoco.mj_name2id(
         mj_model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
     )
@@ -360,21 +396,42 @@ def main():
         displacement, forward_velocity = (
             forward_motion_goal(stamp) if args.forward else (0.0, 0.0)
         )
-        
+        yaw_delta, yaw_rate = (
+            turn_yaw_goal(stamp) if args.turn else (0.0, 0.0)
+        )
+
         base_position = q[:3].copy()
         base_position[0] = initial_base_x + displacement
         base_position[2] = standing_height_goal(stamp)
 
-        # 这里的四脚位置是用于生成可达的名义关节姿态，非滑动命令
+        yaw_rotation = pin.rpy.rpyToMatrix(
+            np.array([0.0, 0.0, yaw_delta])
+        )
+        target_rotation = yaw_rotation @ base_rotation
+
+        # 让名义足端随机身朝向旋转，保持合理的关节姿态参考。
+        # 实际支撑脚仍由 WBC 的接触约束固定在世界坐标中。
         nominal_feet = initial_feet.copy()
-        nominal_feet[:, 0] += displacement
-        nominal_foot_velocities = np.zeros((4,3))
-        nominal_foot_velocities[:, 0] = forward_velocity
+        relative_feet_xy = initial_feet[:, :2] - q[:2]
+        nominal_feet[:, :2] = (
+            base_position[:2]
+            + (yaw_rotation[:2, :2] @ relative_feet_xy.T).T
+        )
+
+        angular_velocity_world = np.array([0.0, 0.0, yaw_rate])
+        nominal_foot_velocities = np.tile(
+            np.array([forward_velocity, 0.0, 0.0]), (4, 1)
+        )
+        nominal_foot_velocities += np.cross(
+            angular_velocity_world,
+            nominal_feet - base_position,
+        )
 
         q_ref, v_ref = fixed_foot_reference.solve(
             base_position,
-            base_rotation,
+            target_rotation,
             np.array([forward_velocity, 0.0, 0.0]),
+            angular_velocity_local=target_rotation.T @ angular_velocity_world,
             foot_positions_world=nominal_feet,
             foot_velocities_world=nominal_foot_velocities,
         )
@@ -451,7 +508,9 @@ def main():
             )
             target[6] = initial_base_x + displacement
             target[8] = standing_height_goal(mj_data.time)
-
+            target[9] = np.interp(
+                mj_data.time, target_times, target_states[:, 9]
+            )
             if (
                 not np.isfinite(q).all()
                 or not np.isfinite(v).all()
@@ -571,6 +630,7 @@ def main():
                     mode_event_times,
                     mode_sequence,
                     feet_by_name,
+                    base_position=q[:3],
                 )
 
             last_control = input_ref.copy()
@@ -710,7 +770,9 @@ def main():
                 reference["desired_base_linear_velocity_world"][2]
             )
             actual_vz = float(mj_data.qvel[2])
-
+            measured_yaw = pin.rpy.matrixToRpy(
+                pin.XYZQUATToSE3(q[:7]).rotation
+            )[2]
 
             row = [
                     float(mj_data.time),
@@ -718,6 +780,9 @@ def main():
                     float(target[6]),
                     float(state_ref[6]),
                     float(q[0]),
+                    float(target[9]),
+                    float(state_ref[9]),
+                    float(measured_yaw),
                     float(target[8]),
                     float(state_ref[8]),
                     float(q[2]),
