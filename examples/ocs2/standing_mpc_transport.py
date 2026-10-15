@@ -15,7 +15,7 @@ from ocs2_msgs.msg import (
     ModeSchedule,
 )
 from ocs2_msgs.srv import Reset
-from go2_mpc_bridge.srv import EvaluatePolicy
+from go2_mpc_bridge.srv import EvaluatePolicy, EvaluatePolicyPair
 
 SUPPORTED_CONTACT_MODES = {15, 9, 6}
 
@@ -184,6 +184,113 @@ def query_mrt(node, client, policy, stamp, current_state):
     raise RuntimeError("Selected policy was not available in MRT cache")
 
 
+def query_mrt_pair(
+    node, client, policy, stamp, future_stamp, current_state
+):
+    """Query two times on the same explicitly selected policy."""
+    if (
+        not math.isfinite(stamp)
+        or not math.isfinite(future_stamp)
+        or future_stamp < stamp
+        or len(current_state) != 24
+        or not all(math.isfinite(value) for value in current_state)
+    ):
+        raise ValueError("Invalid MRT pair query")
+
+    start_time = float(policy.time_trajectory[0])
+    end_time = float(policy.time_trajectory[-1])
+    tolerance = 1e-6
+
+    if (
+        stamp < start_time - tolerance
+        or future_stamp > end_time + tolerance
+    ):
+        raise RuntimeError("MRT pair query outside policy")
+
+    if not client.wait_for_service(timeout_sec=3.0):
+        raise RuntimeError("MRT pair service is unavailable")
+
+    query = EvaluatePolicyPair.Request()
+    query.reset_epoch = policy.reset_epoch
+    query.policy_sequence = policy.policy_sequence
+    # 只修正容差内的边界误差。
+    query.time = min(max(stamp, start_time), end_time)
+    query.future_time = min(max(future_stamp, start_time), end_time)
+    query.current_state = current_state
+
+    deadline = time.monotonic() + 3.0
+
+    while time.monotonic() < deadline:
+        future = client.call_async(query)
+        rclpy.spin_until_future_complete(
+            node,
+            future,
+            timeout_sec=min(
+                1.0, max(0.0, deadline - time.monotonic())
+            ),
+        )
+
+        if not future.done():
+            future.cancel()
+            raise RuntimeError("MRT pair service response timed out")
+
+        response = future.result()
+        if response is None:
+            raise RuntimeError("MRT pair returned no response")
+
+        if not response.success:
+            if response.error == "Requested policy is not cached":
+                rclpy.spin_once(node, timeout_sec=0.01)
+                continue
+            raise RuntimeError(response.error)
+
+        if (
+            response.reset_epoch != query.reset_epoch
+            or response.policy_sequence != query.policy_sequence
+            or response.mode not in SUPPORTED_CONTACT_MODES
+            or response.future_mode not in SUPPORTED_CONTACT_MODES
+        ):
+            raise RuntimeError(
+                "MRT pair response policy ID or mode mismatch"
+            )
+
+        state = list(response.state_reference)
+        control = list(response.input_reference)
+        future_state = list(response.future_state_reference)
+        future_control = list(response.future_input_reference)
+
+        if (
+            any(
+                len(values) != 24
+                for values in (
+                    state, control, future_state, future_control
+                )
+            )
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    state + control + future_state + future_control
+                )
+            )
+        ):
+            raise RuntimeError("Invalid MRT pair references")
+
+        return {
+            "reset_epoch": response.reset_epoch,
+            "policy_sequence": response.policy_sequence,
+            "state": state,
+            "input": control,
+            "mode": response.mode,
+            "future_state": future_state,
+            "future_input": future_control,
+            "future_mode": response.future_mode,
+        }
+
+    raise RuntimeError(
+        "Selected policy was not available in MRT cache"
+    )
+
+
 def main():
     rclpy.init()
     node = rclpy.create_node("go2_simulation_mpc_transport")
@@ -214,6 +321,10 @@ def main():
         EvaluatePolicy,
         "/go2_mpc/evaluate_policy"
     )
+    mrt_pair_client = node.create_client(
+        EvaluatePolicyPair,
+        "/go2_mpc/evaluate_policy_pair",
+    )
 
     epoch = None
     last_sequence = -1
@@ -240,6 +351,27 @@ def main():
                     )
 
                     print(json.dumps(output, allow_nan=False), flush=True)
+                    continue
+
+                if action == "evaluate_pair":
+                    if selected_policy is None:
+                        raise RuntimeError(
+                            "Request a policy before querying MRT"
+                        )
+
+                    output = query_mrt_pair(
+                        node,
+                        mrt_pair_client,
+                        selected_policy,
+                        stamp,
+                        float(request["future_time"]),
+                        request["state"],
+                    )
+
+                    print(
+                        json.dumps(output, allow_nan=False),
+                        flush=True,
+                    )
                     continue
 
                 if action == "poll":

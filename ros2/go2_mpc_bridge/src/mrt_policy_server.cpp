@@ -11,9 +11,11 @@
 #include <ocs2_ros_interfaces/mrt/MRT_ROS_Interface.h>
 
 #include "go2_mpc_bridge/srv/evaluate_policy.hpp"
+#include "go2_mpc_bridge/srv/evaluate_policy_pair.hpp"
 
 using PolicyMessage = ocs2_msgs::msg::MpcFlattenedController;
 using EvaluatePolicy = go2_mpc_bridge::srv::EvaluatePolicy;
+using EvaluatePolicyPair = go2_mpc_bridge::srv::EvaluatePolicyPair;
 using PolicyKey = std::pair<uint64_t, uint64_t>;
 
 bool isSupportedContactMode(size_t mode) {
@@ -200,6 +202,121 @@ int main(int argc, char** argv) {
             response->error = error.what();
           }
         });
+
+    // 同一条策略上查询当前与未来参考。
+    auto pairService = node->create_service<EvaluatePolicyPair>(
+        "/go2_mpc/evaluate_policy_pair",
+        [&](const std::shared_ptr<EvaluatePolicyPair::Request> request,
+            std::shared_ptr<EvaluatePolicyPair::Response> response) {
+          response->success = false;
+
+          try {
+            if (!std::isfinite(request->time) ||
+                !std::isfinite(request->future_time) ||
+                !std::all_of(
+                    request->current_state.begin(),
+                    request->current_state.end(),
+                    [](double value) { return std::isfinite(value); })) {
+              throw std::runtime_error("Query contains NaN or Inf");
+            }
+
+            if (request->future_time < request->time) {
+              throw std::runtime_error(
+                  "Future query time precedes current query time");
+            }
+
+            const PolicyKey key{
+                request->reset_epoch,
+                request->policy_sequence};
+
+            const auto found = policies.find(key);
+            if (found == policies.end()) {
+              throw std::runtime_error(
+                  "Requested policy is not cached");
+            }
+
+            const auto& message = *found->second;
+            const auto& times = message.time_trajectory;
+
+            if (request->time < times.front() ||
+                request->future_time > times.back()) {
+              throw std::runtime_error(
+                  "Query time is outside the policy horizon");
+            }
+
+            if (key != activeKey) {
+              activeKey = PolicyKey{0, 0};
+              mrt.activate(message);
+              activeKey = key;
+            }
+
+            ocs2::vector_t currentState(24);
+            for (int i = 0; i < 24; ++i) {
+              currentState[i] = request->current_state[i];
+            }
+
+            // 两次求值共用实测状态和已经激活的策略。
+            const auto evaluateAtTime =
+                [&](double stamp,
+                    ocs2::vector_t& state,
+                    ocs2::vector_t& input,
+                    size_t& mode) {
+                  mrt.evaluatePolicy(
+                      stamp, currentState, state, input, mode);
+
+                  if (state.size() != 24 ||
+                      input.size() != 24 ||
+                      !state.allFinite() ||
+                      !input.allFinite() ||
+                      !isSupportedContactMode(mode)) {
+                    throw std::runtime_error(
+                        "Invalid MRT Go2 reference");
+                  }
+                };
+
+            ocs2::vector_t stateReference;
+            ocs2::vector_t inputReference;
+            ocs2::vector_t futureStateReference;
+            ocs2::vector_t futureInputReference;
+            size_t mode = 0;
+            size_t futureMode = 0;
+
+            evaluateAtTime(
+                request->time,
+                stateReference,
+                inputReference,
+                mode);
+
+            evaluateAtTime(
+                request->future_time,
+                futureStateReference,
+                futureInputReference,
+                futureMode);
+
+            // 两次求值均通过检查后，才填写成功响应。
+            for (int i = 0; i < 24; ++i) {
+              response->state_reference[i] = stateReference[i];
+              response->input_reference[i] = inputReference[i];
+              response->future_state_reference[i] =
+                  futureStateReference[i];
+              response->future_input_reference[i] =
+                  futureInputReference[i];
+            }
+
+            response->reset_epoch = key.first;
+            response->policy_sequence = key.second;
+            response->mode = mode;
+            response->future_mode = futureMode;
+            response->success = true;
+
+          } catch (const std::exception& error) {
+            response->error = error.what();
+          }
+        });
+
+    RCLCPP_INFO(
+        node->get_logger(),
+        "MRT pair service ready: /go2_mpc/evaluate_policy_pair");
 
     RCLCPP_INFO(
         node->get_logger(),

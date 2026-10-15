@@ -2,9 +2,11 @@
 
 ## 当前状态
 
-2026-10-15 在 `feature/ocs2-async-mpc` 接入可选 `--async-mpc` 路径，完成 20 s 异步站立及原地 trot 到停步闭环，均包含机身高度目标变化。策略持续更新、未触发过期或限幅，但 trot 累计启动迟到约 3.47 s，尚未达到稳定 500 Hz 执行。异步前进和转向待验证，下一步优先优化通信耗时。默认仍使用同步更新。
+2026-10-15 在 `feature/ocs2-async-mpc` 接入可选 `--async-mpc` 路径，完成 20 s 异步站立及原地 trot 到停步闭环，均包含机身高度目标变化。随后精简 poll 载荷并合并 MRT 查询，两项优化后再次完成 20 s trot，最大累计迟到降至约 321 ms、结束时基本追上真实时间；仍有执行超时，尚未达到稳定 500 Hz。异步前进和转向待验证。默认仍使用同步更新。
 
 上述初始闭环结果对应提交 `d00c8ff` 的优化前基线。随后已接入 poll 精简轨迹传输，并完成离线检查和同条件 20 s 原地 trot 对比：poll 平均由 2.075 ms 降至 0.292 ms，最大累计启动迟到由 3.471 s 降至 1.517 s。末步仍迟到 1.305 s，实时执行尚待继续优化，详细对比见后文。
+
+双时刻 MRT 查询的服务定义、C++ 回调、Python 通信及仿真循环均已接入，完成服务级检查和 20 s 闭环。与精简传输基线相比，每步 MRT 合计平均由 0.689 ms 降至 0.499 ms，循环平均由 2.171 ms 降至 1.963 ms。早期结果使用每步两次单时刻查询，最新结果使用每步一次双时刻请求，计时口径见后文。
 
 C++ MPC 原本已经运行在独立进程；此前仿真端每隔 20 ms 发布观测后，会等待基于该次观测的新策略，导致 WBC 控制循环暂停。本阶段取消运行期间对该次 MPC 求解完成的等待。
 
@@ -16,6 +18,7 @@ C++ MPC 原本已经运行在独立进程；此前仿真端每隔 20 ms 发布�
 | `observe` | 发布最新观测和可选步态命令，返回发布确认 |
 | `poll` | 处理已就绪回调；检查收到的策略并选择可用的新策略，无更新时保留当前有效策略 |
 | `evaluate` | 按当前选定策略的 epoch 与 sequence 查询 C++ MRT |
+| `evaluate_pair` | 一次请求在同一策略上查询当前与未来时刻，分别返回两组参考与模式 |
 
 异步模式第一次 `plan` 后调用 `poll` 确认策略，再建立真实时间起点。随后每 20 ms 调用 `observe` 和 `poll`，控制步长保持 2 ms。每个控制步当前时刻与未来 5 ms 的 MRT 查询使用同一条选定策略；收到策略消息本身不会自动切换 `selected_policy`。
 
@@ -39,11 +42,11 @@ CSV 新增以下字段：
 
 终端每秒打印策略年龄。JSON 保存 `async_mpc`、`policy_updates`、最大策略年龄与最大启动迟到量。同步模式这些年龄和迟到指标在 CSV 中为 NaN、汇总最大值为 null。
 
-`timing_ms.plan` 记录完整策略请求，异步模式通常仅初始化一次；新增 `observe`、`poll` 分项记录通信处理耗时。`loop` 不含步前主动等待，但第一个 loop 样本仍含初始化等待。分析持续运行性能时，应区分该初始化样本。MRT 计时仍为每步两次独立服务往返。
+`timing_ms.plan` 记录完整策略请求，异步模式通常仅初始化一次；`observe`、`poll` 分项记录通信处理耗时。`loop` 不含步前主动等待，但第一个 loop 样本仍含初始化等待。分析持续运行性能时，应区分该初始化样本。基线 `timing_ms.mrt` 为每步两次独立往返；新双时刻路径使用 `timing_ms.mrt_pair`，每步记录一次包含两次求值的往返，20 s/10,000 步预期产生 10,000 条计时记录。比较时应将一次 pair 的耗时与原来两次单时刻请求的合计耗时对应。
 
 ## 首次 20 s 站立验证
 
-先启动 MPC 和 MRT，两个节点和仿真均使用 `ROS_DOMAIN_ID=214`。本次无需启动步态命令节点，也无需重新编译 C++；改动位于 Python 源码。
+先启动 MPC 和 MRT，两个节点和仿真均使用 `ROS_DOMAIN_ID=214`，本次无需启动步态命令节点。最初异步站立验证仅修改 Python；后续双时刻路径涉及 C++ 服务，新复现需先完成后文的 bridge 定向构建，并启动支持双时刻接口的 MRT 服务端。
 
 终端 1（MPC）：
 
@@ -66,7 +69,7 @@ export ROS_DOMAIN_ID=214
 ros2 run go2_mpc_bridge mrt_policy_server
 ```
 
-这里先加载 ROS，再加载工作空间的 `local_setup.bash`。当前生成的 `install/setup.bash` 仍记录已删除的 `/tmp/go2_mpc_bridge_install` 父环境；直接加载本地工作空间可避免该失效路径，同时保留工作空间内已安装的 bridge 包。仿真子进程也使用相同加载顺序。
+这里先加载 ROS，再加载工作空间的 `local_setup.bash`。首次检查时生成的 `install/setup.bash` 仍记录已删除的 `/tmp/go2_mpc_bridge_install` 父环境；使用上述顺序可避免该失效路径，同时保留工作空间内已安装的 bridge 包。仿真子进程也使用相同顺序。随后本阶段重新构建 bridge，生成的顶层 `setup.bash` 已不再记录该临时父环境。
 
 终端 3：
 
@@ -224,7 +227,102 @@ env -u PYTHONPATH ROS_DOMAIN_ID=214 \
 
 2–20 s 有效支撑接触切向速度峰值为 FL 25.27、FR 57.24、RL 74.96、RR 36.04 mm/s；FR、RL 峰值在最终停步的 16.000 s，仍存在触地切向瞬态。未改变控制参数，当前结果支持精简诊断载荷后动作仍能完成；不能据这一组运行认定动力学结果完全不变或滑移问题已解决。
 
-本地数据为 `artifacts/ocs2_wbc_trot_async_compact.csv` 和同名 JSON。可提交保存本次优化，下一步将当前与未来 5 ms 的参考查询合并为一次通信请求，在同一策略上保留两次 MRT 求值，减少每步通信往返。该后续接口尚未实现。本阶段完整现有测试集回归仍待收尾执行，离线协议检查和上述 20 s 集成运行分别提供当前变更的验证。
+本地数据为 `artifacts/ocs2_wbc_trot_async_compact.csv` 和同名 JSON。精简传输优化已提交为 `a7a7867`。下一项将当前与未来 5 ms 的参考查询合并为一次通信请求，在同一策略上保留两次 MRT 求值，减少每步通信往返；服务端进度见下节。本阶段完整现有测试集回归仍待收尾执行，离线协议检查和上述 20 s 集成运行分别提供当前变更的验证。
+
+## 第二项通信优化：双时刻 MRT 查询
+
+2026-10-15 新增 `EvaluatePolicyPair.srv`，在 bridge 的 `CMakeLists.txt` 注册，并于 `mrt_policy_server.cpp` 创建 `/go2_mpc/evaluate_policy_pair`。原有 `/go2_mpc/evaluate_policy` 服务继续可用。
+
+请求包含同一个 reset epoch、策略序号、实测状态，以及 `time`、`future_time`。服务检查数据有限、未来时刻不早于当前时刻，并确认两个时刻均处于指定策略覆盖区间。策略只需激活一次，再分别求出当前与未来参考，允许它们的 mode 不同。两次求值都通过维度、有限值和支持模式检查后，才填写成功响应；出现异常时 success 保持 false。
+
+现有单线程 executor 顺序处理订阅和服务，一次双时刻回调中不执行其他策略更新回调。该接口复用同一条完整 MRT 策略和同一份实测状态，减少的是通信往返次数，仍保留两次求值与两个独立 mode。
+
+已在实际工作空间完成定向构建：
+
+```bash
+cd /home/bot/Project/ocs2_ws
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+env PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/python3 -m colcon build \
+  --packages-select go2_mpc_bridge --executor sequential \
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 \
+  --event-handlers console_direct+
+```
+
+结果为 `1 package finished [6.86s]`，C++ 服务端和新接口均已生成、安装；系统 Python 能加载 `EvaluatePolicyPair`。
+
+在独立 `ROS_DOMAIN_ID=215` 下临时启动编译后的 MRT 服务端，发布一条已知前馈策略，完成真实 ROS 服务级检查并自动退出：
+
+- 5 组双时刻结果与两次原单时刻请求的 24 维状态、输入逐元素一致，包括同一支撑阶段、跨 15→9、跨 9→6、相同时刻，以及预测区间两端。
+- 7 类非法请求被拒绝：未来早于当前、当前低于区间、未来超出区间、未来时间 NaN、实测状态 NaN、错误 epoch 和错误策略序号。
+- 失败响应的 success 为 false，状态参考保持默认零值；客户端仍必须先检查 success。
+
+受限环境首次检查输出 UDP 权限错误后，已在允许 ROS 套接字的环境复核，全部通过。该检查未运行 MPC 求解器或 MuJoCo，不能代替后续双时刻调用的 20 s 动作及耗时对比。
+
+服务端编译后，需在终端 2 重启 MRT 进程，使其加载新服务。MPC 进程可继续运行。Python 通信脚本和仿真循环随后也已接入，见下文；本次 Python 修改无需重复编译 C++。
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+export ROS_DOMAIN_ID=214
+ros2 run go2_mpc_bridge mrt_policy_server
+```
+
+启动日志应包含 `MRT pair service ready: /go2_mpc/evaluate_policy_pair`。上述定向构建已经完成，无需为本次服务端改动重复构建。
+
+### Python 通信与仿真端接入
+
+通信脚本新增 `query_mrt_pair`、对应 ROS 客户端和 JSON 动作 `evaluate_pair`。请求始终携带当前选定策略的 epoch、sequence；缓存尚未就绪时重试相同编号，不自动改用其他策略。返回前检查 success、编号、两组 mode 以及四个 24 维参考数组的维度和有限值。两个时刻均允许容差内的区间边界修正，真正越界或时间顺序错误则拒绝。
+
+仿真新增 `evaluate_policy_pair`，一次管道请求解析出当前 state/input/mode 与未来 state/input/mode。异步运行时还将返回编号与最近 poll 选定的策略编号核对。控制循环提前计算 `future_time = t + 0.005`、检查覆盖区间，再通过一次 `timed_call` 取得两组参考，删除后面单独查询未来参考的调用。
+
+当前与未来 mode 仍分别与策略时间表核对；两次运动学映射仍使用当前实测 q，机身线/角加速度前馈和同一摆动阶段内足端加速度的差分间隔仍为 5 ms。JSON 增加 `mrt_query_mode: "pair"`，计时项改为 `mrt_pair`，CSV 列数和控制目标保持原有定义。当前仿真脚本的同步和异步模式均使用双时刻查询，需要支持新服务的 MRT 节点。
+
+已通过实际 C++ 服务检查新 Python 查询函数：5 组场景与两次单时刻查询逐元素一致，每次 Python 双时刻函数调用只发起一次 ROS 请求；7 类 C++ 非法请求检查继续通过。将真实服务回复交给 Conda 仿真端解析，5 组结果完全对应，每次仅发一次管道请求，并拒绝 5 类错误编号/模式/数组回复。上述检查未运行 MuJoCo 闭环，不能据此宣布实时性能已改善。
+
+### 双时刻路径 20 s 对比命令
+
+终端 1 的 MPC 保持运行；确认终端 2 已加载上述新 MRT 服务后，仅在终端 3 运行：
+
+```bash
+env -u PYTHONPATH ROS_DOMAIN_ID=214 \
+  /home/bot/miniconda3/envs/go2_control/bin/python \
+  examples/mujoco/ocs2_wbc_standing.py \
+  --headless --duration 20 --async-mpc \
+  --allow-trot --trot-at 3 --stop-trot-at 15 \
+  --swing-reference=mpc \
+  --csv artifacts/ocs2_wbc_trot_async_pair.csv
+```
+
+与 `ocs2_wbc_trot_async_compact.csv` 及同名 JSON 比较。旧 MRT 单次平均 0.344 ms，对应每步两次合计约 0.689 ms；新 `mrt_pair` 的均值直接表示每步一次往返的开销。
+
+### 2026-10-15 双时刻路径结果
+
+完成 20 s、10,000 步，`mrt_query_mode` 为 `pair`，`mrt_pair` 恰好记录 10,000 次。epoch 为 4，策略序号从 1 到 999，没有倒退；更新 998 次，策略年龄中位数 28 ms、p95 与最大值均为 38 ms。
+
+与精简传输基线逐列对比 103 列 CSV，仅 `policy_reset_epoch` 和 `control_start_lateness_s` 不同，其余 101 列在 CSV 保存精度下逐元素一致（含相同 NaN 位置）。控制动作、接触、力矩、目标跟踪和模式记录没有可见数值差异；这支持本次通信合并保持了原控制参考，但不代表所有异步运行都必然产生相同轨迹。
+
+| 指标 | 精简载荷、两次单时刻查询 | 精简载荷、一次双时刻查询 |
+| --- | ---: | ---: |
+| MRT 往返次数 | 20000 | 10000 |
+| 每步 MRT 合计平均耗时 | 0.689 ms | 0.499 ms |
+| 完整循环平均耗时（含初始化首步） | 2.171 ms | 1.963 ms |
+| 完整循环 p95 | 3.190 ms | 2.928 ms |
+| 执行超过 2 ms 的循环数 | 4462/10000 | 2417/10000 |
+| 最大控制开始迟到量 | 1517.341 ms | 320.751 ms |
+| 末步控制开始迟到量 | 1304.596 ms | 0.0536 ms |
+| 控制开始迟到量中位数 / p95 | 720.610 / 1469.790 ms | 112.739 / 298.023 ms |
+| 控制开始迟到超过 2 ms 的样本数 | 9349/10000 | 7139/10000 |
+
+本组运行的 MRT 每步合计平均耗时下降约 27.6%，循环平均耗时下降约 9.6%。一次 pair 包含两次 MRT 求值，不能直接拿 0.499 ms 与旧单次的 0.344 ms 判断是否改善。本组为单次运行对比，未建立重复运行的统计分布。
+
+本轮 poll 平均 0.299 ms、p95 0.430 ms；MRT pair 平均 0.499 ms、p95 1.338 ms、最大 7.103 ms；WBC 平均 0.825 ms、p95 1.054 ms、最大 7.077 ms。完整循环最大 521.108 ms，仍含初始化首步；plan 初始化为 517.121 ms。
+
+迟到量在 4 s 时约 0.055 ms，8 s 为 117.866 ms，12 s 为 215.867 ms，15.884 s 达到峰值 320.751 ms；16 s 时仍迟到 313.635 ms，停步后到 18 s 降至 41.620 ms，末步降至 0.0536 ms。末步开始于初始化后约 19.998054 s，说明结束时已基本追上真实时间；运行中仍有约 0.32 s 的累计落后，不能因最终追回或全程平均低于 2 ms 就宣称固定 500 Hz 已满足。
+
+实际进入 trot 的时刻仍为 4.042 s，16.000 s 起持续 mode 15；四脚计划支撑触地比例 100%，摆动中段触地为零，最大电机力矩 15.946 Nm、限幅 0 步，外部高度目标 RMSE 为 3.617 mm。最终机身位置仍为 [0.001150, 0.000278, 0.281583] m，接触切向速度瞬态也与上轮 CSV 相同，不能将本轮耗时改善解释为动作或滑移改善。
+
+数据为本地 `artifacts/ocs2_wbc_trot_async_pair.csv` 和同名 JSON。服务级检查、协议解析检查与本轮闭环共同支持保存这项优化。本阶段完整现有测试集回归仍待收尾执行。下一步先细分控制循环耗时，区分 MRT、WBC、状态/参考运动学和仿真诊断等开销，定位 trot 阶段仍然累计迟到的原因，再决定下一处改动。
 
 ## 本阶段离线检查
 

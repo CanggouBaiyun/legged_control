@@ -1,0 +1,27 @@
+# 使用同一条指定策略进行两次求值
+uint64 reset_epoch
+uint64 policy_sequence
+
+# 当前查询时刻与未来查询时刻，单位为秒
+float64 time
+float64 future_time
+
+# 两次求值均使用当前实测状态
+float64[24] current_state
+---
+# 仅当两次求值都成功时，success 才为 true
+bool success
+string error
+
+uint64 reset_epoch
+uint64 policy_sequence
+
+# 当前时刻的参考
+float64[24] state_reference
+float64[24] input_reference
+uint64 mode
+
+# 未来时刻的参考
+float64[24] future_state_reference
+float64[24] future_input_reference
+uint64 future_mode

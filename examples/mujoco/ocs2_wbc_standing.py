@@ -446,6 +446,46 @@ def evaluate_policy(process, stamp, current_state):
 
     return state, control, mode
 
+def evaluate_policy_pair(
+    process, stamp, future_stamp, current_state, expected_policy=None
+):
+    """Obtain current and future references in one transport round trip."""
+    reply = request_transport(
+        process,
+        {
+            "action": "evaluate_pair",
+            "time": float(stamp),
+            "future_time": float(future_stamp),
+            "state": current_state.tolist(),
+        },
+    )
+
+    if expected_policy is not None and (
+        reply["reset_epoch"] != expected_policy["reset_epoch"]
+        or reply["policy_sequence"] != expected_policy["policy_sequence"]
+    ):
+        raise RuntimeError("MRT pair differs from the selected policy")
+
+    state = np.asarray(reply["state"], dtype=float)
+    control = np.asarray(reply["input"], dtype=float)
+    future_state = np.asarray(reply["future_state"], dtype=float)
+    future_control = np.asarray(reply["future_input"], dtype=float)
+    mode = reply["mode"]
+    future_mode = reply["future_mode"]
+
+    if (
+        mode not in OCS2_MODE_CONTACTS
+        or future_mode not in OCS2_MODE_CONTACTS
+        or any(
+            values.shape != (24,) or not np.isfinite(values).all()
+            for values in (state, control, future_state, future_control)
+        )
+    ):
+        raise RuntimeError("Invalid pair references returned by MRT")
+
+    return state, control, mode, future_state, future_control, future_mode
+
+
 def standing_height_goal(time):
     """Smooth height goal: hold, lower, hold, rise, hold."""
 
@@ -758,7 +798,7 @@ def main():
         "plan": [],
         "observe": [],
         "poll": [],
-        "mrt": [],
+        "mrt_pair": [],
         "wbc": [],
         "loop": [],
     }
@@ -977,12 +1017,29 @@ def main():
                 v,
             )
 
-            state_ref, input_ref, mode = timed_call(
-                timings["mrt"],
-                evaluate_policy,
+            # 一次通信取得同一条策略上的当前和未来参考。
+            acceleration_interval = 0.005
+            future_time = mj_data.time + acceleration_interval
+            if future_time > times[-1]:
+                raise RuntimeError(
+                    "Policy does not cover acceleration estimation"
+                )
+
+            (
+                state_ref,
+                input_ref,
+                mode,
+                future_state_ref,
+                future_input_ref,
+                future_mode,
+            ) = timed_call(
+                timings["mrt_pair"],
+                evaluate_policy_pair,
                 process,
                 mj_data.time,
+                future_time,
                 current_mpc_state,
+                policy_info,
             )
 
             scheduled_mode = mode_at_time(
@@ -1029,23 +1086,7 @@ def main():
                 mode=mode,
             )
 
-            # 同一条策略上，用参考基座世界系速度的变化估计加速度
-            acceleration_interval = 0.005
-            future_time = mj_data.time + acceleration_interval
-
-            if future_time > times[-1]:
-                raise RuntimeError(
-                    "Policy does not cover acceleration estimation"
-                )
-
-            future_state_ref, future_input_ref, future_mode = timed_call(
-                timings["mrt"],
-                evaluate_policy,
-                process,
-                future_time,
-                current_mpc_state,
-            )
-
+            # 未来参考已随当前参考返回，仍单独检查未来接触模式。
             scheduled_future_mode = mode_at_time(
                 mode_event_times, mode_sequence, future_time
             )
@@ -1389,7 +1430,7 @@ def main():
         print("Clipped steps:", clipped_steps)
 
         # Inclusive wall-clock measurements; loop already contains all sections.
-        # MRT entries are individual round trips (two per control step).
+        # Each MRT pair entry is one round trip with two policy evaluations.
         print("\nTiming summary [ms]:")
         print(
             f"{'section':<10} {'calls':>8} "
@@ -1545,6 +1586,7 @@ def main():
             "joint_pd_scale": args.joint_pd_scale,
             "swing_reference": args.swing_reference,
             "async_mpc": args.async_mpc,
+            "mrt_query_mode": "pair",
             "policy_updates": policy_updates,
             "maximum_policy_age_s": (
                 float(np.max(records[:, column["policy_age_s"]]))
