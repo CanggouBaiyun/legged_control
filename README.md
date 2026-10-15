@@ -252,6 +252,8 @@ After reviewing upstream and local implementations, migration will proceed throu
 
 The shared C++ model/dynamics implementation is integrated into the workspace and passed three Python/C++ comparisons including tilted poses and nonzero velocities: maximum absolute M/h/J/Jdot·v errors were approximately 5.27e-17/8.88e-16/5.55e-17/7.81e-18; motor limits and armature matched. See the [C++ model baseline](docs/cpp_model_baseline.md).
 
+A candidate native C++ WBC passed seven Python comparisons covering four-foot and both diagonal contact sets, nonzero motion and normal-force limits, with maximum torque difference about 6.56e-12 N·m. Patch application and workspace integration are pending; the candidate has not yet run in the MuJoCo/MRT loop. Details and the verification script are documented in the same baseline report.
+
 Nested timing passed a bridge build, 12 transport tests, isolated service checks and the full closed-loop run above. There were no cache retries or torque clips; final x was 0.090636 m against a 0.09 m target. These timing intervals are nested and must not be added together. The service response type changed; use a rebuilt and restarted MRT node as documented above.
 
 Hardware context (2026-10-15, user reported): a modified Go2 Air with existing SDK2 low-level state-reading and joint-command capability. This project has not yet integrated or independently verified that interface. Sensor availability, joint mapping, control modes, communication-failure behavior and control ownership switching require validation; the deployment compute platform remains to be confirmed.
