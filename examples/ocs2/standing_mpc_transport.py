@@ -188,6 +188,7 @@ def query_mrt_pair(
     node, client, policy, stamp, future_stamp, current_state
 ):
     """Query two times on the same explicitly selected policy."""
+    query_start = time.perf_counter()
     if (
         not math.isfinite(stamp)
         or not math.isfinite(future_stamp)
@@ -207,8 +208,10 @@ def query_mrt_pair(
     ):
         raise RuntimeError("MRT pair query outside policy")
 
+    ready_start = time.perf_counter()
     if not client.wait_for_service(timeout_sec=3.0):
         raise RuntimeError("MRT pair service is unavailable")
+    ros_ready_ms = (time.perf_counter() - ready_start) * 1000.0
 
     query = EvaluatePolicyPair.Request()
     query.reset_epoch = policy.reset_epoch
@@ -219,8 +222,13 @@ def query_mrt_pair(
     query.current_state = current_state
 
     deadline = time.monotonic() + 3.0
+    ros_roundtrip_ms = 0.0
+    cache_retry_wait_ms = 0.0
+    ros_attempts = 0
 
     while time.monotonic() < deadline:
+        ros_start = time.perf_counter()
+        ros_attempts += 1
         future = client.call_async(query)
         rclpy.spin_until_future_complete(
             node,
@@ -235,12 +243,16 @@ def query_mrt_pair(
             raise RuntimeError("MRT pair service response timed out")
 
         response = future.result()
+        success_roundtrip_ms = (time.perf_counter() - ros_start) * 1000.0
+        ros_roundtrip_ms += success_roundtrip_ms
         if response is None:
             raise RuntimeError("MRT pair returned no response")
 
         if not response.success:
             if response.error == "Requested policy is not cached":
+                retry_start = time.perf_counter()
                 rclpy.spin_once(node, timeout_sec=0.01)
+                cache_retry_wait_ms += (time.perf_counter() - retry_start) * 1000.0
                 continue
             raise RuntimeError(response.error)
 
@@ -275,7 +287,36 @@ def query_mrt_pair(
         ):
             raise RuntimeError("Invalid MRT pair references")
 
-        return {
+        try:
+            cpp_timing = {
+                "cpp_policy_activated": response.policy_activated,
+                "cpp_activation_ms": float(response.activation_time_ms),
+                "cpp_current_eval_ms": float(response.current_evaluation_time_ms),
+                "cpp_future_eval_ms": float(response.future_evaluation_time_ms),
+                "cpp_callback_ms": float(response.callback_time_ms),
+            }
+        except AttributeError as error:
+            raise RuntimeError(
+                "MRT timing fields unavailable: rebuild go2_mpc_bridge "
+                "and restart the MRT server"
+            ) from error
+
+        cpp_durations = [
+            value for key, value in cpp_timing.items()
+            if key != "cpp_policy_activated"
+        ]
+        if (
+            not isinstance(cpp_timing["cpp_policy_activated"], bool)
+            or not all(math.isfinite(value) and value >= 0.0 for value in cpp_durations)
+            or sum(cpp_durations[:3]) > cpp_timing["cpp_callback_ms"] + 1e-6
+            or (
+                not cpp_timing["cpp_policy_activated"]
+                and cpp_timing["cpp_activation_ms"] > 1e-6
+            )
+        ):
+            raise RuntimeError("Invalid C++ MRT timing response")
+
+        output = {
             "reset_epoch": response.reset_epoch,
             "policy_sequence": response.policy_sequence,
             "state": state,
@@ -284,7 +325,19 @@ def query_mrt_pair(
             "future_state": future_state,
             "future_input": future_control,
             "future_mode": response.future_mode,
+            "query_timing": {
+                "ros_ready_ms": ros_ready_ms,
+                "ros_roundtrip_ms": ros_roundtrip_ms,
+                "ros_success_roundtrip_ms": success_roundtrip_ms,
+                "cache_retry_wait_ms": cache_retry_wait_ms,
+                "ros_attempts": ros_attempts,
+                **cpp_timing,
+            },
         }
+        output["query_timing"]["transport_query_ms"] = (
+            time.perf_counter() - query_start
+        ) * 1000.0
+        return output
 
     raise RuntimeError(
         "Selected policy was not available in MRT cache"

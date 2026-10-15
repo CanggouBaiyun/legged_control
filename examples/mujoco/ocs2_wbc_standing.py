@@ -26,6 +26,23 @@ CONTROL_TIMING_PHASES = (
     "viewer",
 )
 
+MRT_TIMING_COLUMNS = (
+    "mrt_pipe_roundtrip_ms",
+    "mrt_transport_query_ms",
+    "mrt_ros_ready_ms",
+    "mrt_ros_roundtrip_ms",
+    "mrt_ros_success_roundtrip_ms",
+    "mrt_cache_retry_wait_ms",
+    "mrt_ros_attempts",
+    "mrt_cpp_policy_activated",
+    "mrt_cpp_activation_ms",
+    "mrt_cpp_current_eval_ms",
+    "mrt_cpp_future_eval_ms",
+    "mrt_cpp_callback_ms",
+    "mrt_pipe_residual_ms",
+    "mrt_ros_residual_ms",
+)
+
 CONTROL_TIMING_COLUMNS = (
     "step",
     "time_s",
@@ -37,7 +54,7 @@ CONTROL_TIMING_COLUMNS = (
     "policy_updated",
     "policy_age_ms",
     "control_start_lateness_ms",
-) + tuple(f"{name}_ms" for name in CONTROL_TIMING_PHASES) + (
+) + tuple(f"{name}_ms" for name in CONTROL_TIMING_PHASES) + MRT_TIMING_COLUMNS + (
     "loop_ms",
     "timing_record_ms",
 )
@@ -218,6 +235,29 @@ def summarize_control_timings(records, timestep, evaluation_start_s):
             for index, name in enumerate(phase_names)
         }
 
+    mrt_columns = [name for name in MRT_TIMING_COLUMNS if name.endswith("_ms")]
+    activated = records[active, column["mrt_cpp_policy_activated"]] == 1
+    attempts = records[active, column["mrt_ros_attempts"]]
+    mrt_summary = {
+        "samples": int(np.count_nonzero(active)),
+        "policy_activations": int(np.count_nonzero(activated)),
+        "retry_steps": int(np.count_nonzero(attempts > 1)),
+        "service_attempts": int(np.sum(attempts)),
+        "metric_ms": {
+            name: statistics(records[active, column[name]]) for name in mrt_columns
+        },
+        "activation_ms_when_activated": (
+            statistics(records[active, column["mrt_cpp_activation_ms"]][activated])
+            if np.any(activated) else None
+        ),
+        "overrun_mean_ms": (
+            {
+                name: float(np.mean(records[active, column[name]][overruns]))
+                for name in mrt_columns
+            } if np.any(overruns) else None
+        ),
+    }
+
     return {
         "evaluation_start_s": float(evaluation_start_s),
         "samples": int(np.count_nonzero(active)),
@@ -230,6 +270,7 @@ def summarize_control_timings(records, timestep, evaluation_start_s):
         "overrun_phase_mean_ms": overrun_means,
         "overrun_largest_phase_counts": largest_counts,
         "maximum_accounting_error_ms": float(np.max(accounting_error)),
+        "mrt_query": mrt_summary,
     }
 
 
@@ -542,19 +583,68 @@ def evaluate_policy(process, stamp, current_state):
 
     return state, control, mode
 
+def parse_mrt_query_timing(reply, pipe_roundtrip_ms):
+    """Validate nested elapsed durations; residuals are not pure network time."""
+    timing = reply.get("query_timing")
+    if not isinstance(timing, dict):
+        raise RuntimeError("Missing MRT timings: rebuild bridge and restart MRT")
+    duration_names = (
+        "transport_query_ms", "ros_ready_ms", "ros_roundtrip_ms",
+        "ros_success_roundtrip_ms", "cache_retry_wait_ms",
+        "cpp_activation_ms", "cpp_current_eval_ms", "cpp_future_eval_ms",
+        "cpp_callback_ms",
+    )
+    try:
+        values = {name: float(timing[name]) for name in duration_names}
+        attempts = timing["ros_attempts"]
+        activated = timing["cpp_policy_activated"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("Invalid MRT timing fields") from error
+    if (
+        not np.isfinite(pipe_roundtrip_ms) or pipe_roundtrip_ms < 0.0
+        or not all(np.isfinite(value) and value >= 0.0 for value in values.values())
+        or type(attempts) is not int or attempts < 1
+        or type(activated) is not bool
+        or values["ros_success_roundtrip_ms"] > values["ros_roundtrip_ms"] + 1e-6
+        or (
+            values["ros_ready_ms"] + values["ros_roundtrip_ms"]
+            + values["cache_retry_wait_ms"]
+            > values["transport_query_ms"] + 1e-6
+        )
+        or (
+            values["cpp_activation_ms"] + values["cpp_current_eval_ms"]
+            + values["cpp_future_eval_ms"] > values["cpp_callback_ms"] + 1e-6
+        )
+        or (not activated and values["cpp_activation_ms"] > 1e-6)
+    ):
+        raise RuntimeError("Invalid nested MRT timing durations")
+
+    return {
+        "mrt_pipe_roundtrip_ms": pipe_roundtrip_ms,
+        **{f"mrt_{name}": value for name, value in values.items()},
+        "mrt_ros_attempts": attempts,
+        "mrt_cpp_policy_activated": int(activated),
+        "mrt_pipe_residual_ms": pipe_roundtrip_ms - values["transport_query_ms"],
+        "mrt_ros_residual_ms": (
+            values["ros_success_roundtrip_ms"] - values["cpp_callback_ms"]
+        ),
+    }
+
+
 def evaluate_policy_pair(
-    process, stamp, future_stamp, current_state, expected_policy=None
+    process, stamp, future_stamp, current_state, expected_policy=None,
+    timing_details=None,
 ):
     """Obtain current and future references in one transport round trip."""
-    reply = request_transport(
-        process,
-        {
-            "action": "evaluate_pair",
-            "time": float(stamp),
-            "future_time": float(future_stamp),
-            "state": current_state.tolist(),
-        },
-    )
+    message = {
+        "action": "evaluate_pair",
+        "time": float(stamp),
+        "future_time": float(future_stamp),
+        "state": current_state.tolist(),
+    }
+    pipe_start = time.perf_counter()
+    reply = request_transport(process, message)
+    pipe_roundtrip_ms = (time.perf_counter() - pipe_start) * 1000.0
 
     if expected_policy is not None and (
         reply["reset_epoch"] != expected_policy["reset_epoch"]
@@ -578,6 +668,9 @@ def evaluate_policy_pair(
         )
     ):
         raise RuntimeError("Invalid pair references returned by MRT")
+
+    if timing_details is not None:
+        timing_details.update(parse_mrt_query_timing(reply, pipe_roundtrip_ms))
 
     return state, control, mode, future_state, future_control, future_mode
 
@@ -1131,6 +1224,7 @@ def main():
                     "Policy does not cover acceleration estimation"
                 )
 
+            mrt_timing_details = {}
             phase_marks.append(time.perf_counter())  # policy
             (
                 state_ref,
@@ -1147,6 +1241,7 @@ def main():
                 future_time,
                 current_mpc_state,
                 policy_info,
+                timing_details=mrt_timing_details,
             )
 
             phase_marks.append(time.perf_counter())  # mrt_pair
@@ -1557,6 +1652,7 @@ def main():
                 policy_age_s * 1000.0,
                 control_start_lateness * 1000.0,
                 *phase_ms,
+                *(mrt_timing_details[name] for name in MRT_TIMING_COLUMNS),
                 0.0,
                 0.0,
             ]

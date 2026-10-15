@@ -107,7 +107,7 @@ class TestMrtTransport(unittest.TestCase):
         for field, wrong_value in [
             ("reset_epoch", 4),
             ("policy_sequence", 26),
-            ("mode", 6),
+            ("mode", 0),
         ]:
             with self.subTest(field=field):
                 original = getattr(self.response, field)
@@ -182,6 +182,74 @@ class TestMrtTransport(unittest.TestCase):
             self.assertEqual(sent.policy_sequence, 25)
 
         self.assertEqual(result["policy_sequence"], 25)
+
+
+    def prepare_pair_response(self):
+        self.response.future_mode = 6
+        self.response.future_state_reference = [0.3] * 24
+        self.response.future_input_reference = [0.4] * 24
+        self.response.policy_activated = True
+        self.response.activation_time_ms = 0.001
+        self.response.current_evaluation_time_ms = 0.002
+        self.response.future_evaluation_time_ms = 0.003
+        self.response.callback_time_ms = 0.02
+
+    def query_pair(self):
+        return transport.query_mrt_pair(
+            None, self.client, self.policy, 0.5, 0.505, self.current_state
+        )
+
+    def test_pair_query_preserves_references_and_reports_timings(self):
+        self.prepare_pair_response()
+        result = self.query_pair()
+        self.assertEqual(result["state"], [0.1] * 24)
+        self.assertEqual(result["future_state"], [0.3] * 24)
+        self.assertEqual(result["future_input"], [0.4] * 24)
+        self.assertEqual(result["future_mode"], 6)
+        timing = result["query_timing"]
+        self.assertEqual(timing["ros_attempts"], 1)
+        self.assertTrue(timing["cpp_policy_activated"])
+        self.assertEqual(timing["cpp_current_eval_ms"], 0.002)
+        self.assertGreaterEqual(timing["transport_query_ms"], timing["ros_roundtrip_ms"])
+        self.client.call_async.assert_called_once()
+
+    def test_pair_cache_retry_keeps_identity_and_reports_attempts(self):
+        self.prepare_pair_response()
+        self.future.result.side_effect = [
+            SimpleNamespace(success=False, error="Requested policy is not cached"),
+            self.response,
+        ]
+        result = self.query_pair()
+        timing = result["query_timing"]
+        self.assertEqual(timing["ros_attempts"], 2)
+        self.assertGreaterEqual(timing["ros_roundtrip_ms"], timing["ros_success_roundtrip_ms"])
+        for call in self.client.call_async.call_args_list:
+            request = call.args[0]
+            self.assertEqual((request.reset_epoch, request.policy_sequence), (3, 25))
+        self.assertEqual(self.client.call_async.call_count, 2)
+
+    def test_pair_rejects_invalid_cpp_timing(self):
+        for field, value in (
+            ("current_evaluation_time_ms", float("nan")),
+            ("future_evaluation_time_ms", -1.0),
+            ("callback_time_ms", 0.0),
+            ("policy_activated", False),
+        ):
+            with self.subTest(field=field):
+                self.prepare_pair_response()
+                setattr(self.response, field, value)
+                with self.assertRaisesRegex(RuntimeError, r"Invalid C\+\+ MRT timing"):
+                    self.query_pair()
+
+    def test_pair_rejects_wrong_policy_and_invalid_future_reference(self):
+        self.prepare_pair_response()
+        self.response.policy_sequence = 26
+        with self.assertRaisesRegex(RuntimeError, "policy ID or mode mismatch"):
+            self.query_pair()
+        self.response.policy_sequence = 25
+        self.response.future_state_reference[0] = float("nan")
+        with self.assertRaisesRegex(RuntimeError, "Invalid MRT pair references"):
+            self.query_pair()
 
 
 if __name__ == "__main__":

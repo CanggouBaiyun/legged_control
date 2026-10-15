@@ -25,3 +25,10 @@ uint64 mode
 float64[24] future_state_reference
 float64[24] future_input_reference
 uint64 future_mode
+
+# 服务回调内部墙钟耗时，单位 ms；不包含 DDS 排队或响应序列化
+bool policy_activated
+float64 activation_time_ms
+float64 current_evaluation_time_ms
+float64 future_evaluation_time_ms
+float64 callback_time_ms
