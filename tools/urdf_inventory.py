@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = PROJECT_ROOT / "configs" / "go2_model.json"
+CONFIG_PATH = PROJECT_ROOT / "config" / "go2_model.json"
 
 
 def default_urdf_path() -> Path:

@@ -184,7 +184,7 @@ $$
 
 ## 运行
 
-示例依赖已安装的项目环境，以及 [configs/go2_model.json](configs/go2_model.json) 指定位置下的模型仓库。现有环境安装记录见 [安装说明](docs/setup_guide.md)。
+示例依赖已安装的项目环境，以及 [config/go2_model.json](config/go2_model.json) 指定位置下的模型仓库。现有环境安装记录见 [安装说明](docs/setup_guide.md)。
 
 已记录的数值计算环境：
 
@@ -240,7 +240,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_single_leg_cycle.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-最近一次完整回归由用户运行并反馈（2026-10-15，接入异步 MPC 及 OSQP 工作区复用后）：**38 passed，6 warnings，11.27 s**，包含 MPC/WBC 足端顺序、MRT 通信边界、五次轨迹、OCS2 摆腿竖直轨迹边界条件及 20 s 无窗口单腿循环检查。真实 ROS 2 MPC/MRT 链路由独立运行提供集成验证；异步原地 trot 停步及前进停步均已完成 20 s；同版本同步对照中，移动阶段 x RMSE 为同步 9.793 mm、20 ms poll 异步 13.770 mm；随后 4 ms poll 的独立 20 s 验证将异步 RMSE 降至 12.218 mm。该节拍修改之后尚未重跑完整 pytest，异步左右转停步另已各完成 20 s（最终 +9.829° / −9.794°），触地瞬态及稳定 500 Hz 仍待解决。MPC 摆腿参考此前已完成同步左转、右转和前进停步各 20 s 验证。同步 OCS2 实验不会主动等待以匹配真实时间；可选 `--async-mpc` 即使无窗口运行也使用真实时间节拍。hppfcl/coal 和 OSQP 的依赖弃用提示与测试失败是两回事。
+最近一次完整回归在项目清理和配置路径统一后重新运行（2026-10-15）：**38 passed，6 warnings，11.06 s**，包含 MPC/WBC 足端顺序、MRT 通信边界、五次轨迹、OCS2 摆腿竖直轨迹边界条件及 20 s 无窗口单腿循环检查。真实 ROS 2 MPC/MRT 链路由独立运行提供集成验证；异步原地 trot 停步及前进停步均已完成 20 s；同版本同步对照中，移动阶段 x RMSE 为同步 9.793 mm、20 ms poll 异步 13.770 mm；随后 4 ms poll 的独立 20 s 验证将异步 RMSE 降至 12.218 mm。异步左右转停步另已各完成 20 s（最终 +9.829° / −9.794°），触地瞬态及稳定 500 Hz 仍待解决。MPC 摆腿参考此前已完成同步左转、右转和前进停步各 20 s 验证。同步 OCS2 实验不会主动等待以匹配真实时间；可选 `--async-mpc` 即使无窗口运行也使用真实时间节拍。hppfcl/coal 和 OSQP 的依赖弃用提示与测试失败是两回事。
 
 循环 CSV 保存 FR 期望/实际坐标系高度和实际法向接触力。汇总中的高度误差指身体高度；`maximum_xy_drift_mm` 是相对世界原点的水平位移，包含主动移重，不是目标跟踪误差。
 
@@ -248,7 +248,9 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 
 逐步分段及 MRT 内部计时均已完成 20 s 前进停步验证。最新运行排除前 2 s 后，循环平均/p99 为 1.762/2.971 ms，2008/9000 步超过 2 ms。C++ 两次求值平均合计约 4.52 μs，新策略激活步骤的激活耗时平均 0.539 ms；ROS 往返扣除 C++ 回调后的剩余耗时最大 7.056 ms，其中还包含排队、序列化及调度，不能直接当成纯网络延迟。见[控制循环耗时分析](docs/ocs2_control_timing.md)。
 
-对照上游及本地实现后，下一阶段按“模型/坐标及编译对照 → C++ WBC 离线对照 → 本地 MRT 与控制入口 → C++ MuJoCo 闭环”推进；首阶段保留当前独立进程的 DDP/SLQ MPC 和已验证的 WBC 数学问题。具体差异、验收及预计用时见[C++ 控制循环迁移计划](docs/cpp_control_plan.md)。
+对照上游及本地实现后，下一阶段按“模型/坐标及编译对照 → C++ WBC 离线对照 → 本地 MRT 与控制入口 → C++ MuJoCo 闭环”推进；首阶段保留当前独立进程的 DDP/SLQ MPC 和已验证的 WBC 数学问题。具体差异、验收及预计用时见[C++ 控制循环迁移计划](docs/roadmap.md)。
+
+C++ 公共模型/动力学已接入工作空间并完成三组含倾斜和非零速度的 Python/C++ 对照，M/h/J/Jdot·v 最大绝对误差分别约 5.27e-17/8.88e-16/5.55e-17/7.81e-18，电机限制及 armature 一致。操作与范围见[C++ 模型基线](docs/cpp_model_baseline.md)。
 
 内部计时已通过 bridge 构建、12 项通信测试、隔离服务检查及上述完整闭环；本轮没有缓存重试，无力矩限幅，最终 x 为 0.090636 m（目标 0.09 m）。计时子项相互嵌套，不能重复相加。服务响应类型已扩展，需使用重新构建并重启的 MRT 节点，操作见同一文档。
 
@@ -266,12 +268,16 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ## 目录
 
 ```text
-configs/                       模型路径与名义姿态
+config/                        模型配置 JSON、OCS2 task/reference/gait
 docs/                          安装、推导与实验记录
 examples/pinocchio/             运动学和动力学示例
 examples/optimization/          接触力优化
 examples/wbc/                   离线站立与三足 WBC
 examples/mujoco/                映射、站立、蹲起与单腿抬落脚仿真
+examples/ocs2/                  MPC 通信与策略诊断
+ros2/go2_control_cpp/           C++ 模型和动力学，后续控制核心
+ros2/go2_mpc_bridge/            C++ MRT 策略查询服务
+launch/                        OCS2 dummy/RViz 启动入口
 src/go2_control/wbc/            动力学、运动学、参考与 WBC
 src/go2_control/simulation/     MuJoCo–Pinocchio 映射
 src/go2_control/optimization/   QP 求解器封装
@@ -281,6 +287,8 @@ tools/                         检查工具
 third_party/                   Unitree 模型仓库
 artifacts/                     生成的日志和报告
 ```
+
+开发路线统一见 [docs/roadmap.md](docs/roadmap.md)。编辑器可打开 [go2_control.code-workspace](go2_control.code-workspace)，C++ 依赖由各包构建生成的编译数据库提供。学习示例保留完整版本：IK 使用 `foot_position_ik_joint_limits.py`，接触力 QP 使用 `contact_force_qp_friction.py`；控制入口和测试使用 `src/go2_control` 公共模块。
 
 ## 阶段标签
 

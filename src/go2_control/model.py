@@ -11,7 +11,7 @@ import pinocchio as pin
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "go2_model.json"
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "go2_model.json"
 
 # Official SDK order: front-right, front-left, rear-right, rear-left.
 GO2_SDK_JOINT_ORDER = (

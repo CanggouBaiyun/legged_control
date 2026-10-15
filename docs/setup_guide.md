@@ -219,3 +219,36 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 /home/bot/miniconda3/envs/go2_control/bin/python \
 -m pytest -q
 ```
+
+## 8. C++ 控制包与编辑器
+
+模型配置统一为 `config/go2_model.json`，OCS2 参数仍在 `config/ocs2/`。`go2_control_cpp` 源码由主仓库管理；首次设置时加入符号链接：
+
+```bash
+ln -s /home/bot/Project/go2_traditional_locomotion/ros2/go2_control_cpp \
+  /home/bot/Project/ocs2_ws/src/go2_control_cpp
+```
+
+链接已存在时直接构建。两个项目包默认生成各自的编译数据库：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+cd /home/bot/Project/ocs2_ws
+env PATH=/usr/bin:/bin:/usr/sbin:/sbin CMAKE_BUILD_PARALLEL_LEVEL=1 \
+  /usr/bin/python3 -m colcon build \
+  --packages-select go2_control_cpp go2_mpc_bridge --executor sequential \
+  --cmake-args -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DPython3_EXECUTABLE=/usr/bin/python3
+```
+
+VS Code 使用根目录 `go2_control.code-workspace` 打开项目。它指向：
+
+```text
+../ocs2_ws/build/go2_control_cpp/compile_commands.json
+../ocs2_ws/build/go2_mpc_bridge/compile_commands.json
+```
+
+这能让 C/C++ 扩展读取实际编译时的 Pinocchio、Eigen、ROS 和生成服务头文件路径。不要再指向已经删除的 `/tmp/go2_mpc_bridge_build`。若程序构建成功而编辑器仍保留旧红线，可执行 `C/C++: Reset IntelliSense Database`，再执行 `Developer: Reload Window`。
+
+工程构建由上述 colcon 命令完成；工作空间关闭了打开时自动运行 CMake 配置，避免继承其他项目的 CMake 源目录。模型与动力学验证命令见[C++ 模型基线](cpp_model_baseline.md)。

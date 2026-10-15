@@ -184,7 +184,7 @@ The stance constraint is acceleration-level; it does not itself correct accumula
 
 ## Run
 
-Examples assume an installed project environment and model repositories at the paths in [configs/go2_model.json](configs/go2_model.json). See [setup notes](docs/setup_guide.md) for the existing environment setup.
+Examples assume an installed project environment and model repositories at the paths in [config/go2_model.json](config/go2_model.json). See [setup notes](docs/setup_guide.md) for the existing environment setup.
 
 Recorded numerical environment:
 
@@ -240,7 +240,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_single_leg_cycle.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-Latest user-reported full regression result (2026-10-15, after asynchronous MPC integration and OSQP workspace reuse): **38 passed, 6 warnings in 11.27 s**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic and OCS2 vertical swing trajectory checks, and a headless 20 s single-leg cycle. Live ROS 2 MPC/MRT integration is verified through separate runs; asynchronous in-place trot/stop and forward/stop runs completed 20 s each. A comparison using the current synchronous code found greater moving-phase lag with 20 ms asynchronous polling (x RMSE 13.770 versus 9.793 mm); a subsequent 20 s run with 4 ms polling reduced asynchronous RMSE to 12.218 mm. That polling change has separate integration validation and has not yet had a full pytest rerun; asynchronous left/right turn and stop runs additionally completed 20 s each (final yaw +9.829° / −9.794°). Touchdown transients and fixed 500 Hz execution remain unresolved. The MPC swing-reference path previously completed separate synchronous 20 s left-turn, right-turn and forward/stop runs. The synchronous OCS2 experiment does not intentionally sleep to match wall time; optional `--async-mpc` execution uses wall-clock pacing even in headless mode. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
+Latest full regression after repository cleanup and configuration-path consolidation (2026-10-15): **38 passed, 6 warnings in 11.06 s**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic and OCS2 vertical swing trajectory checks, and a headless 20 s single-leg cycle. Live ROS 2 MPC/MRT integration is verified through separate runs; asynchronous in-place trot/stop and forward/stop runs completed 20 s each. A comparison using the current synchronous code found greater moving-phase lag with 20 ms asynchronous polling (x RMSE 13.770 versus 9.793 mm); a subsequent 20 s run with 4 ms polling reduced asynchronous RMSE to 12.218 mm. Asynchronous left/right turn and stop runs additionally completed 20 s each (final yaw +9.829° / −9.794°). Touchdown transients and fixed 500 Hz execution remain unresolved. The MPC swing-reference path previously completed separate synchronous 20 s left-turn, right-turn and forward/stop runs. The synchronous OCS2 experiment does not intentionally sleep to match wall time; optional `--async-mpc` execution uses wall-clock pacing even in headless mode. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
 
 Cycle CSV logs include FR desired/actual frame height and actual normal contact force. Summary height errors refer to the base; `maximum_xy_drift_mm` measures displacement from the world origin, including the intentional base shift, not target-tracking error.
 
@@ -248,7 +248,9 @@ Cycle CSV logs include FR desired/actual frame height and actual normal contact 
 
 Per-step phase timing and nested MRT timing have both completed 20 s forward/stop runs. In the latest run, excluding the first 2 s, mean/p99 loop duration was 1.762/2.971 ms and 2008/9000 steps exceeded 2 ms. The two C++ evaluations averaged 4.52 μs combined; activation averaged 0.539 ms on steps activating a new policy. The ROS round trip minus the C++ callback peaked at 7.056 ms; this residual includes queuing, serialization and scheduling and does not measure pure network latency. See [control-loop timing analysis](docs/ocs2_control_timing.md).
 
-After reviewing upstream and local implementations, migration will proceed through model/coordinate and build checks, offline C++ WBC comparison, local MRT/controller integration, and a C++ MuJoCo loop. Initially retain the external DDP/SLQ MPC process and the validated WBC formulation. See the [C++ control migration plan](docs/cpp_control_plan.md) for differences, acceptance criteria and estimates.
+After reviewing upstream and local implementations, migration will proceed through model/coordinate and build checks, offline C++ WBC comparison, local MRT/controller integration, and a C++ MuJoCo loop. Initially retain the external DDP/SLQ MPC process and the validated WBC formulation. See the [C++ control migration plan](docs/roadmap.md) for differences, acceptance criteria and estimates.
+
+The shared C++ model/dynamics implementation is integrated into the workspace and passed three Python/C++ comparisons including tilted poses and nonzero velocities: maximum absolute M/h/J/Jdot·v errors were approximately 5.27e-17/8.88e-16/5.55e-17/7.81e-18; motor limits and armature matched. See the [C++ model baseline](docs/cpp_model_baseline.md).
 
 Nested timing passed a bridge build, 12 transport tests, isolated service checks and the full closed-loop run above. There were no cache retries or torque clips; final x was 0.090636 m against a 0.09 m target. These timing intervals are nested and must not be added together. The service response type changed; use a rebuilt and restarted MRT node as documented above.
 
@@ -266,12 +268,16 @@ Additional gaits follow a stable basic trot. Neither arbitrary-push recovery nor
 ## Repository Layout
 
 ```text
-configs/                       Model paths and nominal posture
+config/                        Model JSON and OCS2 task/reference/gait files
 docs/                          Setup, derivations and experiment reports
 examples/pinocchio/             Kinematics and dynamics examples
 examples/optimization/          Contact-force optimization
 examples/wbc/                   Offline standing and three-foot WBC
 examples/mujoco/                Mapping, standing, squat and single-leg cycles
+examples/ocs2/                  MPC transport and policy diagnostics
+ros2/go2_control_cpp/           C++ model/dynamics and future control core
+ros2/go2_mpc_bridge/            C++ MRT policy query service
+launch/                        OCS2 dummy/RViz launch entry
 src/go2_control/wbc/            Dynamics, kinematics, references and WBC
 src/go2_control/simulation/     MuJoCo–Pinocchio bridge
 src/go2_control/optimization/   QP solver wrappers
@@ -281,6 +287,8 @@ tools/                         Inspection tools
 third_party/                   Unitree model repositories
 artifacts/                     Generated logs and reports
 ```
+
+The development plan is maintained in [docs/roadmap.md](docs/roadmap.md). Open [go2_control.code-workspace](go2_control.code-workspace) for C++ editing with per-package compilation databases. Learning examples retain the complete variants: `foot_position_ik_joint_limits.py` for IK and `contact_force_qp_friction.py` for contact-force QP; controllers and tests use the shared `src/go2_control` modules.
 
 ## Milestones
 
