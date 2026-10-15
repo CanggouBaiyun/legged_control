@@ -246,7 +246,9 @@ Cycle CSV logs include FR desired/actual frame height and actual normal contact 
 
 ## Roadmap
 
-Per-step phase timing and nested MRT timing have both completed 20 s forward/stop runs. In the latest run, excluding the first 2 s, mean/p99 loop duration was 1.762/2.971 ms and 2008/9000 steps exceeded 2 ms. The two C++ evaluations averaged 4.52 μs combined; activation averaged 0.539 ms on steps activating a new policy. The ROS round trip minus the C++ callback peaked at 7.056 ms; this residual includes queuing, serialization and scheduling and does not measure pure network latency. Next, build a local C++ MRT prototype and compare matching references. See [control-loop timing analysis](docs/ocs2_control_timing.md).
+Per-step phase timing and nested MRT timing have both completed 20 s forward/stop runs. In the latest run, excluding the first 2 s, mean/p99 loop duration was 1.762/2.971 ms and 2008/9000 steps exceeded 2 ms. The two C++ evaluations averaged 4.52 μs combined; activation averaged 0.539 ms on steps activating a new policy. The ROS round trip minus the C++ callback peaked at 7.056 ms; this residual includes queuing, serialization and scheduling and does not measure pure network latency. See [control-loop timing analysis](docs/ocs2_control_timing.md).
+
+After reviewing upstream and local implementations, migration will proceed through model/coordinate and build checks, offline C++ WBC comparison, local MRT/controller integration, and a C++ MuJoCo loop. Initially retain the external DDP/SLQ MPC process and the validated WBC formulation. See the [C++ control migration plan](docs/cpp_control_plan.md) for differences, acceptance criteria and estimates.
 
 Nested timing passed a bridge build, 12 transport tests, isolated service checks and the full closed-loop run above. There were no cache retries or torque clips; final x was 0.090636 m against a 0.09 m target. These timing intervals are nested and must not be added together. The service response type changed; use a rebuilt and restarted MRT node as documented above.
 
