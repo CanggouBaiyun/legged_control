@@ -246,6 +246,8 @@ Cycle CSV logs include FR desired/actual frame height and actual normal contact 
 
 ## Roadmap
 
+Per-step phase timing completed a 20 s forward/stop run. Excluding the first 2 s, mean/p99 loop duration was 1.756/2.900 ms; 1820/9000 steps exceeded 2 ms, with the MRT round trip the largest phase in 1714 of those steps. Next, separate communication waits from C++ evaluation costs within that path. See [control-loop timing analysis](docs/ocs2_control_timing.md).
+
 Hardware context (2026-10-15, user reported): a modified Go2 Air with existing SDK2 low-level state-reading and joint-command capability. This project has not yet integrated or independently verified that interface. Sensor availability, joint mapping, control modes, communication-failure behavior and control ownership switching require validation; the deployment compute platform remains to be confirmed.
 
 1. Build on asynchronous MPC, 4 ms policy polling and OSQP reuse by locating remaining control-step overruns. Separate necessary control computation, communication waits and simulation diagnostics; record p95/p99, peaks and accumulated lateness, and validate longer runs.
