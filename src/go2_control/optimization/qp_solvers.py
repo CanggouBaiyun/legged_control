@@ -38,7 +38,7 @@ def solve_with_osqp(
         ]
     )
 
-    solver = osqp.OSQP()
+    solver = osqp.OSQP(algebra="builtin")
     solver.setup(
         P=sparse.csc_matrix(quadratic_cost),
         q=linear_cost,

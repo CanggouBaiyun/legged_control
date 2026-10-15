@@ -29,6 +29,7 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | MPC-derived swing references | Optional `--swing-reference=mpc`; 20 s left/right turns and forward/stop runs verified: +9.91° / −9.86° for ±10° goals, final x 0.09090 m for a 0.09 m goal, actual forward swing for all feet |
 | Asynchronous MPC updates | 20 s standing and trot/stop runs completed. Compact poll payloads reduced mean poll time from 2.075 to 0.292 ms in the first comparison; maximum start lateness fell from 3.47 to 1.52 s, with 1.30 s still remaining at the final step. Real-time execution remains pending. See [execution and timing notes](docs/ocs2_async_mpc.md) |
 | Paired MRT queries | 20 s trot/stop verified: mean MRT time per step 0.689 → 0.499 ms, mean loop 1.963 ms; maximum start lateness 321 ms, near zero at the final step. Fixed 500 Hz execution remains unverified |
+| Explicit OSQP builtin backend | Subsequent 20 s trot/stop: mean WBC 0.743 ms, mean loop 1.906 ms, maximum start lateness 34 ms; 2117/10000 loops still exceeded 2 ms. Solver creation and setup still occur each step. See [timing comparison](docs/ocs2_async_mpc.md) |
 | Disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 

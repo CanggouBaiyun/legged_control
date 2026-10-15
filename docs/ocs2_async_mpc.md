@@ -2,11 +2,11 @@
 
 ## 当前状态
 
-2026-10-15 在 `feature/ocs2-async-mpc` 接入可选 `--async-mpc` 路径，完成 20 s 异步站立及原地 trot 到停步闭环，均包含机身高度目标变化。随后精简 poll 载荷并合并 MRT 查询，两项优化后再次完成 20 s trot，最大累计迟到降至约 321 ms、结束时基本追上真实时间；仍有执行超时，尚未达到稳定 500 Hz。异步前进和转向待验证。默认仍使用同步更新。
+2026-10-15 在 `feature/ocs2-async-mpc` 接入可选 `--async-mpc` 路径，完成 20 s 异步站立及原地 trot 到停步闭环，均包含机身高度目标变化。随后精简 poll 载荷、合并 MRT 查询并显式指定当前 OSQP builtin 后端；最新 20 s trot 中 WBC 平均耗时 0.743 ms，循环平均 1.906 ms，最大累计启动迟到约 34 ms，结束时基本追上真实时间。仍有 2117/10000 步耗时超过 2 ms，尚未达到稳定 500 Hz。异步前进和转向待验证。默认仍使用同步更新。
 
 上述初始闭环结果对应提交 `d00c8ff` 的优化前基线。随后已接入 poll 精简轨迹传输，并完成离线检查和同条件 20 s 原地 trot 对比：poll 平均由 2.075 ms 降至 0.292 ms，最大累计启动迟到由 3.471 s 降至 1.517 s。末步仍迟到 1.305 s，实时执行尚待继续优化，详细对比见后文。
 
-双时刻 MRT 查询的服务定义、C++ 回调、Python 通信及仿真循环均已接入，完成服务级检查和 20 s 闭环。与精简传输基线相比，每步 MRT 合计平均由 0.689 ms 降至 0.499 ms，循环平均由 2.171 ms 降至 1.963 ms。早期结果使用每步两次单时刻查询，最新结果使用每步一次双时刻请求，计时口径见后文。
+双时刻 MRT 查询的服务定义、C++ 回调、Python 通信及仿真循环均已接入，完成服务级检查和 20 s 闭环。与精简传输基线相比，首次对比中每步 MRT 合计平均由 0.689 ms 降至 0.499 ms，循环平均由 2.171 ms 降至 1.963 ms。早期结果使用每步两次单时刻查询，后续结果使用每步一次双时刻请求，计时口径见后文。
 
 C++ MPC 原本已经运行在独立进程；此前仿真端每隔 20 ms 发布观测后，会等待基于该次观测的新策略，导致 WBC 控制循环暂停。本阶段取消运行期间对该次 MPC 求解完成的等待。
 
@@ -323,6 +323,120 @@ env -u PYTHONPATH ROS_DOMAIN_ID=214 \
 实际进入 trot 的时刻仍为 4.042 s，16.000 s 起持续 mode 15；四脚计划支撑触地比例 100%，摆动中段触地为零，最大电机力矩 15.946 Nm、限幅 0 步，外部高度目标 RMSE 为 3.617 mm。最终机身位置仍为 [0.001150, 0.000278, 0.281583] m，接触切向速度瞬态也与上轮 CSV 相同，不能将本轮耗时改善解释为动作或滑移改善。
 
 数据为本地 `artifacts/ocs2_wbc_trot_async_pair.csv` 和同名 JSON。服务级检查、协议解析检查与本轮闭环共同支持保存这项优化。本阶段完整现有测试集回归仍待收尾执行。下一步先细分控制循环耗时，区分 MRT、WBC、状态/参考运动学和仿真诊断等开销，定位 trot 阶段仍然累计迟到的原因，再决定下一处改动。
+
+## Python 函数耗时采样
+
+双时刻查询优化已提交并推送为 `952e2d8`。当前已有 MRT、WBC 等总体计时，进一步使用标准库 `cProfile` 定位状态转换、参考运动学、摆腿参考、关节 PD 和仿真诊断中的函数热点，先取得数据再决定优化位置。此步骤不修改控制参数或控制循环代码。
+
+保持 MPC 与新版 MRT 运行，终端 3 在项目根目录执行一次带函数计时的完整 20 s 实验：
+
+```bash
+cd /home/bot/Project/go2_traditional_locomotion
+env -u PYTHONPATH ROS_DOMAIN_ID=214 \
+  /home/bot/miniconda3/envs/go2_control/bin/python \
+  -m cProfile -o artifacts/ocs2_wbc_trot_async_pair.prof \
+  examples/mujoco/ocs2_wbc_standing.py \
+  --headless --duration 20 --async-mpc \
+  --allow-trot --trot-at 3 --stop-trot-at 15 \
+  --swing-reference=mpc \
+  --csv artifacts/ocs2_wbc_trot_async_pair_profile.csv
+```
+
+完成后打印两份函数统计：
+
+```bash
+env -u PYTHONPATH \
+  /home/bot/miniconda3/envs/go2_control/bin/python - <<'PY'
+import pstats
+
+stats = pstats.Stats("artifacts/ocs2_wbc_trot_async_pair.prof")
+stats.strip_dirs()
+print("累计耗时（包含子调用）：")
+stats.sort_stats("cumulative").print_stats(30)
+print("函数自身耗时（不包含子调用）：")
+stats.sort_stats("tottime").print_stats(30)
+PY
+```
+
+`ncalls` 为调用次数；`tottime` 为函数自身耗时，`cumtime` 包含其子调用，报告单位为秒。不同函数的累计耗时存在包含关系，不能直接相加；阻塞等待也会计入墙钟耗时，不能都解释为 CPU 计算。该报告仅分析仿真 Python 进程，ROS 通信子进程和 C++ MPC/MRT 内部不会单独展开。
+
+`cProfile` 会增加执行开销，可能改变调度和策略接收时机，因此本轮的循环耗时、迟到量和机身误差不能直接与未采样基线比较来评价优化收益。采样文件和独立命名的 CSV/JSON 均保存在本地 `artifacts/`，保留原有对比基线。后续优化效果应通过不带 cProfile 的相同 20 s 命令确认。
+
+### 2026-10-15 采样结果
+
+采样完成，报告记录约 4073 万次函数调用、总计 30.777 s。总时长包含初始化、控制、采样开销和退出清理，不能解释为未采样控制循环的运行时长。
+
+| 函数/阶段 | 次数 | 累计耗时（采样运行） |
+| --- | ---: | ---: |
+| `StandingWBC.solve` | 10000 | 13.024 s |
+| `solve_with_osqp` | 10000 | 9.020 s |
+| `osqp.OSQP.__init__` | 10000 | 2.146 s |
+| `OSQP.setup` | 10000 | 3.658 s |
+| `OSQP.solve` | 10000 | 1.162 s |
+| `request_transport` | 12000 | 6.150 s |
+| `select.select`（等待通信回复） | 12000 | 5.151 s |
+| `floor_contact_tangent_speeds` | 10000 | 2.021 s |
+| `pinocchio_from_state` | 40258 | 1.660 s |
+
+表中有父子调用关系，不能将所有时间相加。`solve_with_osqp` 每步都创建 OSQP 对象、构造稀疏矩阵并执行 setup；初始化和 setup 的累计耗时均超过实际求解。调用关系检查还确认，约 3 s 的 `time.sleep` 全部来自 `subprocess._wait` 的退出清理，不是控制循环中主动等待 3 s；应与实时控制优化分开看待。
+
+当前安装 OSQP 1.1.3，已检查其实际 Python 源码和可用后端：仅 `builtin` 可用，默认也是 `builtin`。但 `OSQP()` 每次都会调用 `default_algebra()`，逐一尝试导入候选后端；采样中大量可选后端导入探测属于初始化开销。
+
+对构造函数做一次不含求解的定向比较，各运行 1000 次、重复 3 轮，单次耗时的轮次中位数为：自动选择约 52.9 μs，显式 `algebra="builtin"` 约 6.0 μs。它仅测构造开销，不代表整个 WBC 或闭环能取得相同比例收益。
+
+### 显式选择现有 OSQP 后端及闭环结果
+
+在 `src/go2_control/optimization/qp_solvers.py` 的 `solve_with_osqp` 中，将：
+
+```python
+solver = osqp.OSQP()
+```
+
+改为：
+
+```python
+solver = osqp.OSQP(algebra="builtin")
+```
+
+该修改已完成，仍保留每步新建对象和 setup，先消除后端自动探测的开销。使用当前本机同一后端，不调整代价函数、约束、求解设置或控制增益。OSQP 支持显式指定后端，见[官方后端说明](https://osqp.org/docs/backends/python.html)。
+
+修改后不带 cProfile 运行：
+
+```bash
+env -u PYTHONPATH ROS_DOMAIN_ID=214 \
+  /home/bot/miniconda3/envs/go2_control/bin/python \
+  examples/mujoco/ocs2_wbc_standing.py \
+  --headless --duration 20 --async-mpc \
+  --allow-trot --trot-at 3 --stop-trot-at 15 \
+  --swing-reference=mpc \
+  --csv artifacts/ocs2_wbc_trot_async_builtin.csv
+```
+
+2026-10-15 已完成上述无 cProfile 的 20 s 运行。对照同样未采样的 `ocs2_wbc_trot_async_pair.csv` 及 JSON：
+
+| 指标 | 自动选择后端 | 显式 builtin |
+| --- | ---: | ---: |
+| WBC 平均 / p95 | 0.825 / 1.054 ms | 0.743 / 0.947 ms |
+| 每步 MRT pair 平均 | 0.499 ms | 0.517 ms |
+| 完整循环平均 / p95 | 1.963 / 2.928 ms | 1.906 / 2.843 ms |
+| 超过 2 ms 的循环数 | 2417 / 10000 | 2117 / 10000 |
+| 启动迟到量中位数 / p95 | 112.739 / 298.023 ms | 0.822 / 14.399 ms |
+| 最大启动迟到量 | 320.751 ms | 34.281 ms |
+| 末步启动迟到量 | 0.0536 ms | 0.0574 ms |
+| 高度目标 RMSE（2 s 后） | 3.617 mm | 3.594 mm |
+| 最大电机力矩 / 限幅步数 | 15.946 N·m / 0 | 15.930 N·m / 0 |
+
+本轮 WBC 平均耗时比前一轮低约 9.9%。MRT 耗时略增，说明并非各环节都会随本项改动一起改善；数据来自各一次闭环运行，系统负载、异步调度和策略接收时机也会影响结果，不能将累计迟到量的全部变化归因于这行代码。循环平均仍含首次约 517 ms 策略初始化；首次循环约 521 ms，不代表持续运行中的单步峰值。
+
+本轮包含 10000 步、998 次策略更新，策略 sequence 从 1 到 999，年龄中位数 28 ms、p95 和最大值均为 38 ms；首次双足模式出现在 4.022 s，16.000 s 后持续四足模式。前一轮首次双足模式为 4.042 s，因此两次物理轨迹并非逐步完全一致。
+
+四脚支撑阶段超过 1 N 的实际地面接触比例均为 100%，摆动中段地面接触样本均为 0。四脚相对当前 MPC 策略的摆动高度 RMSE 为 1.707–1.884 mm；机身相对当前 MPC 高度参考的 RMSE 为 0.213 mm、最大误差 1.086 mm。最大动力学残差约 1.07e-5，最大接触加速度残差约 1.73e-6，未发生力矩限幅。最终机身位置为 [0.001310, 0.000341, 0.281526] m。
+
+最大启动迟到发生在仿真 8.872 s，约 34.281 ms；末步在初始化后约 19.998057 s 开始。结束时已基本追回，但循环 p95 仍超过 2 ms，21.17% 的控制步执行耗时超出步长，不能据此宣称稳定 500 Hz。该迟到量衡量控制步相对固定时间表晚开始多少，不等于传感器到执行器的端到端时延。
+
+数据保存在本地 `artifacts/ocs2_wbc_trot_async_builtin.csv` 及同名 JSON，未纳入 Git。本次以完整 20 s 闭环验证该修改；本阶段完整现有测试集回归仍待收尾执行。
+
+后续可评估由每个固定接触集合的 WBC 实例持有求解器，用更新问题数据代替反复 setup。此项尚未实现：需要处理各 mode 的问题维度、P/A 稀疏结构及数值结果变化。OSQP 的矩阵 update 要求稀疏结构保持不变，不能只把对象构造移出函数后直接覆盖任意矩阵，见[官方更新接口说明](https://osqp.org/docs/interfaces/python.html)。
 
 ## 本阶段离线检查
 
