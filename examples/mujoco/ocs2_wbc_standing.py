@@ -300,10 +300,55 @@ def request_policy(process, message):
     reply = request_transport(process, message)
     return parse_policy_reply(reply)
 def parse_policy_reply(reply):
-    """Parse and validate the trajectory arrays in a policy reply."""
+    """Validate a policy reply and extract diagnostic trajectories."""
     times = np.asarray(reply["times"], dtype=float)
-    states = np.asarray(reply["states"], dtype=float)
-    inputs = np.asarray(reply["inputs"], dtype=float)
+
+    if (
+        times.ndim != 1
+        or len(times) < 2
+        or not np.isfinite(times).all()
+        or not np.all(np.diff(times) >= 0.0)
+        or not np.any(np.diff(times) > 0.0)
+    ):
+        raise RuntimeError("Invalid policy time trajectory")
+
+    trajectory_format = reply.get("trajectory_format", "full")
+
+    if trajectory_format == "full":
+        states = np.asarray(reply["states"], dtype=float)
+        inputs = np.asarray(reply["inputs"], dtype=float)
+
+        if (
+            states.shape != (len(times), 24)
+            or inputs.shape != (len(times), 24)
+            or not np.isfinite(states).all()
+            or not np.isfinite(inputs).all()
+        ):
+            raise RuntimeError("Invalid full policy arrays")
+
+        height_trajectory = states[:, 8].copy()
+        yaw_trajectory = states[:, 9].copy()
+
+    elif trajectory_format == "height_yaw":
+        height_trajectory = np.asarray(
+            reply["height_trajectory"], dtype=float
+        )
+        yaw_trajectory = np.asarray(
+            reply["yaw_trajectory"], dtype=float
+        )
+
+    else:
+        raise RuntimeError(
+            f"Unknown policy trajectory format: {trajectory_format}"
+        )
+
+    if (
+        height_trajectory.shape != (len(times),)
+        or yaw_trajectory.shape != (len(times),)
+        or not np.isfinite(height_trajectory).all()
+        or not np.isfinite(yaw_trajectory).all()
+    ):
+        raise RuntimeError("Invalid diagnostic trajectories")
 
     mode_event_times = np.asarray(
         reply["mode_event_times"], dtype=float
@@ -313,16 +358,7 @@ def parse_policy_reply(reply):
     )
 
     if (
-        times.ndim != 1
-        or len(times) < 2
-        or states.shape != (len(times), 24)
-        or inputs.shape != (len(times), 24)
-        or not np.isfinite(times).all()
-        or not np.isfinite(states).all()
-        or not np.isfinite(inputs).all()
-        or not np.all(np.diff(times) >= 0.0)
-        or not np.any(np.diff(times) > 0.0)
-        or mode_event_times.ndim != 1
+        mode_event_times.ndim != 1
         or mode_sequence.ndim != 1
         or len(mode_sequence) != len(mode_event_times) + 1
         or not np.isfinite(mode_event_times).all()
@@ -332,9 +368,15 @@ def parse_policy_reply(reply):
             for mode in mode_sequence
         )
     ):
-        raise RuntimeError("Invalid standing policy arrays")
+        raise RuntimeError("Invalid policy mode schedule")
 
-    return times, states, inputs, mode_event_times, mode_sequence
+    return (
+        times,
+        height_trajectory,
+        yaw_trajectory,
+        mode_event_times,
+        mode_sequence,
+    )
 
 def poll_policy(process, stamp, until, max_age=0.1):
     """Poll for a usable policy without waiting for MPC to finish."""
@@ -821,8 +863,8 @@ def main():
                     # 同步模式下，每次更新也继续走原来的等待流程。
                     (
                         times,
-                        states,
-                        inputs,
+                        height_trajectory,
+                        yaw_trajectory,
                         mode_event_times,
                         mode_sequence,
                     ) = timed_call(
@@ -889,8 +931,8 @@ def main():
                     if new_policy is not None:
                         (
                             times,
-                            states,
-                            inputs,
+                            height_trajectory,
+                            yaw_trajectory,
                             mode_event_times,
                             mode_sequence,
                         ) = new_policy
@@ -910,7 +952,7 @@ def main():
                 predicted_next_z = float(np.interp(
                     next_policy_time,
                     times,
-                    states[:, 8],
+                    height_trajectory,
                 ))
 
             policy_age_s = float("nan")
@@ -1228,12 +1270,12 @@ def main():
                 future_z = float(np.interp(
                     lookahead_time,
                     times,
-                    states[:, 8],
+                    height_trajectory,
                 ))
                 future_yaw = float(np.interp(
                     lookahead_time,
                     times,
-                    states[:, 9],
+                    yaw_trajectory,
                 ))
                 yaw_change = np.arctan2(
                     np.sin(future_yaw - state_ref[9]),
@@ -1252,7 +1294,7 @@ def main():
                     f"yaw_mpc={np.rad2deg(state_ref[9]):.2f} "
                     f"yaw={np.rad2deg(measured_yaw):.2f} "
                     f"yaw+0.2={np.rad2deg(future_yaw):.2f} "
-                    f"yaw_end={np.rad2deg(states[-1, 9]):.2f} "
+                    f"yaw_end={np.rad2deg(yaw_trajectory[-1]):.2f} "
                     f"yaw_rate_plan={planned_yaw_rate_deg_s:+.2f} "
                     f"x_goal={target[6]:.4f} "
                     f"x_mpc={state_ref[6]:.4f} "
@@ -1260,7 +1302,7 @@ def main():
                     f"goal={target[8]:.4f} "
                     f"z={q[2]:.4f} "
                     f"plan+0.2={future_z:.4f} "
-                    f"plan_end={states[-1, 8]:.4f} "
+                    f"plan_end={height_trajectory[-1]:.4f} "
                     f"horizon={times[-1] - mj_data.time:.2f} "
                     f"vz_ref={reference_vz:+.5f} "
                     f"vz={actual_vz:+.5f} "

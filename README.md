@@ -27,7 +27,7 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | Trot to four-foot stance | Stance command at 15 s; mode 15 sustained from 16.020 s in a 20 s headless run |
 | In-place yaw turn | Initial 20 s headless runs for ±10° targets; final measured +9.77° / -9.79°; left-turn foot XY direction verified, with endpoint errors and touchdown slip transients recorded |
 | MPC-derived swing references | Optional `--swing-reference=mpc`; 20 s left/right turns and forward/stop runs verified: +9.91° / −9.86° for ±10° goals, final x 0.09090 m for a 0.09 m goal, actual forward swing for all feet |
-| Asynchronous MPC updates | 20 s standing and in-place trot/stop runs completed with `--async-mpc`: 998 policy updates each, maximum policy age 38 ms; trot accumulated 3.47 s of start lateness, so real-time execution remains pending. See [execution and timing notes](docs/ocs2_async_mpc.md) |
+| Asynchronous MPC updates | 20 s standing and trot/stop runs completed. Compact poll payloads reduced mean poll time from 2.075 to 0.292 ms in the first comparison; maximum start lateness fell from 3.47 to 1.52 s, with 1.30 s still remaining at the final step. Real-time execution remains pending. See [execution and timing notes](docs/ocs2_async_mpc.md) |
 | Disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 

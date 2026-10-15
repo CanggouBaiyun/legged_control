@@ -19,21 +19,14 @@ from go2_mpc_bridge.srv import EvaluatePolicy
 
 SUPPORTED_CONTACT_MODES = {15, 9, 6}
 
-def policy_to_reply(policy):
-    """Serialize one MPC policy with its identity and observation time."""
-    return{
+def policy_to_reply(policy, compact=False):
+    """Serialize a policy with full or diagnostic-only trajectories."""
+    reply = {
         "reset_epoch": int(policy.reset_epoch),
         "policy_sequence": int(policy.policy_sequence),
         "observation_time": float(policy.init_observation.time),
+        "trajectory_format": "height_yaw" if compact else "full",
         "times": list(policy.time_trajectory),
-        "states": [
-            list(item.value)
-            for item in policy.state_trajectory
-        ],
-        "inputs": [
-            list(item.data)
-            for item in policy.data
-        ],
         "mode_event_times": list(
             policy.mode_schedule.event_times
         ),
@@ -41,6 +34,28 @@ def policy_to_reply(policy):
             policy.mode_schedule.mode_sequence
         ),
     }
+
+    if compact:
+        reply["height_trajectory"] = [
+            float(item.value[8])
+            for item in policy.state_trajectory
+        ]
+        reply["yaw_trajectory"] = [
+            float(item.value[9])
+            for item in policy.state_trajectory
+        ]
+    else:
+        reply["states"] = [
+            list(item.value)
+            for item in policy.state_trajectory
+        ]
+        reply["inputs"] = [
+            list(item.data)
+            for item in policy.data
+        ]
+
+    return reply
+
 def policy_is_usable(policy, stamp, until, max_age):
     """Check policy structure, execution coverage and observation age."""
     if policy.controller_type != policy.CONTROLLER_FEEDFORWARD:
@@ -282,7 +297,9 @@ def main():
                             stamp - selected_policy.init_observation.time
                         ),
                         "policy": (
-                            policy_to_reply(selected_policy)
+                            policy_to_reply(
+                                selected_policy, compact=True
+                            )
                             if updated else None
                         ),
                     }
