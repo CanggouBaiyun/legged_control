@@ -1,4 +1,4 @@
-"""Synchronized OCS2-WBC-MuJoCo standing experiment; simulation only."""
+"""OCS2-WBC-MuJoCo experiment with optional asynchronous MPC; simulation only."""
 
 import argparse
 import json
@@ -95,6 +95,14 @@ CSV_COLUMNS += tuple(
     for kind, unit in (("position", "m"), ("velocity", "mps"))
     for axis in ("x", "y", "z")
     for leg in ("fl", "fr", "rl", "rr")
+)
+
+CSV_COLUMNS += (
+    "policy_reset_epoch",
+    "policy_sequence",
+    "policy_age_s",
+    "policy_updated",
+    "control_start_lateness_s",
 )
 
 from go2_control.centroidal import (
@@ -290,7 +298,9 @@ def request_transport(process, message):
 def request_policy(process, message):
     """Request a fresh MPC policy."""
     reply = request_transport(process, message)
-
+    return parse_policy_reply(reply)
+def parse_policy_reply(reply):
+    """Parse and validate the trajectory arrays in a policy reply."""
     times = np.asarray(reply["times"], dtype=float)
     states = np.asarray(reply["states"], dtype=float)
     inputs = np.asarray(reply["inputs"], dtype=float)
@@ -326,6 +336,46 @@ def request_policy(process, message):
 
     return times, states, inputs, mode_event_times, mode_sequence
 
+def poll_policy(process, stamp, until, max_age=0.1):
+    """Poll for a usable policy without waiting for MPC to finish."""
+    reply = request_transport(
+        process,
+        {
+            "action": "poll",
+            "time": float(stamp),
+            "until": float(until),
+            "max_policy_age": float(max_age),
+        },
+    )
+
+    age = float(reply["policy_age_s"])
+    if (
+        not isinstance(reply["updated"], bool)
+        or reply["reset_epoch"] <= 0
+        or reply["policy_sequence"] <= 0
+        or not np.isfinite(age)
+        or not -1e-6 <= age <= max_age
+    ):
+        raise RuntimeError("Invalid policy polling response")
+
+    policy = None
+    if reply["updated"]:
+        payload = reply["policy"]
+        observation_time = float(payload["observation_time"])
+
+        if (
+            payload["reset_epoch"] != reply["reset_epoch"]
+            or payload["policy_sequence"] != reply["policy_sequence"]
+            or not np.isfinite(observation_time)
+            or abs((stamp - observation_time) - age) > 1e-6
+        ):
+            raise RuntimeError("Polled policy metadata mismatch")
+
+        policy = parse_policy_reply(payload)
+    elif reply["policy"] is not None:
+        raise RuntimeError("Unexpected policy without update flag")
+
+    return policy, reply
 
 def evaluate_policy(process, stamp, current_state):
     """Obtain references from the C++ MRT service."""
@@ -486,6 +536,11 @@ def parse_args():
         default="planner",
         help="Select the source of WBC swing-foot references.",
     )
+    parser.add_argument(
+        "--async-mpc",
+        action="store_true",
+        help="Publish observations without waiting for each MPC solve.",
+    )
     args = parser.parse_args()
 
     if not 0.0 < args.duration <= 20.0:
@@ -625,7 +680,7 @@ def main():
     transport = root / "examples/ocs2/standing_mpc_transport.py"
     command = (
     "source /opt/ros/jazzy/setup.bash && "
-    "source /home/bot/Project/ocs2_ws/install/setup.bash && "
+    "source /home/bot/Project/ocs2_ws/install/local_setup.bash && "
     "export RCUTILS_LOGGING_USE_STDOUT=0 && "
     f"exec /usr/bin/python3 {shlex.quote(str(transport))}"
     )
@@ -651,9 +706,16 @@ def main():
     viewer = None
     predicted_next_z = None
     prediction_error_mm = float("nan")
+    wall_start = None
+    policy_info = None
+    policy_observation_time = None
+    policy_updates = 0
+    max_policy_age = 0.1
     rows = []
     timings = {
         "plan": [],
+        "observe": [],
+        "poll": [],
         "mrt": [],
         "wbc": [],
         "loop": [],
@@ -676,6 +738,19 @@ def main():
         for step in range(total_steps):
             if viewer is not None and not viewer.is_running():
                 break
+
+            control_start_lateness = float("nan")
+            policy_changed = False
+
+            if args.async_mpc and wall_start is not None:
+                scheduled_start = wall_start + float(mj_data.time)
+                remaining = scheduled_start - time.perf_counter()
+                if remaining > 0.0:
+                    time.sleep(remaining)
+
+                control_start_lateness = max(
+                    0.0, time.perf_counter() - scheduled_start
+                )
 
             loop_start = time.perf_counter()
 
@@ -727,38 +802,110 @@ def main():
                 elif send_stance:
                     gait_command = "stance"
 
-                (
-                    times,
-                    states,
-                    inputs,
-                    mode_event_times,
-                    mode_sequence,
-                ) = timed_call(
-                    timings["plan"],
-                    request_policy,
-                    process,
-                    {
-                        "time": float(mj_data.time),
-                        "until": float(
-                            mj_data.time + steps_per_policy * dt
-                        ),
-                        "state": state.tolist(),
-                        "input": observation_input.tolist(),
-                        "target": target.tolist(),
-                        "target_times": target_times.tolist(),
-                        "target_states": target_states.tolist(),
-                        **({"gait": gait_command} if gait_command is not None else {}),
-                    },
-                )
+                stamp = float(mj_data.time)
+                next_policy_time = stamp + steps_per_policy * dt
+
+                # 覆盖下一次更新之前的控制与未来 5 ms 加速度查询。
+                required_until = next_policy_time + 0.005
+
+                observation_message = {
+                    "time": stamp,
+                    "state": state.tolist(),
+                    "input": observation_input.tolist(),
+                }
+                if gait_command is not None:
+                    observation_message["gait"] = gait_command
+
+                if not args.async_mpc or step == 0:
+                    # 初始化仍需等待第一条策略。
+                    # 同步模式下，每次更新也继续走原来的等待流程。
+                    (
+                        times,
+                        states,
+                        inputs,
+                        mode_event_times,
+                        mode_sequence,
+                    ) = timed_call(
+                        timings["plan"],
+                        request_policy,
+                        process,
+                        {
+                            **observation_message,
+                            "until": required_until,
+                            "target": target.tolist(),
+                            "target_times": target_times.tolist(),
+                            "target_states": target_states.tolist(),
+                        },
+                    )
+                else:
+                    acknowledgement = timed_call(
+                        timings["observe"],
+                        request_transport,
+                        process,
+                        {
+                            **observation_message,
+                            "action": "observe",
+                        },
+                    )
+                    if (
+                        acknowledgement.get("observation_published") is not True
+                        or acknowledgement.get("observation_time") != stamp
+                    ):
+                        raise RuntimeError(
+                            "Invalid observation acknowledgement"
+                        )
+
                 if send_gait:
                     gait_command_sent = True
-
                 if send_stance:
                     stance_command_sent = True
 
-                next_policy_time = (
-                    mj_data.time + steps_per_policy * dt
-                )
+                if args.async_mpc:
+                    new_policy, new_info = timed_call(
+                        timings["poll"],
+                        poll_policy,
+                        process,
+                        stamp,
+                        required_until,
+                        max_policy_age,
+                    )
+
+                    if policy_info is not None:
+                        sequence_advanced = (
+                            new_info["policy_sequence"]
+                            > policy_info["policy_sequence"]
+                        )
+                        if (
+                            new_info["reset_epoch"]
+                            != policy_info["reset_epoch"]
+                            or new_info["policy_sequence"]
+                            < policy_info["policy_sequence"]
+                            or new_info["updated"] != sequence_advanced
+                        ):
+                            raise RuntimeError(
+                                "Unexpected MPC policy identity change"
+                            )
+
+                    if new_policy is not None:
+                        (
+                            times,
+                            states,
+                            inputs,
+                            mode_event_times,
+                            mode_sequence,
+                        ) = new_policy
+                        policy_updates += 1
+
+                    policy_info = new_info
+                    policy_changed = new_info["updated"]
+                    policy_observation_time = (
+                        stamp - new_info["policy_age_s"]
+                    )
+
+                    # 初始化等待结束后，再建立仿真的真实时间起点。
+                    if wall_start is None:
+                        wall_start = time.perf_counter() - stamp
+                        control_start_lateness = 0.0
 
                 predicted_next_z = float(np.interp(
                     next_policy_time,
@@ -766,7 +913,20 @@ def main():
                     states[:, 8],
                 ))
 
-
+            policy_age_s = float("nan")
+            if args.async_mpc:
+                policy_age_s = (
+                    float(mj_data.time) - policy_observation_time
+                )
+                if (
+                    not -1e-6 <= policy_age_s <= max_policy_age
+                    or times[0] > mj_data.time + 1e-6
+                    or times[-1] < mj_data.time + 0.005
+                ):
+                    raise RuntimeError(
+                        "Active MPC policy is stale or does not "
+                        "cover the control queries"
+                    )
             # B. 用当前仿真时间取得 MPC 参考。
             current_mpc_state = state_from_pinocchio(
                 model,
@@ -1087,6 +1247,7 @@ def main():
                 print(
                     f"t={mj_data.time:5.2f} "
                     f"mode={mode} "
+                    f"policy_age_ms={policy_age_s * 1000.0:.1f} "
                     f"yaw_goal={np.rad2deg(target[9]):.2f} "
                     f"yaw_mpc={np.rad2deg(state_ref[9]):.2f} "
                     f"yaw={np.rad2deg(measured_yaw):.2f} "
@@ -1164,6 +1325,19 @@ def main():
             else:
                 row.extend([float("nan")] * 20)
             row.extend(pd_swing_deltas)
+            row.extend([
+                (
+                    policy_info["reset_epoch"]
+                    if policy_info is not None else float("nan")
+                ),
+                (
+                    policy_info["policy_sequence"]
+                    if policy_info is not None else float("nan")
+                ),
+                policy_age_s,
+                int(policy_changed),
+                control_start_lateness,
+            ])
             rows.append(row)
             if viewer is not None:
                 viewer.sync()
@@ -1328,6 +1502,20 @@ def main():
             "requested_duration_s": args.duration,
             "joint_pd_scale": args.joint_pd_scale,
             "swing_reference": args.swing_reference,
+            "async_mpc": args.async_mpc,
+            "policy_updates": policy_updates,
+            "maximum_policy_age_s": (
+                float(np.max(records[:, column["policy_age_s"]]))
+                if args.async_mpc else None
+            ),
+            "maximum_control_start_lateness_ms": (
+                float(
+                    1000.0 * np.max(
+                        records[:, column["control_start_lateness_s"]]
+                    )
+                )
+                if args.async_mpc else None
+            ),
             "actual_duration_s": float(mj_data.time),
             "samples": len(records),
             "mode_samples": {
