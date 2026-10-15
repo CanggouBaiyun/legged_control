@@ -10,7 +10,7 @@
 namespace go2 {
 RobotModel loadSimulationModel(const std::filesystem::path& root) {
   boost::property_tree::ptree config;
-  boost::property_tree::read_json((root / "configs/go2_model.json").string(), config);
+  boost::property_tree::read_json((root / "config/go2_model.json").string(), config);
   RobotModel robot;
   auto& model = robot.model;
   pinocchio::mjcf::buildModel((root / config.get<std::string>("mjcf")).string(), model);

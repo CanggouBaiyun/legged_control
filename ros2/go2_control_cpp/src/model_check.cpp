@@ -1,10 +1,6 @@
 #include "go2_control_cpp/model.hpp"
 #include <pinocchio/algorithm/center-of-mass.hpp>
 #include <pinocchio/algorithm/frames.hpp>
-#include <pinocchio/algorithm/joint-configuration.hpp>
-
-#include <boost/property_tree/json_parser.hpp>
-#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>

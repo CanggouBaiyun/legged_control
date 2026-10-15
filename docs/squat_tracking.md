@@ -67,7 +67,7 @@ IK 用上一帧参考构型做初值，不从实际构型重新积分生成位�
 ### 4. 保留真实仿真设置和诊断入口
 
 没有修改第三方 MJCF；关节 damping=0.1、frictionloss=0.2、armature=0.01，以及足端接触参数保持不变。
-旧诊断脚本完整保存在 examples/mujoco/wbc_squat_diagnostics.py。
+诊断统一使用当前 `examples/mujoco/wbc_squat.py` 的 baseline/tracking 模式和 CSV/JSON 输出。
 正常入口只保留每秒一行日志，支持无窗口验证与 CSV 导出。
 
 ## 运行

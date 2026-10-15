@@ -2,7 +2,7 @@
 
 ## 当前状态（2026-10-15）
 
-`feature/cpp-model-baseline` 已建立 `ros2/go2_control_cpp`，工作空间符号链接和首个 `model_check` 构建已完成。后续模型/动力学实现已在 `/tmp/go2_cpp_dynamics_step` 完成预验证，等待用户按下述命令复制并在工作空间构建。本文区分候选实现验证与项目接入状态；尚未实现 C++ WBC 或 C++ 闭环。
+`feature/cpp-model-baseline` 已接入 `ros2/go2_control_cpp`，通过工作空间符号链接构建。模型/动力学实现已在项目中运行，并完成 C++/Python 三组状态对照。C++ WBC 和 C++ 闭环尚未实现。模型配置统一为 `config/go2_model.json`。
 
 ## 本组修改
 
@@ -26,9 +26,9 @@
 
 本实现保留现有 Python 模型中的 MJCF armature，并从 URDF 按关节名称取力矩/速度限制。没有将该模型当作 OCS2 的欧拉角基座模型；后续质心状态转换仍需显式适配。当前方法返回动态尺寸数组，尚未完成控制循环预分配及性能优化。
 
-## 已完成的预验证
+## 已完成的验证
 
-临时目录 CMake Release 构建成功，运行 `model_check` 和 `dynamics_check` 成功；使用现有 Conda Python/Pinocchio 3.9.0 与 C++/Pinocchio 4.1.0 比较：
+工作空间 CMake Release 构建成功，运行 `model_check` 和 `dynamics_check` 成功；使用现有 Conda Python/Pinocchio 3.9.0 与 C++/Pinocchio 4.1.0 比较：
 
 - 总质量 15.206408 kg、armature、URDF effort/velocity 限制逐项一致。
 - 三组状态包含名义静止、正向倾斜运动、反向倾斜运动；运动状态使用非零基座/关节速度及变化后的关节角。
@@ -43,24 +43,16 @@
 | Jdot·v | 7.81e-18 |
 | 足端位置（m） | 5.55e-17 |
 
-对照容差为 atol=1e-10、rtol=1e-9。三组完整 q/v 与结果保存在 `/tmp/go2_cpp_dynamics_cases.json`，对照摘要为同名 `_comparison.json`。这些是离线计算对照，不代表接触力求解、动态稳定性、实时性能或硬件闭环验证。
+对照容差为 atol=1e-10、rtol=1e-9。三组完整 q/v 与结果保存在 `artifacts/cpp_model_dynamics.json`，对照摘要为同名 `_comparison.json`。这些是离线计算对照，不代表接触力求解、动态稳定性、实时性能或硬件闭环验证。
 
 ## 用户接入与运行
 
-候选包是当前首版包的扩展。复制到项目：
-
-```bash
-cd /home/bot/Project/go2_traditional_locomotion
-cp -r /tmp/go2_cpp_dynamics_step/. ros2/go2_control_cpp/
-cp /tmp/check_cpp_dynamics.py examples/pinocchio/dynamics/check_cpp_dynamics.py
-```
-
-沿用已有符号链接，构建并导出 C++ 结果：
+源码已由 Git 管理，无需复制临时目录。首次设置工作空间时按[安装说明](setup_guide.md)建立符号链接。构建并导出 C++ 结果：
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 cd /home/bot/Project/ocs2_ws
-env PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+env PATH=/usr/bin:/bin:/usr/sbin:/sbin CMAKE_BUILD_PARALLEL_LEVEL=1 \
   /usr/bin/python3 -m colcon build \
   --packages-select go2_control_cpp --executor sequential \
   --cmake-args -DCMAKE_BUILD_TYPE=Release \
@@ -84,4 +76,4 @@ env -u PYTHONPATH /home/bot/miniconda3/envs/go2_control/bin/python \
 
 末尾预期：`PASS: model limits, armature, FK, M, h, J and Jdot*v match in all 3 cases.` 程序保存 `artifacts/cpp_model_dynamics_comparison.json`。无需启动 MPC/MRT；本步骤核对计算模块，没有连接机器人。
 
-工作空间接入验证通过后，提交本组模型基线及文档。随后进入 C++ WBC 的任务/约束组装和 OSQP 求解接口；继续沿用已验证的 Python 参数与数学问题。总体路线见[迁移计划](cpp_control_plan.md)。
+两个 C++ 包默认导出各自的 `compile_commands.json`，用于编辑器准确解析依赖；可打开根目录的 `go2_control.code-workspace`。随后进入 C++ WBC 的任务/约束组装和 OSQP 求解接口，沿用已验证的 Python 参数与数学问题。总体路线见[开发路线](roadmap.md)。

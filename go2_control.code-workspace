@@ -1,0 +1,17 @@
+{
+  "folders": [
+    { "name": "go2_control", "path": "." }
+  ],
+  "settings": {
+    "C_Cpp.default.compilerPath": "/usr/bin/c++",
+    "C_Cpp.default.cppStandard": "c++17",
+    "C_Cpp.default.compileCommands": [
+      "${workspaceFolder:go2_control}/../ocs2_ws/build/go2_control_cpp/compile_commands.json",
+      "${workspaceFolder:go2_control}/../ocs2_ws/build/go2_mpc_bridge/compile_commands.json"
+    ],
+    "cmake.sourceDirectory": "${workspaceFolder:go2_control}/ros2/go2_control_cpp",
+    "cmake.configureOnOpen": false,
+    "python.defaultInterpreterPath": "/home/bot/miniconda3/envs/go2_control/bin/python",
+    "python.analysis.extraPaths": ["${workspaceFolder:go2_control}/src"]
+  }
+}
