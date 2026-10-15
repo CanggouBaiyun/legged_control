@@ -246,11 +246,14 @@ Cycle CSV logs include FR desired/actual frame height and actual normal contact 
 
 ## Roadmap
 
-1. Correct the remaining OCS2 height-target offset and separate 50 Hz MPC updates from the 500 Hz WBC loop.
-2. Build on the low-speed forward and return-to-stance results by measuring contact-point slip, improving forward foothold planning and validating turning.
-3. Test disturbance recovery with repeatable force pulses. Distinguish staying upright, recovering pose and returning to a fixed world-position target; record force, duration, application point, recovery time and constraint violations.
-4. Move hardware-rate components to C++ and add the ROS 2 / SDK2 interface, state estimation, contact detection, watchdogs and emergency-stop handling.
-5. Validate torque, joint, orientation and communication-loss safety gates before low-energy suspended hardware tests.
+Hardware context (2026-10-15, user reported): a modified Go2 Air with existing SDK2 low-level state-reading and joint-command capability. This project has not yet integrated or independently verified that interface. Sensor availability, joint mapping, control modes, communication-failure behavior and control ownership switching require validation; the deployment compute platform remains to be confirmed.
+
+1. Build on asynchronous MPC, 4 ms policy polling and OSQP reuse by locating remaining control-step overruns. Separate necessary control computation, communication waits and simulation diagnostics; record p95/p99, peaks and accumulated lateness, and validate longer runs.
+2. Move MRT policy evaluation and necessary WBC computation into a local C++ control loop in stages. Compare numerical outputs and closed-loop behavior with the existing Python implementation using matching states and references, reducing per-step pipe and ROS service round trips.
+3. Extend scripted motions to online ROS 2 velocity, heading and gait commands. Validate forward/backward, lateral and combined motion and repeated starts/stops; consolidate launch entry points and dependency/configuration versions. Compare the current DDP/SLQ and upstream SQP paths separately, keeping changes to major modules isolated.
+4. Improve dynamic target lag and stopping touchdown transients by checking landing position, velocity and contact-switch consistency. Test disturbance recovery with defined force pulses and record application point, magnitude, duration, recovery time and constraint violations.
+5. Add IMU, joint-state and contact inputs and validate state estimation against simulation truth. Gradually replace ground-truth base position/velocity inputs and evaluate noise, bias and incorrect contact detection.
+6. Confirm Go2 low-level interface access, compute platform and SDK2 communication. Complete read-only acquisition, joint direction/unit checks, torque/attitude limits, watchdogs, control ownership switching and emergency-stop handling before staged protected hardware standing, in-place trot and low-speed motion.
 
 Additional gaits follow a stable basic trot. Neither arbitrary-push recovery nor immediate sim-to-real deployment is claimed.
 
