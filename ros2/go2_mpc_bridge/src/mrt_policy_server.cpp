@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <map>
@@ -208,6 +209,11 @@ int main(int argc, char** argv) {
         "/go2_mpc/evaluate_policy_pair",
         [&](const std::shared_ptr<EvaluatePolicyPair::Request> request,
             std::shared_ptr<EvaluatePolicyPair::Response> response) {
+          const auto callbackStart = std::chrono::steady_clock::now();
+          const auto elapsedMs = [](std::chrono::steady_clock::time_point start) {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - start).count();
+          };
           response->success = false;
 
           try {
@@ -246,7 +252,10 @@ int main(int argc, char** argv) {
 
             if (key != activeKey) {
               activeKey = PolicyKey{0, 0};
+              const auto activationStart = std::chrono::steady_clock::now();
               mrt.activate(message);
+              response->activation_time_ms = elapsedMs(activationStart);
+              response->policy_activated = true;
               activeKey = key;
             }
 
@@ -281,17 +290,21 @@ int main(int argc, char** argv) {
             size_t mode = 0;
             size_t futureMode = 0;
 
+            const auto currentStart = std::chrono::steady_clock::now();
             evaluateAtTime(
                 request->time,
                 stateReference,
                 inputReference,
                 mode);
+            response->current_evaluation_time_ms = elapsedMs(currentStart);
 
+            const auto futureStart = std::chrono::steady_clock::now();
             evaluateAtTime(
                 request->future_time,
                 futureStateReference,
                 futureInputReference,
                 futureMode);
+            response->future_evaluation_time_ms = elapsedMs(futureStart);
 
             // 两次求值均通过检查后，才填写成功响应。
             for (int i = 0; i < 24; ++i) {
@@ -312,6 +325,7 @@ int main(int argc, char** argv) {
           } catch (const std::exception& error) {
             response->error = error.what();
           }
+          response->callback_time_ms = elapsedMs(callbackStart);
         });
 
     RCLCPP_INFO(

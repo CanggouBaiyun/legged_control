@@ -13,6 +13,52 @@ import mujoco.viewer
 import numpy as np
 import pinocchio as pin
 
+CONTROL_TIMING_PHASES = (
+    "state",
+    "policy",
+    "mrt_pair",
+    "reference",
+    "wbc",
+    "command",
+    "logging",
+    "simulation",
+    "contact",
+    "viewer",
+)
+
+MRT_TIMING_COLUMNS = (
+    "mrt_pipe_roundtrip_ms",
+    "mrt_transport_query_ms",
+    "mrt_ros_ready_ms",
+    "mrt_ros_roundtrip_ms",
+    "mrt_ros_success_roundtrip_ms",
+    "mrt_cache_retry_wait_ms",
+    "mrt_ros_attempts",
+    "mrt_cpp_policy_activated",
+    "mrt_cpp_activation_ms",
+    "mrt_cpp_current_eval_ms",
+    "mrt_cpp_future_eval_ms",
+    "mrt_cpp_callback_ms",
+    "mrt_pipe_residual_ms",
+    "mrt_ros_residual_ms",
+)
+
+CONTROL_TIMING_COLUMNS = (
+    "step",
+    "time_s",
+    "mode",
+    "initialization_step",
+    "plan_requested",
+    "observation_published",
+    "poll_requested",
+    "policy_updated",
+    "policy_age_ms",
+    "control_start_lateness_ms",
+) + tuple(f"{name}_ms" for name in CONTROL_TIMING_PHASES) + MRT_TIMING_COLUMNS + (
+    "loop_ms",
+    "timing_record_ms",
+)
+
 CSV_COLUMNS = (
     "time_s",
     "mode",
@@ -135,6 +181,97 @@ def timed_call(samples, function, *args, **kwargs):
     result = function(*args, **kwargs)
     samples.append(time.perf_counter() - start)
     return result
+
+
+def summarize_control_timings(records, timestep, evaluation_start_s):
+    """Summarize disjoint loop phases, excluding the startup interval."""
+    records = np.asarray(records, dtype=float)
+    if records.ndim != 2 or records.shape[1] != len(CONTROL_TIMING_COLUMNS):
+        raise RuntimeError("Control timing row width does not match columns")
+
+    column = {name: index for index, name in enumerate(CONTROL_TIMING_COLUMNS)}
+    phase_names = [f"{name}_ms" for name in CONTROL_TIMING_PHASES]
+    phase_names.append("timing_record_ms")
+    durations = records[:, [column[name] for name in phase_names]]
+    loop_ms = records[:, column["loop_ms"]]
+    if (
+        not np.isfinite(durations).all()
+        or not np.isfinite(loop_ms).all()
+        or np.any(durations < 0.0)
+        or np.any(loop_ms < 0.0)
+    ):
+        raise RuntimeError("Invalid control timing durations")
+
+    accounting_error = np.abs(np.sum(durations, axis=1) - loop_ms)
+    if np.any(accounting_error > 1e-6):
+        raise RuntimeError("Control timing phases do not sum to loop duration")
+
+    active = records[:, column["time_s"]] >= evaluation_start_s
+    if not np.any(active):
+        raise RuntimeError("No control timing samples in evaluation interval")
+    active_durations = durations[active]
+    active_loop = loop_ms[active]
+    overruns = active_loop > timestep * 1000.0
+
+    def statistics(values):
+        return {
+            "mean": float(np.mean(values)),
+            "p95": float(np.percentile(values, 95)),
+            "p99": float(np.percentile(values, 99)),
+            "maximum": float(np.max(values)),
+        }
+
+    largest_counts = {name: 0 for name in phase_names}
+    overrun_means = None
+    if np.any(overruns):
+        overrun_durations = active_durations[overruns]
+        overrun_means = {
+            name: float(np.mean(overrun_durations[:, index]))
+            for index, name in enumerate(phase_names)
+        }
+        largest = np.argmax(overrun_durations, axis=1)
+        largest_counts = {
+            name: int(np.count_nonzero(largest == index))
+            for index, name in enumerate(phase_names)
+        }
+
+    mrt_columns = [name for name in MRT_TIMING_COLUMNS if name.endswith("_ms")]
+    activated = records[active, column["mrt_cpp_policy_activated"]] == 1
+    attempts = records[active, column["mrt_ros_attempts"]]
+    mrt_summary = {
+        "samples": int(np.count_nonzero(active)),
+        "policy_activations": int(np.count_nonzero(activated)),
+        "retry_steps": int(np.count_nonzero(attempts > 1)),
+        "service_attempts": int(np.sum(attempts)),
+        "metric_ms": {
+            name: statistics(records[active, column[name]]) for name in mrt_columns
+        },
+        "activation_ms_when_activated": (
+            statistics(records[active, column["mrt_cpp_activation_ms"]][activated])
+            if np.any(activated) else None
+        ),
+        "overrun_mean_ms": (
+            {
+                name: float(np.mean(records[active, column[name]][overruns]))
+                for name in mrt_columns
+            } if np.any(overruns) else None
+        ),
+    }
+
+    return {
+        "evaluation_start_s": float(evaluation_start_s),
+        "samples": int(np.count_nonzero(active)),
+        "overrun_samples": int(np.count_nonzero(overruns)),
+        "phase_ms": {
+            name: statistics(active_durations[:, index])
+            for index, name in enumerate(phase_names)
+        },
+        "loop_ms": statistics(active_loop),
+        "overrun_phase_mean_ms": overrun_means,
+        "overrun_largest_phase_counts": largest_counts,
+        "maximum_accounting_error_ms": float(np.max(accounting_error)),
+        "mrt_query": mrt_summary,
+    }
 
 
 def floor_normal_forces(model, data, floor_id, foot_name_by_geom):
@@ -446,19 +583,68 @@ def evaluate_policy(process, stamp, current_state):
 
     return state, control, mode
 
+def parse_mrt_query_timing(reply, pipe_roundtrip_ms):
+    """Validate nested elapsed durations; residuals are not pure network time."""
+    timing = reply.get("query_timing")
+    if not isinstance(timing, dict):
+        raise RuntimeError("Missing MRT timings: rebuild bridge and restart MRT")
+    duration_names = (
+        "transport_query_ms", "ros_ready_ms", "ros_roundtrip_ms",
+        "ros_success_roundtrip_ms", "cache_retry_wait_ms",
+        "cpp_activation_ms", "cpp_current_eval_ms", "cpp_future_eval_ms",
+        "cpp_callback_ms",
+    )
+    try:
+        values = {name: float(timing[name]) for name in duration_names}
+        attempts = timing["ros_attempts"]
+        activated = timing["cpp_policy_activated"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("Invalid MRT timing fields") from error
+    if (
+        not np.isfinite(pipe_roundtrip_ms) or pipe_roundtrip_ms < 0.0
+        or not all(np.isfinite(value) and value >= 0.0 for value in values.values())
+        or type(attempts) is not int or attempts < 1
+        or type(activated) is not bool
+        or values["ros_success_roundtrip_ms"] > values["ros_roundtrip_ms"] + 1e-6
+        or (
+            values["ros_ready_ms"] + values["ros_roundtrip_ms"]
+            + values["cache_retry_wait_ms"]
+            > values["transport_query_ms"] + 1e-6
+        )
+        or (
+            values["cpp_activation_ms"] + values["cpp_current_eval_ms"]
+            + values["cpp_future_eval_ms"] > values["cpp_callback_ms"] + 1e-6
+        )
+        or (not activated and values["cpp_activation_ms"] > 1e-6)
+    ):
+        raise RuntimeError("Invalid nested MRT timing durations")
+
+    return {
+        "mrt_pipe_roundtrip_ms": pipe_roundtrip_ms,
+        **{f"mrt_{name}": value for name, value in values.items()},
+        "mrt_ros_attempts": attempts,
+        "mrt_cpp_policy_activated": int(activated),
+        "mrt_pipe_residual_ms": pipe_roundtrip_ms - values["transport_query_ms"],
+        "mrt_ros_residual_ms": (
+            values["ros_success_roundtrip_ms"] - values["cpp_callback_ms"]
+        ),
+    }
+
+
 def evaluate_policy_pair(
-    process, stamp, future_stamp, current_state, expected_policy=None
+    process, stamp, future_stamp, current_state, expected_policy=None,
+    timing_details=None,
 ):
     """Obtain current and future references in one transport round trip."""
-    reply = request_transport(
-        process,
-        {
-            "action": "evaluate_pair",
-            "time": float(stamp),
-            "future_time": float(future_stamp),
-            "state": current_state.tolist(),
-        },
-    )
+    message = {
+        "action": "evaluate_pair",
+        "time": float(stamp),
+        "future_time": float(future_stamp),
+        "state": current_state.tolist(),
+    }
+    pipe_start = time.perf_counter()
+    reply = request_transport(process, message)
+    pipe_roundtrip_ms = (time.perf_counter() - pipe_start) * 1000.0
 
     if expected_policy is not None and (
         reply["reset_epoch"] != expected_policy["reset_epoch"]
@@ -482,6 +668,9 @@ def evaluate_policy_pair(
         )
     ):
         raise RuntimeError("Invalid pair references returned by MRT")
+
+    if timing_details is not None:
+        timing_details.update(parse_mrt_query_timing(reply, pipe_roundtrip_ms))
 
     return state, control, mode, future_state, future_control, future_mode
 
@@ -795,6 +984,7 @@ def main():
     policy_updates = 0
     max_policy_age = 0.1
     rows = []
+    step_timing_rows = []
     timings = {
         "plan": [],
         "observe": [],
@@ -836,6 +1026,7 @@ def main():
                 )
 
             loop_start = time.perf_counter()
+            phase_marks = [loop_start]
 
             # A. 实测状态：来自 MuJoCo，不来自 MPC 预测。
             q, v = bridge.state(mj_data)
@@ -855,6 +1046,7 @@ def main():
             ):
                 raise RuntimeError("Invalid state or unsafe base height")
 
+            phase_marks.append(time.perf_counter())  # state
             if step % steps_per_policy == 0:
                 if predicted_next_z is not None:
                     prediction_error_mm = (
@@ -1032,6 +1224,8 @@ def main():
                     "Policy does not cover acceleration estimation"
                 )
 
+            mrt_timing_details = {}
+            phase_marks.append(time.perf_counter())  # policy
             (
                 state_ref,
                 input_ref,
@@ -1047,8 +1241,10 @@ def main():
                 future_time,
                 current_mpc_state,
                 policy_info,
+                timing_details=mrt_timing_details,
             )
 
+            phase_marks.append(time.perf_counter())  # mrt_pair
             scheduled_mode = mode_at_time(
                 mode_event_times, mode_sequence, mj_data.time
             )
@@ -1188,6 +1384,7 @@ def main():
                     swing_targets[name] = (
                         position, velocity, acceleration
                     )
+            phase_marks.append(time.perf_counter())  # reference
             # C. WBC 必须用实测 q、v 求解。
             result = timed_call(
                 timings["wbc"],
@@ -1208,6 +1405,7 @@ def main():
             ):
                 raise RuntimeError("WBC solve/constraint check failed")
 
+            phase_marks.append(time.perf_counter())  # wbc, including checks
             # D. 关节 PD 的参考也来自当前 MPC 轨迹点。
             q_ref, v_ref = pinocchio_from_state(
                 model, mapping_data, state_ref, input_ref[12:]
@@ -1233,6 +1431,7 @@ def main():
             clipped_steps += int(np.any(np.abs(limited - controls) > 1e-9))
             mj_data.ctrl[:] = limited
 
+            phase_marks.append(time.perf_counter())  # command
             # OCS2 force order: FL, FR, RL, RR.
             mpc_forces = input_ref[:12].reshape(4,3)
             # WBC uses a different internal contact order, so convert it to the
@@ -1363,8 +1562,10 @@ def main():
 
                 next_print += 1.0
 
+            phase_marks.append(time.perf_counter())  # logging
             # E. 执行力矩，推进真实的仿真动力学。
             mujoco.mj_step(mj_model, mj_data)
+            phase_marks.append(time.perf_counter())  # simulation
             if trot_wbc is not None:
                 # mj_step 的接触求解对应本步积分前的 q、v 和 mode。
                 floor_forces = floor_normal_forces(
@@ -1429,9 +1630,38 @@ def main():
                 control_start_lateness,
             ])
             rows.append(row)
+            phase_marks.append(time.perf_counter())  # contact and row completion
             if viewer is not None:
                 viewer.sync()
-            timings["loop"].append(time.perf_counter() - loop_start)
+            phase_marks.append(time.perf_counter())  # viewer
+
+            phase_ms = [
+                (end - start) * 1000.0
+                for start, end in zip(phase_marks[:-1], phase_marks[1:])
+            ]
+            observation_due = step % steps_per_policy == 0
+            step_timing_row = [
+                step,
+                row[0],  # mj_step 已推进时间；沿用本步积分前的日志时间。
+                mode,
+                int(step == 0),
+                int(observation_due and (not args.async_mpc or step == 0)),
+                int(observation_due and args.async_mpc and step != 0),
+                int(args.async_mpc and step % steps_per_poll == 0),
+                int(policy_changed),
+                policy_age_s * 1000.0,
+                control_start_lateness * 1000.0,
+                *phase_ms,
+                *(mrt_timing_details[name] for name in MRT_TIMING_COLUMNS),
+                0.0,
+                0.0,
+            ]
+            step_timing_rows.append(step_timing_row)
+            loop_end = time.perf_counter()
+            loop_seconds = loop_end - loop_start
+            timings["loop"].append(loop_seconds)
+            step_timing_row[-2] = loop_seconds * 1000.0
+            step_timing_row[-1] = (loop_end - phase_marks[-1]) * 1000.0
 
         print("\nFinal base position:", mj_data.qpos[:3])
         print("Clipped steps:", clipped_steps)
@@ -1516,6 +1746,37 @@ def main():
         active = records[
             records[:, column["time_s"]] >= evaluation_start_s
         ]
+
+        timing_records = np.asarray(step_timing_rows, dtype=float)
+        if (
+            timing_records.ndim != 2
+            or timing_records.shape[0] != records.shape[0]
+            or timing_records.shape[1] != len(CONTROL_TIMING_COLUMNS)
+            or not np.array_equal(timing_records[:, 1], records[:, column["time_s"]])
+            or not np.array_equal(timing_records[:, 2], records[:, column["mode"]])
+        ):
+            raise RuntimeError("Control timing rows do not align with motion rows")
+        control_timing_summary = summarize_control_timings(
+            timing_records, dt, evaluation_start_s
+        )
+        control_timing_path = (
+            args.csv.with_name(f"{args.csv.stem}_timing.csv")
+            if args.csv is not None else None
+        )
+        control_timing_summary["csv_file"] = (
+            str(control_timing_path) if control_timing_path is not None else None
+        )
+
+        print(
+            f"\nControl phases [ms], t >= {evaluation_start_s:g} s "
+            f"({control_timing_summary['samples']} samples):"
+        )
+        print(f"{'phase':<20} {'mean':>10} {'p95':>10} {'p99':>10} {'max':>10}")
+        for name, stats in control_timing_summary["phase_ms"].items():
+            print(
+                f"{name:<20} {stats['mean']:>10.3f} {stats['p95']:>10.3f} "
+                f"{stats['p99']:>10.3f} {stats['maximum']:>10.3f}"
+            )
 
         prediction_errors = active[
             :, column["prediction_error_mm"]
@@ -1706,6 +1967,7 @@ def main():
             )),
             "final_base_position": mj_data.qpos[:3].tolist(),
             "timing_ms": timing_summary_ms,
+            "control_timing": control_timing_summary,
             "osqp_workspace_stats": osqp_workspace_stats,
         }
 
@@ -1723,6 +1985,15 @@ def main():
                 fmt="%.10g",
             )
 
+            np.savetxt(
+                control_timing_path,
+                timing_records,
+                delimiter=",",
+                comments="",
+                header=",".join(CONTROL_TIMING_COLUMNS),
+                fmt="%.10g",
+            )
+
             summary_path = args.csv.with_suffix(".json")
             summary_path.write_text(
                 json.dumps(summary, indent=2) + "\n",
@@ -1730,6 +2001,7 @@ def main():
             )
 
             print(f"\nSaved {len(records)} samples to {args.csv}")
+            print(f"Saved {len(timing_records)} timing samples to {control_timing_path}")
             print(f"Saved summary to {summary_path}")
 
     finally:
