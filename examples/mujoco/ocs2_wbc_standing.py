@@ -1428,7 +1428,26 @@ def main():
 
         print("\nFinal base position:", mj_data.qpos[:3])
         print("Clipped steps:", clipped_steps)
+        controllers = (
+            trot_wbc.controllers
+            if trot_wbc is not None
+            else {15: wbc}
+        )
 
+        osqp_workspace_stats = {}
+        print("\nOSQP workspace statistics:")
+
+        for contact_mode, controller in sorted(controllers.items()):
+            workspace = controller.osqp_workspace
+            osqp_workspace_stats[str(contact_mode)] = {
+                "setup_count": workspace.setup_count,
+                "update_count": workspace.update_count,
+            }
+            print(
+                f"mode={contact_mode}: "
+                f"setup={workspace.setup_count}, "
+                f"update={workspace.update_count}"
+            )
         # Inclusive wall-clock measurements; loop already contains all sections.
         # Each MRT pair entry is one round trip with two policy evaluations.
         print("\nTiming summary [ms]:")
@@ -1676,6 +1695,7 @@ def main():
             )),
             "final_base_position": mj_data.qpos[:3].tolist(),
             "timing_ms": timing_summary_ms,
+            "osqp_workspace_stats": osqp_workspace_stats,
         }
 
         print("\nExperiment summary:")

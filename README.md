@@ -30,6 +30,7 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | Asynchronous MPC updates | 20 s standing and trot/stop runs completed. Compact poll payloads reduced mean poll time from 2.075 to 0.292 ms in the first comparison; maximum start lateness fell from 3.47 to 1.52 s, with 1.30 s still remaining at the final step. Real-time execution remains pending. See [execution and timing notes](docs/ocs2_async_mpc.md) |
 | Paired MRT queries | 20 s trot/stop verified: mean MRT time per step 0.689 → 0.499 ms, mean loop 1.963 ms; maximum start lateness 321 ms, near zero at the final step. Fixed 500 Hz execution remains unverified |
 | Explicit OSQP builtin backend | Subsequent 20 s trot/stop: mean WBC 0.743 ms, mean loop 1.906 ms, maximum start lateness 34 ms; 2117/10000 loops still exceeded 2 ms. Solver creation and setup still occur each step. See [timing comparison](docs/ocs2_async_mpc.md) |
+| OSQP workspace reuse | Latest 20 s trot/stop: 4 setups and 9996 updates across 10000 steps; mean WBC 0.628 ms, mean loop 1.733 ms, maximum start lateness 7.36 ms. 2118/10000 loops still exceeded 2 ms; fixed 500 Hz remains unverified |
 | Disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 
@@ -237,7 +238,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_single_leg_cycle.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-Latest verified regression result (2026-10-14, after the MPC swing-reference integration): **38 passed, 6 warnings in 13.95 s**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic and OCS2 vertical swing trajectory checks, and a headless 20 s single-leg cycle. The new MPC swing-reference path was additionally validated through separate 20 s left-turn, right-turn and forward/stop runs. The synchronous OCS2 experiment does not intentionally sleep to match wall time; optional `--async-mpc` execution uses wall-clock pacing even in headless mode. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
+Latest user-reported full regression result (2026-10-15, after asynchronous MPC integration and OSQP workspace reuse): **38 passed, 6 warnings in 11.27 s**. Tests include MPC/WBC contact-order conversion, MRT transport boundaries, quintic and OCS2 vertical swing trajectory checks, and a headless 20 s single-leg cycle. Live ROS 2 MPC/MRT integration is verified through separate runs; the latest asynchronous in-place trot/stop run completed 20 s, while asynchronous forward and turning runs remain pending. The MPC swing-reference path previously completed separate synchronous 20 s left-turn, right-turn and forward/stop runs. The synchronous OCS2 experiment does not intentionally sleep to match wall time; optional `--async-mpc` execution uses wall-clock pacing even in headless mode. Dependency deprecation warnings for hppfcl/coal and OSQP are separate from test failures.
 
 Cycle CSV logs include FR desired/actual frame height and actual normal contact force. Summary height errors refer to the base; `maximum_xy_drift_mm` measures displacement from the world origin, including the intentional base shift, not target-tracking error.
 

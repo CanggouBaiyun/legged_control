@@ -30,6 +30,7 @@
 | MPC 异步更新 | 站立及 trot 停步各完成 20 s；精简传输首次对比中 poll 平均耗时由 2.075 降至 0.292 ms，最大累计迟到由 3.47 降至 1.52 s，末步仍迟到 1.30 s，实时执行仍待解决，详见[执行与计时说明](docs/ocs2_async_mpc.md) |
 | MRT 双时刻查询 | 20 s trot 停步验证完成，每步 MRT 平均 0.689 → 0.499 ms，循环平均 1.963 ms；最大累计迟到 321 ms，结束时基本追回，仍未达到稳定 500 Hz |
 | 显式指定 OSQP builtin 后端 | 后续 20 s trot 停步运行：WBC 平均 0.743 ms，循环平均 1.906 ms，最大启动迟到 34 ms；仍有 2117/10000 步超过 2 ms，每步仍创建和初始化求解器，详见[计时对比](docs/ocs2_async_mpc.md) |
+| OSQP 工作区复用 | 最新 20 s trot 停步运行：10000 步共 4 次 setup、9996 次 update；WBC 平均 0.628 ms，循环平均 1.733 ms，最大启动迟到 7.36 ms；仍有 2118/10000 步超过 2 ms，尚未达到稳定 500 Hz |
 | 抗扰恢复 | 计划中 |
 | SDK2、状态估计和实机安全 | 计划中 |
 
@@ -237,7 +238,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests/test_single_leg_cycle.py
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 ```
 
-最近一次已验证的回归结果（2026-10-14，接入 MPC 摆腿参考后）为 **38 passed，6 warnings，13.95 s**，包含 MPC/WBC 足端顺序、MRT 通信边界、五次轨迹、OCS2 摆腿竖直轨迹边界条件及 20 s 无窗口单腿循环检查。新 MPC 摆腿参考路径另以左转、右转和前进停步各 20 s 的运行完成集成验证。同步 OCS2 实验不会主动等待以匹配真实时间；可选 `--async-mpc` 即使无窗口运行也使用真实时间节拍。hppfcl/coal 和 OSQP 的依赖弃用提示与测试失败是两回事。
+最近一次完整回归由用户运行并反馈（2026-10-15，接入异步 MPC 及 OSQP 工作区复用后）：**38 passed，6 warnings，11.27 s**，包含 MPC/WBC 足端顺序、MRT 通信边界、五次轨迹、OCS2 摆腿竖直轨迹边界条件及 20 s 无窗口单腿循环检查。真实 ROS 2 MPC/MRT 链路由独立运行提供集成验证；最新异步原地 trot 停步已完成 20 s，异步前进和转向仍待验证。MPC 摆腿参考此前已完成同步左转、右转和前进停步各 20 s 验证。同步 OCS2 实验不会主动等待以匹配真实时间；可选 `--async-mpc` 即使无窗口运行也使用真实时间节拍。hppfcl/coal 和 OSQP 的依赖弃用提示与测试失败是两回事。
 
 循环 CSV 保存 FR 期望/实际坐标系高度和实际法向接触力。汇总中的高度误差指身体高度；`maximum_xy_drift_mm` 是相对世界原点的水平位移，包含主动移重，不是目标跟踪误差。
 
