@@ -776,6 +776,7 @@ def main():
 
     dt = mj_model.opt.timestep
     steps_per_policy = max(1, round(0.02 / dt))
+    steps_per_poll = max(1, round(0.004 / dt))
     total_steps = round(args.duration / dt)
     last_control = np.zeros(24)
     next_print = 0.0
@@ -942,53 +943,59 @@ def main():
                 if send_stance:
                     stance_command_sent = True
 
-                if args.async_mpc:
-                    new_policy, new_info = timed_call(
-                        timings["poll"],
-                        poll_policy,
-                        process,
-                        stamp,
-                        required_until,
-                        max_policy_age,
-                    )
+            # 策略检查独立于每 20 ms 的观测发布。
+            if args.async_mpc and step % steps_per_poll == 0:
+                poll_stamp = float(mj_data.time)
+                poll_until = poll_stamp + steps_per_poll * dt + 0.005
 
-                    if policy_info is not None:
-                        sequence_advanced = (
-                            new_info["policy_sequence"]
-                            > policy_info["policy_sequence"]
+                new_policy, new_info = timed_call(
+                    timings["poll"],
+                    poll_policy,
+                    process,
+                    poll_stamp,
+                    poll_until,
+                    max_policy_age,
+                )
+
+                if policy_info is not None:
+                    sequence_advanced = (
+                        new_info["policy_sequence"]
+                        > policy_info["policy_sequence"]
+                    )
+                    if (
+                        new_info["reset_epoch"]
+                        != policy_info["reset_epoch"]
+                        or new_info["policy_sequence"]
+                        < policy_info["policy_sequence"]
+                        or new_info["updated"] != sequence_advanced
+                    ):
+                        raise RuntimeError(
+                            "Unexpected MPC policy identity change"
                         )
-                        if (
-                            new_info["reset_epoch"]
-                            != policy_info["reset_epoch"]
-                            or new_info["policy_sequence"]
-                            < policy_info["policy_sequence"]
-                            or new_info["updated"] != sequence_advanced
-                        ):
-                            raise RuntimeError(
-                                "Unexpected MPC policy identity change"
-                            )
 
-                    if new_policy is not None:
-                        (
-                            times,
-                            height_trajectory,
-                            yaw_trajectory,
-                            mode_event_times,
-                            mode_sequence,
-                        ) = new_policy
-                        policy_updates += 1
+                if new_policy is not None:
+                    (
+                        times,
+                        height_trajectory,
+                        yaw_trajectory,
+                        mode_event_times,
+                        mode_sequence,
+                    ) = new_policy
+                    policy_updates += 1
 
-                    policy_info = new_info
-                    policy_changed = new_info["updated"]
-                    policy_observation_time = (
-                        stamp - new_info["policy_age_s"]
-                    )
+                policy_info = new_info
+                policy_changed = new_info["updated"]
+                policy_observation_time = (
+                    poll_stamp - new_info["policy_age_s"]
+                )
 
-                    # 初始化等待结束后，再建立仿真的真实时间起点。
-                    if wall_start is None:
-                        wall_start = time.perf_counter() - stamp
-                        control_start_lateness = 0.0
+                # 初始化等待结束后，再建立仿真的真实时间起点。
+                if wall_start is None:
+                    wall_start = time.perf_counter() - poll_stamp
+                    control_start_lateness = 0.0
 
+            # 保留每 20 ms 的高度预测诊断口径。
+            if step % steps_per_policy == 0:
                 predicted_next_z = float(np.interp(
                     next_policy_time,
                     times,
@@ -1605,6 +1612,10 @@ def main():
             "joint_pd_scale": args.joint_pd_scale,
             "swing_reference": args.swing_reference,
             "async_mpc": args.async_mpc,
+            "observation_period_s": float(steps_per_policy * dt),
+            "policy_poll_period_s": (
+                float(steps_per_poll * dt) if args.async_mpc else None
+            ),
             "mrt_query_mode": "pair",
             "policy_updates": policy_updates,
             "maximum_policy_age_s": (
