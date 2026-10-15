@@ -1,4 +1,4 @@
-"""ROS transport for synchronized, simulation-only standing integration."""
+"""ROS transport for synchronous or asynchronous simulation MPC updates."""
 import json
 import math
 import sys
@@ -15,9 +15,81 @@ from ocs2_msgs.msg import (
     ModeSchedule,
 )
 from ocs2_msgs.srv import Reset
-from go2_mpc_bridge.srv import EvaluatePolicy
+from go2_mpc_bridge.srv import EvaluatePolicy, EvaluatePolicyPair
 
 SUPPORTED_CONTACT_MODES = {15, 9, 6}
+
+def policy_to_reply(policy, compact=False):
+    """Serialize a policy with full or diagnostic-only trajectories."""
+    reply = {
+        "reset_epoch": int(policy.reset_epoch),
+        "policy_sequence": int(policy.policy_sequence),
+        "observation_time": float(policy.init_observation.time),
+        "trajectory_format": "height_yaw" if compact else "full",
+        "times": list(policy.time_trajectory),
+        "mode_event_times": list(
+            policy.mode_schedule.event_times
+        ),
+        "mode_sequence": list(
+            policy.mode_schedule.mode_sequence
+        ),
+    }
+
+    if compact:
+        reply["height_trajectory"] = [
+            float(item.value[8])
+            for item in policy.state_trajectory
+        ]
+        reply["yaw_trajectory"] = [
+            float(item.value[9])
+            for item in policy.state_trajectory
+        ]
+    else:
+        reply["states"] = [
+            list(item.value)
+            for item in policy.state_trajectory
+        ]
+        reply["inputs"] = [
+            list(item.data)
+            for item in policy.data
+        ]
+
+    return reply
+
+def policy_is_usable(policy, stamp, until, max_age):
+    """Check policy structure, execution coverage and observation age."""
+    if policy.controller_type != policy.CONTROLLER_FEEDFORWARD:
+        raise RuntimeError("Only feedforward policies are supported")
+
+    times = list(policy.time_trajectory)
+    modes = list(policy.mode_schedule.mode_sequence)
+    events = list(policy.mode_schedule.event_times)
+    observation_time = float(policy.init_observation.time)
+
+    if (
+        len(times) < 2
+        or not all(math.isfinite(value) for value in times)
+        or any(second < first for first, second in zip(times, times[1:]))
+        or times[-1] <= times[0]
+        or not math.isfinite(observation_time)
+    ):
+        raise RuntimeError("Invalid MPC policy times")
+
+    if (
+        not modes
+        or len(events) != len(modes) - 1
+        or any(mode not in SUPPORTED_CONTACT_MODES for mode in modes)
+        or not all(math.isfinite(value) for value in events)
+        or any(second < first for first, second in zip(events, events[1:]))
+    ):
+        raise RuntimeError("Invalid MPC mode schedule")
+
+    age = stamp - observation_time
+    return (
+        times[0] <= stamp + 1e-6
+        and times[-1] >= until
+        and -1e-6 <= age <= max_age
+    )
 
 def query_mrt(node, client, policy, stamp, current_state):
     """Query the exact selected policy; never substitute another policy."""
@@ -112,6 +184,113 @@ def query_mrt(node, client, policy, stamp, current_state):
     raise RuntimeError("Selected policy was not available in MRT cache")
 
 
+def query_mrt_pair(
+    node, client, policy, stamp, future_stamp, current_state
+):
+    """Query two times on the same explicitly selected policy."""
+    if (
+        not math.isfinite(stamp)
+        or not math.isfinite(future_stamp)
+        or future_stamp < stamp
+        or len(current_state) != 24
+        or not all(math.isfinite(value) for value in current_state)
+    ):
+        raise ValueError("Invalid MRT pair query")
+
+    start_time = float(policy.time_trajectory[0])
+    end_time = float(policy.time_trajectory[-1])
+    tolerance = 1e-6
+
+    if (
+        stamp < start_time - tolerance
+        or future_stamp > end_time + tolerance
+    ):
+        raise RuntimeError("MRT pair query outside policy")
+
+    if not client.wait_for_service(timeout_sec=3.0):
+        raise RuntimeError("MRT pair service is unavailable")
+
+    query = EvaluatePolicyPair.Request()
+    query.reset_epoch = policy.reset_epoch
+    query.policy_sequence = policy.policy_sequence
+    # 只修正容差内的边界误差。
+    query.time = min(max(stamp, start_time), end_time)
+    query.future_time = min(max(future_stamp, start_time), end_time)
+    query.current_state = current_state
+
+    deadline = time.monotonic() + 3.0
+
+    while time.monotonic() < deadline:
+        future = client.call_async(query)
+        rclpy.spin_until_future_complete(
+            node,
+            future,
+            timeout_sec=min(
+                1.0, max(0.0, deadline - time.monotonic())
+            ),
+        )
+
+        if not future.done():
+            future.cancel()
+            raise RuntimeError("MRT pair service response timed out")
+
+        response = future.result()
+        if response is None:
+            raise RuntimeError("MRT pair returned no response")
+
+        if not response.success:
+            if response.error == "Requested policy is not cached":
+                rclpy.spin_once(node, timeout_sec=0.01)
+                continue
+            raise RuntimeError(response.error)
+
+        if (
+            response.reset_epoch != query.reset_epoch
+            or response.policy_sequence != query.policy_sequence
+            or response.mode not in SUPPORTED_CONTACT_MODES
+            or response.future_mode not in SUPPORTED_CONTACT_MODES
+        ):
+            raise RuntimeError(
+                "MRT pair response policy ID or mode mismatch"
+            )
+
+        state = list(response.state_reference)
+        control = list(response.input_reference)
+        future_state = list(response.future_state_reference)
+        future_control = list(response.future_input_reference)
+
+        if (
+            any(
+                len(values) != 24
+                for values in (
+                    state, control, future_state, future_control
+                )
+            )
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    state + control + future_state + future_control
+                )
+            )
+        ):
+            raise RuntimeError("Invalid MRT pair references")
+
+        return {
+            "reset_epoch": response.reset_epoch,
+            "policy_sequence": response.policy_sequence,
+            "state": state,
+            "input": control,
+            "mode": response.mode,
+            "future_state": future_state,
+            "future_input": future_control,
+            "future_mode": response.future_mode,
+        }
+
+    raise RuntimeError(
+        "Selected policy was not available in MRT cache"
+    )
+
+
 def main():
     rclpy.init()
     node = rclpy.create_node("go2_simulation_mpc_transport")
@@ -142,6 +321,10 @@ def main():
         EvaluatePolicy,
         "/go2_mpc/evaluate_policy"
     )
+    mrt_pair_client = node.create_client(
+        EvaluatePolicyPair,
+        "/go2_mpc/evaluate_policy_pair",
+    )
 
     epoch = None
     last_sequence = -1
@@ -170,13 +353,121 @@ def main():
                     print(json.dumps(output, allow_nan=False), flush=True)
                     continue
 
-                if action != "plan":
+                if action == "evaluate_pair":
+                    if selected_policy is None:
+                        raise RuntimeError(
+                            "Request a policy before querying MRT"
+                        )
+
+                    output = query_mrt_pair(
+                        node,
+                        mrt_pair_client,
+                        selected_policy,
+                        stamp,
+                        float(request["future_time"]),
+                        request["state"],
+                    )
+
+                    print(
+                        json.dumps(output, allow_nan=False),
+                        flush=True,
+                    )
+                    continue
+
+                if action == "poll":
+                    if epoch is None or selected_policy is None:
+                        raise RuntimeError(
+                            "Initialize MPC with plan before poll"
+                        )
+
+                    until = float(request["until"])
+                    max_age = float(request.get("max_policy_age", 0.1))
+
+                    if (
+                        not all(
+                            math.isfinite(value)
+                            for value in (stamp, until, max_age)
+                        )
+                        or until < stamp
+                        or max_age <= 0.0
+                    ):
+                        raise ValueError("Invalid policy polling interval")
+
+                    # 只处理已就绪回调，不等待求解完成或新消息到达。
+                    rclpy.spin_once(node, timeout_sec=0.0)
+
+                    updated = False
+                    if policies:
+                        candidate = policies[-1]
+                        if (
+                            candidate.reset_epoch == epoch
+                            and candidate.policy_sequence > last_sequence
+                            and candidate.init_observation.time
+                            >= selected_policy.init_observation.time - 1e-6
+                            and policy_is_usable(
+                                candidate, stamp, until, max_age
+                            )
+                        ):
+                            selected_policy = candidate
+                            last_sequence = candidate.policy_sequence
+                            updated = True
+
+                    # 没有新策略时，也必须检查保留的策略是否仍然有效。
+                    if not policy_is_usable(
+                        selected_policy, stamp, until, max_age
+                    ):
+                        raise RuntimeError(
+                            "No usable MPC policy: stale observation "
+                            "or insufficient execution coverage"
+                        )
+
+                    output = {
+                        "updated": updated,
+                        "reset_epoch": int(epoch),
+                        "policy_sequence": int(last_sequence),
+                        "policy_age_s": float(
+                            stamp - selected_policy.init_observation.time
+                        ),
+                        "policy": (
+                            policy_to_reply(
+                                selected_policy, compact=True
+                            )
+                            if updated else None
+                        ),
+                    }
+                    print(
+                        json.dumps(output, allow_nan=False),
+                        flush=True,
+                    )
+                    continue
+
+                if action not in ("plan", "observe"):
                     raise ValueError(f"Unknown request action: {action}")
 
+                if action == "observe":
+                    if epoch is None or selected_policy is None:
+                        raise RuntimeError("Initialize MPC with plan before observe")
+                    if (
+                        not math.isfinite(stamp)
+                        or len(request["state"]) != 24
+                        or len(request["input"]) != 24
+                        or not all(
+                            math.isfinite(value)
+                            for value in request["state"] + request["input"]
+                        )
+                    ):
+                        raise ValueError("Invalid MPC observation")
                 gait = request.get("gait")
                 if gait not in (None, "standing_trot", "stance"):
                     raise ValueError(f"Unsupported gait command: {gait}")
                 if gait is not None :
+                    if (
+                        action == "observe"
+                        and gait_publisher.get_subscription_count() == 0
+                    ):
+                        raise RuntimeError(
+                            "MPC gait receiver is unavailable"
+                        )
                     deadline = time.monotonic() + 3.0
                     while (
                         gait_publisher.get_subscription_count() == 0
@@ -263,6 +554,21 @@ def main():
                     schedule = selected_policy.mode_schedule
                     phase = bisect_left(schedule.event_times, stamp)
                     observation.mode = schedule.mode_sequence[phase]
+                if action == "observe":
+                    publisher.publish(observation)
+
+                    # 处理已经就绪的 ROS 回调，不等待新消息。
+                    rclpy.spin_once(node, timeout_sec=0.0)
+
+                    output = {
+                        "observation_published": True,
+                        "observation_time": stamp,
+                    }
+                    print(
+                        json.dumps(output, allow_nan=False),
+                        flush=True,
+                    )
+                    continue
 
                 deadline = time.monotonic() + 15.0
                 next_publish = 0.0
@@ -320,19 +626,7 @@ def main():
                         raise RuntimeError("Policy does not cover execution time")
 
                     # 输入取实际控制器payload，而不是目标轨迹里的input
-                    output = {
-                        "times": times,
-                        "states": [
-                            list(item.value)
-                            for item in policy.state_trajectory
-                        ],
-                        "inputs": [
-                            list(item.data)
-                            for item in policy.data
-                        ],
-                        "mode_event_times": events,
-                        "mode_sequence": modes,
-                    }
+                    output = policy_to_reply(policy)
                     selected_policy = policy
                     last_sequence = policy.policy_sequence
                     break

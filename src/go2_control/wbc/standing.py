@@ -11,6 +11,7 @@ from go2_control.model import (
 )
 
 from go2_control.optimization.qp_solvers import (
+    OSQPWorkspace,
     solve_with_osqp,
 )
 
@@ -47,6 +48,7 @@ class StandingWBC:
         contact_frame_names=None,
     ):
         self.model = model
+        self.osqp_workspace = OSQPWorkspace()
 
         #默认仍然使用四足支撑，保持原有例子的行为
         if contact_frame_names is None:
@@ -645,7 +647,7 @@ class StandingWBC:
             )
 
             inequality_upper_bound[normal_force_rows] = limits
-
+            
         # --------------------------------------------
         # 求解 QP
         # --------------------------------------------
@@ -663,6 +665,7 @@ class StandingWBC:
                     self.inequality_lower_bound
                 ),
                 inequality_upper_bound=inequality_upper_bound,
+                workspace=self.osqp_workspace,
             )
         )
 
