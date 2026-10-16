@@ -157,6 +157,8 @@ struct Target {
 struct Options {
   std::filesystem::path root,output;
   std::string target;
+  std::string wbc_config;
+  go2::WbcSettings wbc_settings;
   bool headless=false,check_only=false;
   bool centroidal_base_accel=false;
   double duration=20,trot_at=-1,stop_at=-1;
@@ -175,14 +177,16 @@ Options options(int argc,char** argv) {
     else if(key=="--stop-trot-at") result.stop_at=std::stod(value());
     else if(key=="--joint-kp") result.joint_kp=std::stod(value());
     else if(key=="--joint-kd") result.joint_kd=std::stod(value());
+    else if(key=="--wbc-config") result.wbc_config=value();
     else if(key=="--centroidal-base-accel") result.centroidal_base_accel=true;
     else if(key=="--headless") result.headless=true;
     else if(key=="--check-only") result.check_only=true;
     else if(key=="--help") {
       std::cout<<"Simulation only. --project-root ROOT --target JSON --csv CSV [--headless] "
           "[--duration SECONDS] [--trot-at SECONDS] [--stop-trot-at SECONDS] "
-          "[--joint-kp KP] [--joint-kd KD] [--centroidal-base-accel] [--check-only]\n"
-          "Joint gains default to Kp=20, Kd=1; both must be finite and non-negative.\n";
+          "[--joint-kp KP] [--joint-kd KD] [--centroidal-base-accel] [--wbc-config JSON] [--check-only]\n"
+          "Joint gains default to Kp=20, Kd=1; both must be finite and non-negative.\n"
+          "WBC paths are relative to the project root; omitting --wbc-config keeps built-in defaults.\n";
       std::exit(0);
     } else throw std::runtime_error("Unknown option: "+key);
   }
@@ -196,6 +200,48 @@ Options options(int argc,char** argv) {
       !std::isfinite(result.joint_kd) || result.joint_kd<0)
     throw std::runtime_error("Joint gains must be finite and non-negative");
   if(result.output.empty()) result.output=result.root/"artifacts/cpp_control.csv";
+  if(!result.wbc_config.empty()) {
+    std::filesystem::path path=result.wbc_config;
+    if(path.is_relative()) path=result.root/path;
+    try {
+      Tree config;
+      boost::property_tree::read_json(path.string(),config);
+      const std::set<std::string> allowed{
+          "schema","swing_kp","swing_kd","swing_acceleration_feedforward",
+          "base_weight","swing_weight","force_weight","joint_regularization","torque_regularization"};
+      std::set<std::string> seen;
+      for(const auto& item:config) {
+        if(!allowed.count(item.first) || !seen.insert(item.first).second || !item.second.empty())
+          throw std::runtime_error("Unknown, duplicate or non-scalar WBC field: "+item.first);
+      }
+      if(config.get<int>("schema")!=1)
+        throw std::runtime_error("Unsupported WBC configuration schema");
+      auto& settings=result.wbc_settings;
+      settings.swing_kp=config.get<double>("swing_kp");
+      settings.swing_kd=config.get<double>("swing_kd");
+      settings.swing_acceleration_feedforward=config.get<bool>("swing_acceleration_feedforward");
+      settings.base_weight=config.get<double>("base_weight");
+      settings.swing_weight=config.get<double>("swing_weight");
+      settings.force_weight=config.get<double>("force_weight");
+      settings.joint_regularization=config.get<double>("joint_regularization");
+      settings.torque_regularization=config.get<double>("torque_regularization");
+    } catch(const std::exception& error) {
+      throw std::runtime_error("WBC config "+path.string()+": "+error.what());
+    }
+    result.wbc_config=path.string();
+  }
+  return result;
+}
+Tree wbcSettingsTree(const go2::WbcSettings& settings) {
+  Tree result;
+  result.put("swing_kp",settings.swing_kp);
+  result.put("swing_kd",settings.swing_kd);
+  result.put("swing_acceleration_feedforward",settings.swing_acceleration_feedforward);
+  result.put("base_weight",settings.base_weight);
+  result.put("swing_weight",settings.swing_weight);
+  result.put("force_weight",settings.force_weight);
+  result.put("joint_regularization",settings.joint_regularization);
+  result.put("torque_regularization",settings.torque_regularization);
   return result;
 }
 const std::string columns=
@@ -209,8 +255,10 @@ const std::string columns=
     "mj_floor_fz_fl_n,mj_floor_fz_fr_n,mj_floor_fz_rl_n,mj_floor_fz_rr_n,"
     "mpc_fz_fl_n,mpc_fz_fr_n,mpc_fz_rl_n,mpc_fz_rr_n,"
     "wbc_fz_fl_n,wbc_fz_fr_n,wbc_fz_rl_n,wbc_fz_rr_n,measured_roll_rad,measured_pitch_rad,"
-    "policy_controller_type,joint_kp,joint_kd,centroidal_base_accel";
-using Row=std::array<double,59>;
+    "policy_controller_type,joint_kp,joint_kd,centroidal_base_accel,"
+    "wbc_swing_kp,wbc_swing_kd,wbc_swing_acceleration_feedforward,"
+    "wbc_base_weight,wbc_swing_weight,wbc_force_weight,wbc_joint_regularization,wbc_torque_regularization";
+using Row=std::array<double,67>;
 void write(const std::filesystem::path& path,const std::vector<Row>& rows) {
   if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
   std::ofstream out(path); out<<std::setprecision(17)<<columns<<'\n';
@@ -228,7 +276,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
   std::map<std::size_t,std::unique_ptr<go2::Wbc>> controllers;
   std::map<std::size_t,std::unique_ptr<go2::OsqpSolver>> solvers;
   for(std::size_t mode:{15,9,6}) {
-    controllers[mode]=std::make_unique<go2::Wbc>(robot.model,go2::stanceFeet(mode));
+    controllers[mode]=std::make_unique<go2::Wbc>(robot.model,go2::stanceFeet(mode),opts.wbc_settings);
     solvers[mode]=std::make_unique<go2::OsqpSolver>(GO2_OSQP_LIBRARY);
   }
   pinocchio::Data diagnostic_data(robot.model);
@@ -331,6 +379,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
             failure.put("time_s",stamp); failure.put("mode",mode);
             failure.put("policy_sequence",mrt.identity().sequence);
             failure.put("error",error.what());
+            failure.add_child("wbc_settings",wbcSettingsTree(opts.wbc_settings));
             failure.add_child("q",vectorTree(q)); failure.add_child("v",vectorTree(v));
             failure.add_child("input",vectorTree(input_ref));
             failure.add_child("previous_input",vectorTree(last_input));
@@ -387,6 +436,12 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       row[55]=static_cast<int>(policy.controllerPtr_->getType());
       row[56]=opts.joint_kp; row[57]=opts.joint_kd;
       row[58]=double(reference.base_acceleration.has_value());
+      const auto& settings=opts.wbc_settings;
+      row[59]=settings.swing_kp; row[60]=settings.swing_kd;
+      row[61]=double(settings.swing_acceleration_feedforward);
+      row[62]=settings.base_weight; row[63]=settings.swing_weight;
+      row[64]=settings.force_weight; row[65]=settings.joint_regularization;
+      row[66]=settings.torque_regularization;
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();
@@ -429,6 +484,12 @@ int main(int argc,char** argv) {
   try {
     const auto opts=options(argc,argv);
     const auto robot=go2::loadSimulationModel(opts.root);
+    {
+      const go2::Wbc validate_settings(robot.model,go2::stanceFeet(15),opts.wbc_settings);
+    }
+    std::cout<<"WBC configuration: "<<(opts.wbc_config.empty()?"built-in defaults":opts.wbc_config)<<'\n';
+    for(const auto& item:wbcSettingsTree(opts.wbc_settings))
+      std::cout<<"  "<<item.first<<"="<<item.second.data()<<'\n';
     const Target target(opts.target,opts.root);
     go2::ReferenceMapping mapping(robot.model,target.joints);
     target.check(mapping,robot);

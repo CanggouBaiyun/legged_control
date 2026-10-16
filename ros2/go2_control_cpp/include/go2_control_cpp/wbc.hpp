@@ -5,6 +5,18 @@
 #include <optional>
 
 namespace go2 {
+struct WbcSettings {
+  double swing_kp=100.0;
+  double swing_kd=20.0;
+  bool swing_acceleration_feedforward=true;
+
+  // Coefficients of squared errors in the QP objective.
+  double base_weight=1e5;
+  double swing_weight=1e5;
+  double force_weight=1.0;
+  double joint_regularization=1e-3;
+  double torque_regularization=1e-4;
+};
 struct SwingTarget {
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
   Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
@@ -56,13 +68,16 @@ struct WbcResult {
 };
 class Wbc {
  public:
-  Wbc(const pinocchio::Model& model, std::vector<std::string> contacts);
+  Wbc(const pinocchio::Model& model,
+      std::vector<std::string> contacts,
+      WbcSettings settings={});
   WbcQp formulate(const Eigen::VectorXd& q, const Eigen::VectorXd& v,
                   const WbcReference& reference);
   WbcResult solve(const WbcQp& qp, OsqpSolver& solver) const;
  private:
   const pinocchio::Model& model_;
   std::vector<std::string> contacts_;
+  WbcSettings settings_;
   pinocchio::Data dynamics_data_, contact_data_;
 };
 }  // namespace go2

@@ -6,6 +6,7 @@ if [[ "${1:-}" == --help ]]; then
     '  [--mpc-solver ddp|sqp] (default: ddp)' \
     '  [--joint-kp KP] [--joint-kd KD] (defaults: 20, 1)' \
     '  [--centroidal-base-accel] (default: existing tracking task)' \
+    '  [--wbc-config JSON] (relative to project root; default: built-in WBC settings)' \
     '  [--trot-at 3] [--stop-trot-at 15] [--forward] [--turn-angle-deg -10] [--csv PATH]' \
     'Runs one external MPC and the native C++ simulation; closes its own MPC on exit.'
   exit 0
@@ -67,7 +68,8 @@ fi
 if [[ ! -x "${GO2_BINARY}" ]]; then
   printf '%s\n' 'Build first: bash scripts/build_cpp_control.sh' >&2; exit 1
 fi
-"${GO2_BINARY}" --project-root "${GO2_PROJECT_ROOT}" --target "${GO2_TARGET}" --check-only
+"${GO2_BINARY}" --project-root "${GO2_PROJECT_ROOT}" --target "${GO2_TARGET}" \
+  "${GO2_CONTROL_ARGS[@]}" --check-only
 mkdir -p -- "$(dirname -- "${GO2_MPC_LOG}")"
 "${GO2_MPC_BINARY}" --ros-args \
   -p taskFile:="${GO2_PROJECT_ROOT}/config/ocs2/go2/task.info" \

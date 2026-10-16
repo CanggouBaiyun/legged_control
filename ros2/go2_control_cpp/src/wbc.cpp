@@ -4,6 +4,7 @@
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -13,9 +14,11 @@ namespace go2 {
 namespace {
 const std::set<std::string> feet{"FR_foot", "FL_foot", "RR_foot", "RL_foot"};
 }
-Wbc::Wbc(const pinocchio::Model& model, std::vector<std::string> contacts)
-    : model_(model), contacts_(std::move(contacts)), dynamics_data_(model),
-      contact_data_(model) {
+Wbc::Wbc(const pinocchio::Model& model,
+         std::vector<std::string> contacts,
+         WbcSettings settings)
+    : model_(model), contacts_(std::move(contacts)), settings_(settings),
+      dynamics_data_(model), contact_data_(model) {
   if (model.nq != 19 || model.nv != 18 || contacts_.empty())
     throw std::runtime_error("WBC requires Go2 and at least one stance foot");
   std::set<std::string> unique;
@@ -26,6 +29,15 @@ Wbc::Wbc(const pinocchio::Model& model, std::vector<std::string> contacts)
   if (!model.effortLimit.tail(12).allFinite() ||
       (model.effortLimit.tail(12).array() <= 0).any())
     throw std::runtime_error("Invalid model motor torque limits");
+  if(!std::isfinite(settings_.swing_kp) || settings_.swing_kp<0 ||
+      !std::isfinite(settings_.swing_kd) || settings_.swing_kd<0)
+    throw std::runtime_error("Invalid swing PD gains");
+  for(double weight : {
+      settings_.base_weight,settings_.swing_weight,settings_.force_weight,
+      settings_.joint_regularization,settings_.torque_regularization}) {
+    if(!std::isfinite(weight) || weight<=0)
+      throw std::runtime_error("WBC weights must be finite and positive");
+  }
 }
 
 WbcQp Wbc::formulate(const Eigen::VectorXd& q, const Eigen::VectorXd& v,
@@ -63,10 +75,10 @@ WbcQp Wbc::formulate(const Eigen::VectorXd& q, const Eigen::VectorXd& v,
         8.0*(ref.angular_velocity_local-v.segment<3>(3))).cwiseMax(-5.0).cwiseMin(5.0);
   }
 
-  Eigen::VectorXd weights = Eigen::VectorXd::Constant(n,1e-3);
-  weights.head<6>().setConstant(1e5);
-  weights.segment(18,nf).setOnes();
-  weights.tail<12>().setConstant(1e-4);
+  Eigen::VectorXd weights=Eigen::VectorXd::Constant(n,settings_.joint_regularization);
+  weights.head<6>().setConstant(settings_.base_weight);
+  weights.segment(18,nf).setConstant(settings_.force_weight);
+  weights.tail<12>().setConstant(settings_.torque_regularization);
   Eigen::VectorXd target = Eigen::VectorXd::Zero(n);
   target.head<6>() = qp.base_acceleration;
   if (ref.contact_forces.size() == 0) {
@@ -88,11 +100,13 @@ WbcQp Wbc::formulate(const Eigen::VectorXd& q, const Eigen::VectorXd& v,
     pinocchio::getFrameJacobian(model_,contact_data_,id,pinocchio::LOCAL_WORLD_ALIGNED,full_jacobian);
     pinocchio::getFrameJacobianTimeVariation(model_,contact_data_,id,pinocchio::LOCAL_WORLD_ALIGNED,variation);
     const Eigen::MatrixXd J=full_jacobian.topRows<3>();
-    const Eigen::Vector3d desired = swing.acceleration +
-        100.0*(swing.position-contact_data_.oMf[id].translation()) +
-        20.0*(swing.velocity-J*v) - variation.topRows<3>()*v;
-    qp.H.topLeftCorner(18,18).noalias() += 1e5*J.transpose()*J;
-    qp.g.head(18).noalias() -= 1e5*J.transpose()*desired;
+    Eigen::Vector3d feedforward=Eigen::Vector3d::Zero();
+    if(settings_.swing_acceleration_feedforward) feedforward=swing.acceleration;
+    const Eigen::Vector3d desired=feedforward+
+        settings_.swing_kp*(swing.position-contact_data_.oMf[id].translation())+
+        settings_.swing_kd*(swing.velocity-J*v)-variation.topRows<3>()*v;
+    qp.H.topLeftCorner(18,18).noalias() += settings_.swing_weight*J.transpose()*J;
+    qp.g.head(18).noalias() -= settings_.swing_weight*J.transpose()*desired;
   }
   qp.inequality_matrix = Eigen::MatrixXd::Zero(5*k+12,n);
   qp.lower_bound = Eigen::VectorXd::Constant(5*k+12,-std::numeric_limits<double>::infinity());
