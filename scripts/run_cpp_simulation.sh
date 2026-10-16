@@ -3,8 +3,9 @@
 set -eo pipefail
 if [[ "${1:-}" == --help ]]; then
   printf '%s\n' 'Usage: bash scripts/run_cpp_simulation.sh [--headless] [--duration 20]' \
+    '  [--mpc-solver ddp|sqp] (default: ddp)' \
     '  [--trot-at 3] [--stop-trot-at 15] [--forward] [--turn-angle-deg -10] [--csv PATH]' \
-    'Runs one external DDP MPC and the native C++ simulation; closes its own MPC on exit.'
+    'Runs one external MPC and the native C++ simulation; closes its own MPC on exit.'
   exit 0
 fi
 exec 200>/tmp/go2_cpp_simulation.lock
@@ -17,11 +18,19 @@ GO2_PYTHON="${GO2_PYTHON:-/home/bot/miniconda3/envs/go2_control/bin/python}"
 GO2_TARGET="${GO2_TARGET:-${GO2_PROJECT_ROOT}/artifacts/cpp_control_target.json}"
 GO2_MPC_LOG="${GO2_MPC_LOG:-${GO2_PROJECT_ROOT}/artifacts/cpp_control_mpc.log}"
 GO2_DURATION=20
+GO2_MPC_SOLVER=ddp
 GO2_CSV="${GO2_PROJECT_ROOT}/artifacts/cpp_control.csv"
 GO2_TARGET_ARGS=()
 GO2_CONTROL_ARGS=()
 while (($#)); do
   case "$1" in
+    --mpc-solver)
+      if (($#<2)); then
+        printf '%s\n' '--mpc-solver requires ddp or sqp' >&2
+        exit 2
+      fi
+      GO2_MPC_SOLVER="$2"
+      shift 2 ;;
     --duration|--csv)
       if (($#<2)); then printf '%s\n' "$1 requires a value" >&2; exit 2; fi
       if [[ "$1" == --duration ]]; then GO2_DURATION="$2"; else GO2_CSV="$2"; fi
@@ -34,6 +43,13 @@ while (($#)); do
     *) GO2_CONTROL_ARGS+=("$1"); shift ;;
   esac
 done
+case "${GO2_MPC_SOLVER}" in
+  ddp|sqp) ;;
+  *)
+    printf 'Unsupported MPC solver: %s; choose ddp or sqp\n' \
+      "${GO2_MPC_SOLVER}" >&2
+    exit 2 ;;
+esac
 env -u PYTHONPATH "${GO2_PYTHON}" "${GO2_PROJECT_ROOT}/examples/mujoco/prepare_cpp_target.py" \
   "${GO2_TARGET}" "${GO2_TARGET_ARGS[@]}"
 source /opt/ros/jazzy/setup.bash
@@ -41,7 +57,11 @@ source "${GO2_WORKSPACE}/install/local_setup.bash"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-216}"
 export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/go2_cpp_control_ros_logs}"
 GO2_BINARY="${GO2_WORKSPACE}/install/go2_control_cpp/lib/go2_control_cpp/control_simulation"
-GO2_MPC_BINARY="${GO2_WORKSPACE}/install/ocs2_legged_robot_ros/lib/ocs2_legged_robot_ros/legged_robot_ddp_mpc"
+GO2_MPC_BINARY="${GO2_WORKSPACE}/install/ocs2_legged_robot_ros/lib/ocs2_legged_robot_ros/legged_robot_${GO2_MPC_SOLVER}_mpc"
+if [[ ! -x "${GO2_MPC_BINARY}" ]]; then
+  printf 'MPC executable not found: %s\n' "${GO2_MPC_BINARY}" >&2
+  exit 1
+fi
 if [[ ! -x "${GO2_BINARY}" ]]; then
   printf '%s\n' 'Build first: bash scripts/build_cpp_control.sh' >&2; exit 1
 fi
@@ -65,7 +85,8 @@ go2_stop_mpc() {
 trap go2_stop_mpc EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-printf 'Native simulation ROS_DOMAIN_ID=%s; MPC log: %s\n' "${ROS_DOMAIN_ID}" "${GO2_MPC_LOG}"
+printf 'Native simulation MPC=%s; ROS_DOMAIN_ID=%s; MPC log: %s\n' \
+  "${GO2_MPC_SOLVER}" "${ROS_DOMAIN_ID}" "${GO2_MPC_LOG}"
 "${GO2_BINARY}" --project-root "${GO2_PROJECT_ROOT}" --target "${GO2_TARGET}" "${GO2_CONTROL_ARGS[@]}"
 env -u PYTHONPATH "${GO2_PYTHON}" "${GO2_PROJECT_ROOT}/tools/summarize_cpp_control.py" \
   "${GO2_CSV}" --duration "${GO2_DURATION}"
