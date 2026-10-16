@@ -257,8 +257,9 @@ const std::string columns=
     "wbc_fz_fl_n,wbc_fz_fr_n,wbc_fz_rl_n,wbc_fz_rr_n,measured_roll_rad,measured_pitch_rad,"
     "policy_controller_type,joint_kp,joint_kd,centroidal_base_accel,"
     "wbc_swing_kp,wbc_swing_kd,wbc_swing_acceleration_feedforward,"
-    "wbc_base_weight,wbc_swing_weight,wbc_force_weight,wbc_joint_regularization,wbc_torque_regularization";
-using Row=std::array<double,67>;
+    "wbc_base_weight,wbc_swing_weight,wbc_force_weight,wbc_joint_regularization,wbc_torque_regularization,"
+    "wbc_iterations,osqp_setup_count,osqp_update_count";
+using Row=std::array<double,70>;
 void write(const std::filesystem::path& path,const std::vector<Row>& rows) {
   if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
   std::ofstream out(path); out<<std::setprecision(17)<<columns<<'\n';
@@ -442,6 +443,9 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       row[62]=settings.base_weight; row[63]=settings.swing_weight;
       row[64]=settings.force_weight; row[65]=settings.joint_regularization;
       row[66]=settings.torque_regularization;
+      row[67]=double(result.qp_solution.iterations);
+      row[68]=double(solvers.at(mode)->setupCount());
+      row[69]=double(solvers.at(mode)->updateCount());
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();

@@ -134,8 +134,13 @@ int main(int argc,char** argv) {
       if(update_error>1e-4)
         throw std::runtime_error("Updated workspace differs from a fresh solve: max error="+std::to_string(update_error));
       const auto repeated=wbc.solve(qp,solver);
-      if((result.qp_solution.x-repeated.qp_solution.x).lpNorm<Eigen::Infinity>()>1e-4)
-        throw std::runtime_error("Repeated QP solve changed result");
+      const double repeated_error=(result.qp_solution.x-repeated.qp_solution.x).lpNorm<Eigen::Infinity>();
+      if(repeated_error>1e-4)
+        throw std::runtime_error(name+": repeated QP solve changed result: max error="+std::to_string(repeated_error)+
+            "; first iterations="+std::to_string(result.qp_solution.iterations)+
+            ", dual="+std::to_string(result.qp_solution.dual_residual)+
+            "; repeated iterations="+std::to_string(repeated.qp_solution.iterations)+
+            ", dual="+std::to_string(repeated.qp_solution.dual_residual));
       }
       if(!first) out<<','; first=false;
       out<<"{\"name\":\""<<name<<"\",\"H\":"; writeMatrix(out,qp.H);
