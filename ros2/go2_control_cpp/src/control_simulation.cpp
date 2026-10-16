@@ -1,6 +1,8 @@
 #include "go2_control_cpp/reference.hpp"
 #include "go2_control_cpp/simulation.hpp"
 #include "go2_control_cpp/local_mrt.hpp"
+#include <ocs2_core/control/ControllerType.h>
+#include <ocs2_core/misc/LinearInterpolation.h>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/info_parser.hpp>
 #include <pinocchio/algorithm/frames.hpp>
@@ -154,8 +156,9 @@ const std::string columns=
     "swing_target_z_fl_m,swing_target_z_fr_m,swing_target_z_rl_m,swing_target_z_rr_m,"
     "mj_floor_fz_fl_n,mj_floor_fz_fr_n,mj_floor_fz_rl_n,mj_floor_fz_rr_n,"
     "mpc_fz_fl_n,mpc_fz_fr_n,mpc_fz_rl_n,mpc_fz_rr_n,"
-    "wbc_fz_fl_n,wbc_fz_fr_n,wbc_fz_rl_n,wbc_fz_rr_n,measured_roll_rad,measured_pitch_rad";
-using Row=std::array<double,55>;
+    "wbc_fz_fl_n,wbc_fz_fr_n,wbc_fz_rl_n,wbc_fz_rr_n,measured_roll_rad,measured_pitch_rad,"
+    "policy_controller_type";
+using Row=std::array<double,56>;
 void write(const std::filesystem::path& path,const std::vector<Row>& rows) {
   if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
   std::ofstream out(path); out<<std::setprecision(17)<<columns<<'\n';
@@ -196,7 +199,11 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
   auto control=[&] {
    try {
     sim.loadViewer();
-  std::cout<<"Native C++ control started; epoch="<<mrt.identity().epoch<<std::endl;
+  const auto controller_type=mrt.getPolicy().controllerPtr_->getType();
+  std::cout<<"Native C++ control started; epoch="<<mrt.identity().epoch
+    <<"; policy="
+    <<(controller_type==ocs2::ControllerType::LINEAR ? "linear" : "feedforward")
+    <<std::endl;
   go2::CentroidalState last_input=go2::CentroidalState::Zero();
   bool trot_sent=false,stance_sent=false;
   std::size_t mode=15,step=0;
@@ -223,18 +230,33 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       const bool updated=step%2==0 && mrt.select(stamp,stamp+.009);
       mrt.checkCoverage(stamp,stamp+.005);
       const auto policy_end=Clock::now();
-      ocs2::vector_t state_ref,input_ref,future_state,future_input;
-      std::size_t future_mode=15;
+      ocs2::vector_t state_ref,input_ref;
       mrt.evaluatePolicy(stamp,current_state,state_ref,input_ref,mode);
-      mrt.evaluatePolicy(stamp+.005,current_state,future_state,future_input,future_mode);
+
+      // Read nominal trajectories from the same active policy.
+      const auto& policy=mrt.getPolicy();
+      const auto nominal_input=ocs2::LinearInterpolation::interpolate(
+          stamp,policy.timeTrajectory_,policy.inputTrajectory_);
+      const auto future_state=ocs2::LinearInterpolation::interpolate(
+          stamp+.005,policy.timeTrajectory_,policy.stateTrajectory_);
+      const auto future_input=ocs2::LinearInterpolation::interpolate(
+          stamp+.005,policy.timeTrajectory_,policy.inputTrajectory_);
+      const std::size_t future_mode=policy.modeSchedule_.modeAtTime(stamp+.005);
       go2::stanceFeet(mode); go2::stanceFeet(future_mode);
-      if(state_ref.size()!=24 || input_ref.size()!=24 || future_state.size()!=24 || future_input.size()!=24 ||
-          !state_ref.allFinite() || !input_ref.allFinite() || !future_state.allFinite() || !future_input.allFinite())
-        throw std::runtime_error("Invalid local MRT pair result");
+      if(state_ref.size()!=24 || input_ref.size()!=24 || nominal_input.size()!=24 ||
+          future_state.size()!=24 || future_input.size()!=24 ||
+          !state_ref.allFinite() || !input_ref.allFinite() || !nominal_input.allFinite() ||
+          !future_state.allFinite() || !future_input.allFinite())
+        throw std::runtime_error("Invalid local MRT reference result");
       if(opts.trot_at<0 && (mode!=15 || future_mode!=15)) throw std::runtime_error("Standing run received a walking mode");
       const auto mrt_end=Clock::now();
-      const auto point=mapping.point(state_ref,input_ref),future=mapping.point(future_state,future_input);
-      const auto reference=mapping.reference(q,point,future,input_ref,mode,future_mode,.005);
+      // Current feedback input supplies joint-PD velocity references.
+      const auto point=mapping.point(state_ref,input_ref);
+      // WBC motion references and acceleration feedforward follow the plan.
+      const auto nominal=mapping.point(state_ref,nominal_input);
+      const auto future=mapping.point(future_state,future_input);
+      // Contact-force references retain the current feedback correction.
+      const auto reference=mapping.reference(q,nominal,future,input_ref,mode,future_mode,.005);
       const auto reference_end=Clock::now();
       auto& wbc=*controllers.at(mode);
       const auto result=wbc.solve(wbc.formulate(q,v,reference),*solvers.at(mode));
@@ -269,6 +291,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         row[49+i]=foot==contacts.end()?0.0:result.contact_forces(foot-contacts.begin(),2);
       }
       row[53]=rpy[0]; row[54]=rpy[1];
+      row[55]=static_cast<int>(policy.controllerPtr_->getType());
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();

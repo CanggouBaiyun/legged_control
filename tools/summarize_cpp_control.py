@@ -63,6 +63,15 @@ def summarize(path, duration=20.0):
         "raised_swing_contact_samples": {},
         "swing_height_tracking_rmse_mm": {},
     }
+    if "policy_controller_type" in data.dtype.names:
+        controller_names = {1: "feedforward", 2: "linear"}
+        types = np.unique(data["policy_controller_type"])
+        if any(value not in controller_names for value in types):
+            raise RuntimeError("Unsupported policy controller type in CSV")
+        result["policy_controller_samples"] = {
+            controller_names[int(value)]: int((data["policy_controller_type"] == value).sum())
+            for value in types
+        }
     walking = data[data["mode"] != 15]
     if len(walking):
         result["first_non_stance_s"] = float(walking["time_s"][0])
@@ -83,6 +92,8 @@ def summarize(path, duration=20.0):
     output = path.with_suffix(".json")
     output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     print(f"Completed {duration:g} s / {len(data)} steps; modes: {result['mode_samples']}")
+    if "policy_controller_samples" in result:
+        print(f"Policy controller samples: {result['policy_controller_samples']}")
     print(f"Final x: {result['final_x_m']:.6f} m; yaw: {result['final_yaw_deg']:.3f} deg; "
           f"torque: {result['maximum_applied_torque_nm']:.3f} Nm; clipped steps: {result['clipped_steps']}")
     for name in ("control_ms", "loop_ms", "control_start_lateness_ms"):

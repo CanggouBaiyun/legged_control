@@ -68,17 +68,24 @@ void LocalMrt::receive(const ocs2_msgs::msg::MpcFlattenedController::ConstShared
     const auto& events=msg->mode_schedule.event_times;
     const auto& modes=msg->mode_schedule.mode_sequence;
     const auto n=times.size();
+    const bool feedforward =
+        msg->controller_type==msg->CONTROLLER_FEEDFORWARD;
+    const bool linear =
+        msg->controller_type==msg->CONTROLLER_LINEAR;
+    const std::size_t payload_size = linear ? 24 + 24*24 : 24;
+
     if(epoch_==0 || msg->reset_epoch!=epoch_ || msg->policy_sequence<=received_sequence_ ||
-        msg->controller_type!=msg->CONTROLLER_FEEDFORWARD || n<2 ||
+        (!feedforward && !linear) || n<2 ||
         msg->state_trajectory.size()!=n || msg->input_trajectory.size()!=n || msg->data.size()!=n ||
         !finite(times) || !std::is_sorted(times.begin(),times.end()) || times.back()<=times.front() ||
         modes.empty() || events.size()+1!=modes.size() || !finite(events) ||
         !std::is_sorted(events.begin(),events.end()) || !std::all_of(modes.begin(),modes.end(),supported) ||
         !std::isfinite(msg->init_observation.time) || msg->init_observation.time<received_observation_)
       throw std::runtime_error("Invalid policy generation, time or contact schedule");
+
     for(std::size_t i=0;i<n;++i)
       if(msg->state_trajectory[i].value.size()!=24 || msg->input_trajectory[i].value.size()!=24 ||
-          msg->data[i].data.size()!=24 || !finite(msg->state_trajectory[i].value) ||
+          msg->data[i].data.size()!=payload_size || !finite(msg->state_trajectory[i].value) ||
           !finite(msg->input_trajectory[i].value) || !finite(msg->data[i].data))
         throw std::runtime_error("Invalid policy payload");
     auto prepared=std::make_unique<Pending>();
