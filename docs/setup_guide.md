@@ -252,3 +252,7 @@ VS Code 使用根目录 `go2_control.code-workspace` 打开项目。它指向：
 这能让 C/C++ 扩展读取实际编译时的 Pinocchio、Eigen、ROS 和生成服务头文件路径。不要再指向已经删除的 `/tmp/go2_mpc_bridge_build`。若程序构建成功而编辑器仍保留旧红线，可执行 `C/C++: Reset IntelliSense Database`，再执行 `Developer: Reload Window`。
 
 工程构建由上述 colcon 命令完成；工作空间关闭了打开时自动运行 CMake 配置，避免继承其他项目的 CMake 源目录。模型与动力学验证命令见[C++ 模型基线](cpp_model_baseline.md)。
+
+原生 MRT/WBC/MuJoCo 控制入口使用 `bash scripts/build_cpp_control.sh` 构建，额外需要 MuJoCo、OSQP C API、GLFW/OpenGL 开发文件。本机已具备这些依赖。运行 `bash scripts/run_cpp_simulation.sh --help` 查看参数；默认在独立 ROS 域 216 启动配套 MPC，控制循环不需要 Python transport 或 MRT 查询服务。完整命令与验收数据见[C++ 闭环](cpp_model_baseline.md#本地-mrt-与-c-mujoco-闭环2026-10-15)。
+
+官方 Simulate 3.4.0 的必要源码及 PNG 依赖已随仓库保存于 `third_party/mujoco_simulate/`，版本、校验和及许可证一并保留，构建不自动下载源码。查看器与 MuJoCo 3.4.0 库匹配，删掉 `--headless` 即启用官方侧栏和交互；无需启动独立的 `simulate` 可执行程序。

@@ -252,14 +252,25 @@ After reviewing upstream and local implementations, migration will proceed throu
 
 The shared C++ model/dynamics implementation is integrated into the workspace and passed three Python/C++ comparisons including tilted poses and nonzero velocities: maximum absolute M/h/J/Jdot·v errors were approximately 5.27e-17/8.88e-16/5.55e-17/7.81e-18; motor limits and armature matched. See the [C++ model baseline](docs/cpp_model_baseline.md).
 
-A candidate native C++ WBC passed seven Python comparisons covering four-foot and both diagonal contact sets, nonzero motion and normal-force limits, with maximum torque difference about 6.56e-12 N·m. Patch application and workspace integration are pending; the candidate has not yet run in the MuJoCo/MRT loop. Details and the verification script are documented in the same baseline report.
+The native C++ WBC is merged and passed seven Python comparisons covering four-foot and both diagonal contact sets, nonzero motion and normal-force limits, with maximum torque difference about 6.56e-12 N·m. The `feature/cpp-control-loop` branch now connects local MRT, centroidal/reference conversion, WBC, joint PD and MuJoCo C API in one control process. Python prepares the existing IK target before the run and summarizes results afterward; there are no per-step Python pipe or MRT service calls. The MPC remains an external DDP/SLQ process. See the [C++ implementation and run instructions](docs/cpp_model_baseline.md#本地-mrt-与-c-mujoco-闭环2026-10-15).
+
+```bash
+bash scripts/build_cpp_control.sh
+bash scripts/run_cpp_simulation.sh \
+  --headless --duration 20 --trot-at 3 --stop-trot-at 15 --forward \
+  --csv artifacts/cpp_control_forward.csv
+```
+
+The launcher manages its own MPC on ROS domain 216 by default and writes CSV/JSON results. Remove `--headless` to open the official MuJoCo 3.4.0 Simulate passive viewer with both sidebars, mouse camera controls and visualization menus. The main thread handles the UI, while a C++ worker advances the controlled simulation and synchronizes snapshots. The window is created after MPC reset and the first policy are ready; service-wait progress is printed every 5 s. The latest local official-viewer forward/stop run completed 20 s (2026-10-16, final x=0.090628 m, no torque clips). UI synchronization adds timing overhead; see the baseline report for separate measurements. Reset/keyframe loading requires restarting the run to reset MPC consistently.
+
+Native standing, forward/stop and left/right turn runs each completed 20 s / 10,000 steps. Final forward x was 0.090654 m (target 0.09 m), and final yaw was +9.827° / −9.788°. Excluding the first 2 s, the forward loop averaged 0.199 ms with p99 0.470 ms and 0/9000 steps over 2 ms; maximum start lateness was 1.140 ms. No run clipped torques. These short headless runs do not establish hard real-time or hardware readiness.
 
 Nested timing passed a bridge build, 12 transport tests, isolated service checks and the full closed-loop run above. There were no cache retries or torque clips; final x was 0.090636 m against a 0.09 m target. These timing intervals are nested and must not be added together. The service response type changed; use a rebuilt and restarted MRT node as documented above.
 
 Hardware context (2026-10-15, user reported): a modified Go2 Air with existing SDK2 low-level state-reading and joint-command capability. This project has not yet integrated or independently verified that interface. Sensor availability, joint mapping, control modes, communication-failure behavior and control ownership switching require validation; the deployment compute platform remains to be confirmed.
 
-1. Build on asynchronous MPC, 4 ms policy polling and OSQP reuse by locating remaining control-step overruns. Separate necessary control computation, communication waits and simulation diagnostics; record p95/p99, peaks and accumulated lateness, and validate longer runs.
-2. Move MRT policy evaluation and necessary WBC computation into a local C++ control loop in stages. Compare numerical outputs and closed-loop behavior with the existing Python implementation using matching states and references, reducing per-step pipe and ROS service round trips.
+1. Finish visual acceptance and merge the native C++ loop; validate timing over longer runs and under load, including start lateness and rendering overhead.
+2. Compare upstream SQP and WBC task definitions against the retained DDP/SLQ and validated WBC formulation, changing one major component at a time.
 3. Extend scripted motions to online ROS 2 velocity, heading and gait commands. Validate forward/backward, lateral and combined motion and repeated starts/stops; consolidate launch entry points and dependency/configuration versions. Compare the current DDP/SLQ and upstream SQP paths separately, keeping changes to major modules isolated.
 4. Improve dynamic target lag and stopping touchdown transients by checking landing position, velocity and contact-switch consistency. Test disturbance recovery with defined force pulses and record application point, magnitude, duration, recovery time and constraint violations.
 5. Add IMU, joint-state and contact inputs and validate state estimation against simulation truth. Gradually replace ground-truth base position/velocity inputs and evaluate noise, bias and incorrect contact detection.
@@ -277,7 +288,7 @@ examples/optimization/          Contact-force optimization
 examples/wbc/                   Offline standing and three-foot WBC
 examples/mujoco/                Mapping, standing, squat and single-leg cycles
 examples/ocs2/                  MPC transport and policy diagnostics
-ros2/go2_control_cpp/           C++ model/dynamics and future control core
+ros2/go2_control_cpp/           C++ model, WBC, local MRT and MuJoCo control entry
 ros2/go2_mpc_bridge/            C++ MRT policy query service
 launch/                        OCS2 dummy/RViz launch entry
 src/go2_control/wbc/            Dynamics, kinematics, references and WBC
@@ -286,7 +297,7 @@ src/go2_control/optimization/   QP solver wrappers
 tests/                         Numerical and closed-loop regression tests
 scripts/                       Environment and model-version utilities
 tools/                         Inspection tools
-third_party/                   Unitree model repositories
+third_party/                   Unitree models and pinned official MuJoCo Simulate sources
 artifacts/                     Generated logs and reports
 ```
 
@@ -310,3 +321,5 @@ v0.6.0-mujoco-single-leg-cycle
 Original code and documentation in this project are licensed under the [MIT License](LICENSE). Copyright (c) 2026 CanggouBaiyun.
 
 Third-party code, dependencies, robot models, meshes and other assets remain subject to their respective licenses and copyright notices. This includes content under `third_party/` and files derived from upstream sources, such as the exported Unitree URDF under `models/ocs2/`. The project license does not replace upstream license terms or attribution requirements.
+
+The vendored official MuJoCo Simulate sources use Apache-2.0; their LodePNG dependency retains its zlib-style license. See [source versions and notices](third_party/mujoco_simulate/UPSTREAM.md).
