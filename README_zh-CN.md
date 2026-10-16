@@ -252,14 +252,25 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q
 
 C++ 公共模型/动力学已接入工作空间并完成三组含倾斜和非零速度的 Python/C++ 对照，M/h/J/Jdot·v 最大绝对误差分别约 5.27e-17/8.88e-16/5.55e-17/7.81e-18，电机限制及 armature 一致。操作与范围见[C++ 模型基线](docs/cpp_model_baseline.md)。
 
-C++ WBC 候选已完成原生 OSQP 离线求解和 7 组 Python 对照，覆盖四足、两组对角支撑、非零运动和法向力上限；最大力矩差约 6.56e-12 N·m。候选待应用补丁接入工作空间，尚未接入 MuJoCo/MRT 闭环，见同一基线文档。
+C++ WBC 已合并，完成原生 OSQP 求解和 7 组 Python 对照，覆盖四足、两组对角支撑、非零运动和法向力上限；最大力矩差约 6.56e-12 N·m。`feature/cpp-control-loop` 已将本地 MRT、质心/参考转换、WBC、关节 PD 与 MuJoCo C API 接入同一控制进程。Python 只在启动前生成既有 IK 目标、结束后汇总，逐步控制不再经过 Python 管道或 MRT 查询服务；MPC 暂时保留外部 DDP/SLQ 进程。操作和结果见[C++ 闭环记录](docs/cpp_model_baseline.md#本地-mrt-与-c-mujoco-闭环2026-10-15)。
+
+```bash
+bash scripts/build_cpp_control.sh
+bash scripts/run_cpp_simulation.sh \
+  --headless --duration 20 --trot-at 3 --stop-trot-at 15 --forward \
+  --csv artifacts/cpp_control_forward.csv
+```
+
+脚本默认在 ROS 域 216 管理自己启动的 MPC，并输出 CSV/JSON。删掉 `--headless` 打开官方 MuJoCo 3.4.0 Simulate 被动查看器，包含左右侧栏、鼠标相机操作及可视化菜单；主线程处理界面，C++ 控制线程推进仿真并同步状态。窗口在 MPC 和首条策略就绪后创建，等待服务时每 5 s 输出进度。本地最新官方界面复跑已完整完成 20 s 前进停步（2026-10-16，最终 x=0.090628 m，无力矩截断）；界面同步有额外开销，计时单独记录。Reset/加载关键帧需要重新启动本轮，使 MPC 和仿真一致重置。操作、验证范围及剩余工作见同一记录。
+
+原生站立、前进停步和左右转各完成 20 s / 10,000 步。前进最终 x=0.090654 m（目标 0.09 m），左右转最终 +9.827° / −9.788°。排除前 2 s 后，前进轮完整循环平均/p99 为 0.199/0.470 ms，0/9000 步计算超过 2 ms，最大开始迟到 1.140 ms；四轮均无力矩截断。这些短时无窗口结果尚不证明硬实时或实机可部署。
 
 内部计时已通过 bridge 构建、12 项通信测试、隔离服务检查及上述完整闭环；本轮没有缓存重试，无力矩限幅，最终 x 为 0.090636 m（目标 0.09 m）。计时子项相互嵌套，不能重复相加。服务响应类型已扩展，需使用重新构建并重启的 MRT 节点，操作见同一文档。
 
 实机条件（2026-10-15，用户反馈）：Go2 Air，经现有改装已具备 SDK2 底层状态读取和关节指令发送能力；本项目尚未接入或独立验证该接口。后续需核对实际传感器数据、关节映射、控制模式、通信异常处理及控制权切换行为，部署计算平台待确认。
 
-1. 在已实现的异步 MPC、4 ms 策略检查和 OSQP 复用基础上，分析剩余控制步超时，区分必要控制计算、通信等待和仿真诊断；记录 p95/p99、峰值和累计迟到，验证更长时间运行。
-2. 面向固定频率控制，将 MRT 策略求值与必要的 WBC 计算逐步接入本地 C++ 控制循环；使用现有 Python 实现和相同状态/参考进行数值及闭环对照，减少每个控制步的管道和 ROS 服务往返依赖。
+1. 完成 C++ 闭环窗口观察和当前分支合并，验证更长时间及负载下的时序，包括开始迟到与渲染开销。
+2. 逐项对照上游 SQP 和 WBC 任务定义，与当前保留的 DDP/SLQ、已验证 WBC 比较，每次只改变一个主要模块。
 3. 将脚本化运动扩展为 ROS 2 在线速度、朝向及步态命令，验证前后、横向、组合运动和多次启停；整理启动入口、依赖及配置版本。当前 DDP/SLQ 与上游 SQP 路径的配置和行为差异需另行对照，不同时混改多个关键模块。
 4. 改进动态目标滞后及停步触地瞬态，核对落脚位置、速度和接触切换的一致性；用明确的外力脉冲逐步验证抗扰恢复，记录作用点、大小、持续时间、恢复时间和约束违反情况。
 5. 接入 IMU、关节状态和接触信息，实现在仿真中可与真值比较的状态估计，逐步将基座位置/速度等真值输入替换为估计值；验证噪声、偏置及错误接触判断的影响。
@@ -277,7 +288,7 @@ examples/optimization/          接触力优化
 examples/wbc/                   离线站立与三足 WBC
 examples/mujoco/                映射、站立、蹲起与单腿抬落脚仿真
 examples/ocs2/                  MPC 通信与策略诊断
-ros2/go2_control_cpp/           C++ 模型和动力学，后续控制核心
+ros2/go2_control_cpp/           C++ 模型、WBC、本地 MRT 与 MuJoCo 控制入口
 ros2/go2_mpc_bridge/            C++ MRT 策略查询服务
 launch/                        OCS2 dummy/RViz 启动入口
 src/go2_control/wbc/            动力学、运动学、参考与 WBC
@@ -286,7 +297,7 @@ src/go2_control/optimization/   QP 求解器封装
 tests/                         数值与闭环回归测试
 scripts/                       环境和模型版本记录
 tools/                         检查工具
-third_party/                   Unitree 模型仓库
+third_party/                   Unitree 模型与固定版本的官方 MuJoCo Simulate 源码
 artifacts/                     生成的日志和报告
 ```
 
@@ -310,3 +321,5 @@ v0.6.0-mujoco-single-leg-cycle
 本项目的原创代码与文档采用 [MIT 许可证](LICENSE)。Copyright (c) 2026 CanggouBaiyun。
 
 第三方代码、依赖库、机器人模型、网格及其他资源仍遵循各自的许可证和版权声明，包括 `third_party/` 中的内容，以及从上游资源派生的文件，例如 `models/ocs2/` 下导出的 Unitree URDF。本项目的许可证不替代上游许可条款或署名要求。
+
+随仓库保存的官方 MuJoCo Simulate 源码采用 Apache-2.0，LodePNG 依赖保留其 zlib 风格许可。版本及声明见[源码来源记录](third_party/mujoco_simulate/UPSTREAM.md)。
