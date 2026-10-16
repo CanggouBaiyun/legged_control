@@ -48,7 +48,9 @@ void writeMatrix(std::ostream& out,const Eigen::MatrixXd& m) {
 }
 int main(int argc,char** argv) {
   try {
-    if(argc!=4) throw std::runtime_error("Usage: wbc_replay PROJECT_ROOT INPUT_JSON OUTPUT_JSON");
+    if(argc!=4 && (argc!=5 || std::string(argv[4])!="--single-solve"))
+      throw std::runtime_error("Usage: wbc_replay PROJECT_ROOT INPUT_JSON OUTPUT_JSON [--single-solve]");
+    const bool single_solve=argc==5;
     const auto robot=go2::loadSimulationModel(argv[1]);
     const auto& model=robot.model;
     Tree input; boost::property_tree::read_json(argv[2],input);
@@ -97,6 +99,11 @@ int main(int argc,char** argv) {
       const auto rotation=matrix(r.get_child("desired_base_rotation"));
       if(rotation.rows()!=3 || rotation.cols()!=3) throw std::runtime_error("Expected rotation matrix");
       ref.base_rotation=rotation;
+      if(r.get_child_optional("desired_base_acceleration_generalized")) {
+        const auto acceleration=vector(r.get_child("desired_base_acceleration_generalized"));
+        if(acceleration.size()!=6) throw std::runtime_error("Expected generalized base acceleration6");
+        ref.base_acceleration=acceleration;
+      }
       if(r.get_child_optional("desired_base_linear_velocity_world")) ref.linear_velocity_world=v3(r,"desired_base_linear_velocity_world");
       if(r.get_child_optional("desired_base_angular_velocity_local")) ref.angular_velocity_local=v3(r,"desired_base_angular_velocity_local");
       if(r.get_child_optional("desired_base_linear_acceleration_world")) ref.linear_acceleration_world=v3(r,"desired_base_linear_acceleration_world");
@@ -117,16 +124,19 @@ int main(int argc,char** argv) {
       if(!solvers.count(key)) solvers[key]=std::make_unique<go2::OsqpSolver>(GO2_OSQP_LIBRARY);
       auto& solver=*solvers[key];
       const auto result=wbc.solve(qp,solver);
+      if(!single_solve) {
       auto changed_qp=qp;
       changed_qp.g[0]+=500.0;
       const auto updated=wbc.solve(changed_qp,solver);
       go2::OsqpSolver fresh_solver(GO2_OSQP_LIBRARY);
       const auto fresh=wbc.solve(changed_qp,fresh_solver);
       const double update_error=(updated.qp_solution.x-fresh.qp_solution.x).lpNorm<Eigen::Infinity>();
-      if(update_error>1e-4) throw std::runtime_error("Updated workspace differs from a fresh solve");
+      if(update_error>1e-4)
+        throw std::runtime_error("Updated workspace differs from a fresh solve: max error="+std::to_string(update_error));
       const auto repeated=wbc.solve(qp,solver);
       if((result.qp_solution.x-repeated.qp_solution.x).lpNorm<Eigen::Infinity>()>1e-4)
         throw std::runtime_error("Repeated QP solve changed result");
+      }
       if(!first) out<<','; first=false;
       out<<"{\"name\":\""<<name<<"\",\"H\":"; writeMatrix(out,qp.H);
       out<<",\"g\":"; writeVector(out,qp.g);

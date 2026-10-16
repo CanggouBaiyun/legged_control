@@ -82,6 +82,11 @@ def summarize(path, duration=20.0):
             if len(values) != 1 or values[0] < 0:
                 raise RuntimeError(f"Invalid or changing joint gain: {name}")
             result["joint_gains"][name] = float(values[0])
+    if "centroidal_base_accel" in data.dtype.names:
+        sources = np.unique(data["centroidal_base_accel"])
+        if len(sources) != 1 or sources[0] not in (0, 1):
+            raise RuntimeError("Invalid or changing base acceleration source")
+        result["base_acceleration_source"] = "centroidal" if sources[0] else "tracking"
     walking = data[data["mode"] != 15]
     if len(walking):
         result["first_non_stance_s"] = float(walking["time_s"][0])
@@ -107,6 +112,8 @@ def summarize(path, duration=20.0):
     if "joint_gains" in result:
         gains = result["joint_gains"]
         print(f"Joint gains: Kp={gains['joint_kp']:g}, Kd={gains['joint_kd']:g}")
+    if "base_acceleration_source" in result:
+        print(f"Base acceleration source: {result['base_acceleration_source']}")
     print(f"Final x: {result['final_x_m']:.6f} m; yaw: {result['final_yaw_deg']:.3f} deg; "
           f"torque: {result['maximum_applied_torque_nm']:.3f} Nm; clipped steps: {result['clipped_steps']}")
     for name in ("control_ms", "loop_ms", "control_start_lateness_ms"):

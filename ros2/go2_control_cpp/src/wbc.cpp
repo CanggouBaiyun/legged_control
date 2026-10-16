@@ -7,6 +7,7 @@
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <sstream>
 
 namespace go2 {
 namespace {
@@ -46,15 +47,21 @@ WbcQp Wbc::formulate(const Eigen::VectorXd& q, const Eigen::VectorXd& v,
   qp.equality_target.resize(18+nf);
   qp.equality_target << -dynamics.nonlinear_effects, -dynamics.contact_bias;
 
-  const Eigen::Matrix3d rotation = Eigen::Quaterniond(q[6],q[3],q[4],q[5]).toRotationMatrix();
-  const Eigen::Vector3d kp(30,30,50), kd(8,8,10);
-  const Eigen::Vector3d linear = (ref.linear_acceleration_world +
-      kp.cwiseProduct(ref.base_position-q.head<3>()) +
-      kd.cwiseProduct(ref.linear_velocity_world-rotation*v.head<3>())).cwiseMax(-2.0).cwiseMin(2.0);
-  qp.base_acceleration.head<3>() = rotation.transpose()*linear - v.segment<3>(3).cross(v.head<3>());
-  qp.base_acceleration.tail<3>() = (ref.angular_acceleration_local +
-      40.0*pinocchio::log3(Eigen::Matrix3d(rotation.transpose()*ref.base_rotation)) +
-      8.0*(ref.angular_velocity_local-v.segment<3>(3))).cwiseMax(-5.0).cwiseMin(5.0);
+  if(ref.base_acceleration) {
+    if(!ref.base_acceleration->allFinite())
+      throw std::runtime_error("Invalid generalized base acceleration");
+    qp.base_acceleration=*ref.base_acceleration;
+  } else {
+    const Eigen::Matrix3d rotation = Eigen::Quaterniond(q[6],q[3],q[4],q[5]).toRotationMatrix();
+    const Eigen::Vector3d kp(30,30,50), kd(8,8,10);
+    const Eigen::Vector3d linear = (ref.linear_acceleration_world +
+        kp.cwiseProduct(ref.base_position-q.head<3>()) +
+        kd.cwiseProduct(ref.linear_velocity_world-rotation*v.head<3>())).cwiseMax(-2.0).cwiseMin(2.0);
+    qp.base_acceleration.head<3>() = rotation.transpose()*linear - v.segment<3>(3).cross(v.head<3>());
+    qp.base_acceleration.tail<3>() = (ref.angular_acceleration_local +
+        40.0*pinocchio::log3(Eigen::Matrix3d(rotation.transpose()*ref.base_rotation)) +
+        8.0*(ref.angular_velocity_local-v.segment<3>(3))).cwiseMax(-5.0).cwiseMin(5.0);
+  }
 
   Eigen::VectorXd weights = Eigen::VectorXd::Constant(n,1e-3);
   weights.head<6>().setConstant(1e5);
@@ -121,9 +128,17 @@ WbcResult Wbc::solve(const WbcQp& qp, OsqpSolver& solver) const {
   const Eigen::VectorXd constrained=qp.inequality_matrix*result.qp_solution.x;
   result.dynamics_residual=residual.head(18).norm();
   result.contact_residual=residual.tail(3*contacts_.size()).norm();
+  const double upper_violation=std::max(0.0,(constrained-qp.upper_bound).maxCoeff());
+  const double lower_violation=std::max(0.0,(qp.lower_bound-constrained).maxCoeff());
   if (!residual.allFinite() || !constrained.allFinite() || result.dynamics_residual>1e-3 || result.contact_residual>1e-3 ||
-      (constrained-qp.upper_bound).maxCoeff()>1e-3 || (qp.lower_bound-constrained).maxCoeff()>1e-3)
-    throw std::runtime_error("WBC constraint residual exceeds 1e-3 or is non-finite");
+      upper_violation>1e-3 || lower_violation>1e-3) {
+    std::ostringstream message;
+    message<<"WBC constraint residual exceeds 1e-3 or is non-finite: dynamics="<<result.dynamics_residual
+        <<", contact="<<result.contact_residual<<", upper="<<upper_violation<<", lower="<<lower_violation
+        <<", OSQP primal="<<result.qp_solution.primal_residual<<", dual="<<result.qp_solution.dual_residual
+        <<", iterations="<<result.qp_solution.iterations;
+    throw std::runtime_error(message.str());
+  }
   return result;
 }
 }  // namespace go2

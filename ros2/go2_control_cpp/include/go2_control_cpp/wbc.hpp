@@ -2,6 +2,7 @@
 #include "go2_control_cpp/model.hpp"
 #include <map>
 #include <memory>
+#include <optional>
 
 namespace go2 {
 struct SwingTarget {
@@ -16,6 +17,8 @@ struct WbcReference {
   Eigen::Vector3d angular_velocity_local = Eigen::Vector3d::Zero();
   Eigen::Vector3d linear_acceleration_world = Eigen::Vector3d::Zero();
   Eigen::Vector3d angular_acceleration_local = Eigen::Vector3d::Zero();
+  // Generalized acceleration in the measured free-flyer coordinates.
+  std::optional<Eigen::Matrix<double,6,1>> base_acceleration;
   Eigen::MatrixXd contact_forces;  // Empty selects mass*g/number_of_contacts.
   Eigen::VectorXd normal_force_limits;  // Empty selects the default 100 N.
   std::map<std::string, SwingTarget> swing_targets;

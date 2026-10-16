@@ -77,6 +77,9 @@ QpSolution OsqpSolver::solve(const WbcQp& qp) {
     OSQPSettings settings;
     impl.defaults(&settings);
     settings.verbose=0; settings.polishing=1; settings.max_iter=20000; settings.warm_starting=0;
+    // Default relative tolerances can accept force-bound errors above the
+    // controller's absolute 1e-3 constraint gate, especially if polishing fails.
+    settings.eps_abs=1e-6; settings.eps_rel=1e-6;
     OSQPCscMatrix pc{},ac{};
     impl.csc(&pc,n,n,P.nonZeros(),P.valuePtr(),P.innerIndexPtr(),P.outerIndexPtr());
     impl.csc(&ac,m,n,A.nonZeros(),A.valuePtr(),A.innerIndexPtr(),A.outerIndexPtr());
