@@ -4,6 +4,7 @@ set -eo pipefail
 if [[ "${1:-}" == --help ]]; then
   printf '%s\n' 'Usage: bash scripts/run_cpp_simulation.sh [--headless] [--duration 20]' \
     '  [--mpc-solver ddp|sqp] (default: ddp)' \
+    '  [--joint-kp KP] [--joint-kd KD] (defaults: 20, 1)' \
     '  [--trot-at 3] [--stop-trot-at 15] [--forward] [--turn-angle-deg -10] [--csv PATH]' \
     'Runs one external MPC and the native C++ simulation; closes its own MPC on exit.'
   exit 0

@@ -117,6 +117,7 @@ struct Options {
   std::string target;
   bool headless=false,check_only=false;
   double duration=20,trot_at=-1,stop_at=-1;
+  double joint_kp=20.0,joint_kd=1.0;
 };
 Options options(int argc,char** argv) {
   Options result;
@@ -129,11 +130,15 @@ Options options(int argc,char** argv) {
     else if(key=="--duration") result.duration=std::stod(value());
     else if(key=="--trot-at") result.trot_at=std::stod(value());
     else if(key=="--stop-trot-at") result.stop_at=std::stod(value());
+    else if(key=="--joint-kp") result.joint_kp=std::stod(value());
+    else if(key=="--joint-kd") result.joint_kd=std::stod(value());
     else if(key=="--headless") result.headless=true;
     else if(key=="--check-only") result.check_only=true;
     else if(key=="--help") {
       std::cout<<"Simulation only. --project-root ROOT --target JSON --csv CSV [--headless] "
-          "[--duration SECONDS] [--trot-at SECONDS] [--stop-trot-at SECONDS] [--check-only]\n";
+          "[--duration SECONDS] [--trot-at SECONDS] [--stop-trot-at SECONDS] "
+          "[--joint-kp KP] [--joint-kd KD] [--check-only]\n"
+          "Joint gains default to Kp=20, Kd=1; both must be finite and non-negative.\n";
       std::exit(0);
     } else throw std::runtime_error("Unknown option: "+key);
   }
@@ -143,6 +148,9 @@ Options options(int argc,char** argv) {
       (result.trot_at!=-1 && (result.trot_at<=0 || result.trot_at>=result.duration)) ||
       (result.stop_at!=-1 && (result.trot_at<0 || result.stop_at<=result.trot_at || result.stop_at>=result.duration)))
     throw std::runtime_error("Invalid duration or gait times");
+  if(!std::isfinite(result.joint_kp) || result.joint_kp<0 ||
+      !std::isfinite(result.joint_kd) || result.joint_kd<0)
+    throw std::runtime_error("Joint gains must be finite and non-negative");
   if(result.output.empty()) result.output=result.root/"artifacts/cpp_control.csv";
   return result;
 }
@@ -157,8 +165,8 @@ const std::string columns=
     "mj_floor_fz_fl_n,mj_floor_fz_fr_n,mj_floor_fz_rl_n,mj_floor_fz_rr_n,"
     "mpc_fz_fl_n,mpc_fz_fr_n,mpc_fz_rl_n,mpc_fz_rr_n,"
     "wbc_fz_fl_n,wbc_fz_fr_n,wbc_fz_rl_n,wbc_fz_rr_n,measured_roll_rad,measured_pitch_rad,"
-    "policy_controller_type";
-using Row=std::array<double,56>;
+    "policy_controller_type,joint_kp,joint_kd";
+using Row=std::array<double,58>;
 void write(const std::filesystem::path& path,const std::vector<Row>& rows) {
   if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
   std::ofstream out(path); out<<std::setprecision(17)<<columns<<'\n';
@@ -203,6 +211,8 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
   std::cout<<"Native C++ control started; epoch="<<mrt.identity().epoch
     <<"; policy="
     <<(controller_type==ocs2::ControllerType::LINEAR ? "linear" : "feedforward")
+    <<"; joint_kp="<<opts.joint_kp
+    <<"; joint_kd="<<opts.joint_kd
     <<std::endl;
   go2::CentroidalState last_input=go2::CentroidalState::Zero();
   bool trot_sent=false,stance_sent=false;
@@ -261,7 +271,9 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       auto& wbc=*controllers.at(mode);
       const auto result=wbc.solve(wbc.formulate(q,v,reference),*solvers.at(mode));
       const auto wbc_end=Clock::now();
-      const Eigen::VectorXd feedback=20.0*(point.q.tail<12>()-q.tail<12>())+(point.v.tail<12>()-v.tail<12>());
+      const Eigen::VectorXd feedback=
+          opts.joint_kp*(point.q.tail<12>()-q.tail<12>())+
+          opts.joint_kd*(point.v.tail<12>()-v.tail<12>());
       const Eigen::VectorXd torques=result.torques+feedback;
       const double clip=sim.command(torques);
       last_input=input_ref;
@@ -292,6 +304,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       }
       row[53]=rpy[0]; row[54]=rpy[1];
       row[55]=static_cast<int>(policy.controllerPtr_->getType());
+      row[56]=opts.joint_kp; row[57]=opts.joint_kd;
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();

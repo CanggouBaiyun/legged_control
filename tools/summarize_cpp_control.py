@@ -72,6 +72,16 @@ def summarize(path, duration=20.0):
             controller_names[int(value)]: int((data["policy_controller_type"] == value).sum())
             for value in types
         }
+    gain_columns = ("joint_kp", "joint_kd")
+    if any(name in data.dtype.names for name in gain_columns):
+        if not all(name in data.dtype.names for name in gain_columns):
+            raise RuntimeError("Incomplete joint-gain metadata in CSV")
+        result["joint_gains"] = {}
+        for name in gain_columns:
+            values = np.unique(data[name])
+            if len(values) != 1 or values[0] < 0:
+                raise RuntimeError(f"Invalid or changing joint gain: {name}")
+            result["joint_gains"][name] = float(values[0])
     walking = data[data["mode"] != 15]
     if len(walking):
         result["first_non_stance_s"] = float(walking["time_s"][0])
@@ -94,6 +104,9 @@ def summarize(path, duration=20.0):
     print(f"Completed {duration:g} s / {len(data)} steps; modes: {result['mode_samples']}")
     if "policy_controller_samples" in result:
         print(f"Policy controller samples: {result['policy_controller_samples']}")
+    if "joint_gains" in result:
+        gains = result["joint_gains"]
+        print(f"Joint gains: Kp={gains['joint_kp']:g}, Kd={gains['joint_kd']:g}")
     print(f"Final x: {result['final_x_m']:.6f} m; yaw: {result['final_yaw_deg']:.3f} deg; "
           f"torque: {result['maximum_applied_torque_nm']:.3f} Nm; clipped steps: {result['clipped_steps']}")
     for name in ("control_ms", "loop_ms", "control_start_lateness_ms"):
