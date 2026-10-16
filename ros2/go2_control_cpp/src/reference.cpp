@@ -103,4 +103,81 @@ WbcReference ReferenceMapping::reference(const Eigen::VectorXd& measured_q,
   }
   return ref;
 }
+Eigen::Matrix<double,6,1> baseAccelerationInMeasuredFrame(
+    const ReferencePoint& desired,
+    const Eigen::Matrix<double,6,1>& desired_acceleration,
+    const Eigen::VectorXd& measured_q,const Eigen::VectorXd& measured_v) {
+  if(desired.v.size()!=18 || measured_q.size()!=19 || measured_v.size()!=18 ||
+      !desired.v.allFinite() || !desired.rotation.allFinite() ||
+      !desired_acceleration.allFinite() || !measured_q.allFinite() || !measured_v.allFinite() ||
+      std::abs(measured_q.segment<4>(3).norm()-1.0)>1e-8)
+    throw std::runtime_error("Invalid base acceleration coordinate conversion");
+  const Eigen::Matrix3d measured_rotation=Eigen::Quaterniond(
+      measured_q[6],measured_q[3],measured_q[4],measured_q[5]).toRotationMatrix();
+  const Eigen::Vector3d linear_world=desired.rotation*(
+      desired_acceleration.head<3>()+desired.v.segment<3>(3).cross(desired.v.head<3>()));
+  const Eigen::Vector3d angular_world=desired.rotation*desired_acceleration.tail<3>();
+  Eigen::Matrix<double,6,1> result;
+  result.head<3>()=measured_rotation.transpose()*linear_world-
+      measured_v.segment<3>(3).cross(measured_v.head<3>());
+  result.tail<3>()=measured_rotation.transpose()*angular_world;
+  if(!result.allFinite()) throw std::runtime_error("Non-finite base acceleration conversion");
+  return result;
+}
+Eigen::Matrix<double,6,1> ReferenceMapping::centroidalBaseAcceleration(
+    const ReferencePoint& desired,
+    const CentroidalState& input,
+    const Eigen::VectorXd& joint_acceleration) {
+  if(desired.q.size()!=19 || desired.v.size()!=18 ||
+      joint_acceleration.size()!=12 ||
+      !desired.q.allFinite() || !desired.v.allFinite() ||
+      !input.allFinite() || !joint_acceleration.allFinite() ||
+      std::abs(desired.q.segment<4>(3).norm()-1.0)>1e-8)
+    throw std::runtime_error("Invalid centroidal acceleration reference");
+
+  // Computes A, its time derivative, and the world-frame center of mass.
+  pinocchio::dccrba(model_,data_,desired.q,desired.v);
+  const Eigen::Matrix<double,6,18> A=data_.Ag;
+  const Eigen::Matrix<double,6,18> Adot=data_.dAg;
+  const Eigen::Vector3d com=data_.com[0];
+
+  // Physical momentum rate: world-frame force and moment about the COM.
+  Eigen::Matrix<double,6,1> momentum_rate;
+  momentum_rate.head<3>()=mass_*model_.gravity.linear();
+  momentum_rate.tail<3>().setZero();
+
+  for(int i=0;i<4;++i) {
+    const auto& position=desired.feet.at(ocs2Feet()[i]).position;
+    if(!position.allFinite())
+      throw std::runtime_error("Invalid desired foot position");
+
+    const Eigen::Vector3d force=input.segment<3>(3*i);
+    momentum_rate.head<3>()+=force;
+    momentum_rate.tail<3>()+=(position-com).cross(force);
+  }
+
+  // Convert OCS2 joint order to Pinocchio velocity order.
+  Eigen::Matrix<double,12,1> joint_acceleration_pin;
+  joint_acceleration_pin.setZero();
+  for(int i=0;i<12;++i)
+    joint_acceleration_pin[vi_[i]-6]=joint_acceleration[i];
+
+  const Eigen::Matrix<double,6,6> base=A.leftCols<6>();
+  const Eigen::Matrix<double,6,1> rhs=
+      momentum_rate-Adot*desired.v-
+      A.rightCols<12>()*joint_acceleration_pin;
+
+  const auto lu=base.fullPivLu();
+  if(!lu.isInvertible())
+    throw std::runtime_error("Singular centroidal acceleration mapping");
+
+  const Eigen::Matrix<double,6,1> acceleration=lu.solve(rhs);
+  if(!acceleration.allFinite() ||
+      (base*acceleration-rhs).norm()>1e-8*(1.0+rhs.norm()))
+    throw std::runtime_error("Centroidal acceleration reconstruction failed");
+
+  return acceleration;
+}
+
+
 }  // namespace go2

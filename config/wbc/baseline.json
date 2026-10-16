@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "swing_kp": 100.0,
+  "swing_kd": 20.0,
+  "swing_acceleration_feedforward": true,
+  "base_weight": 100000.0,
+  "swing_weight": 100000.0,
+  "force_weight": 1.0,
+  "joint_regularization": 0.001,
+  "torque_regularization": 0.0001
+}

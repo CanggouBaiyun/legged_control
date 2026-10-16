@@ -72,6 +72,42 @@ def summarize(path, duration=20.0):
             controller_names[int(value)]: int((data["policy_controller_type"] == value).sum())
             for value in types
         }
+    gain_columns = ("joint_kp", "joint_kd")
+    if any(name in data.dtype.names for name in gain_columns):
+        if not all(name in data.dtype.names for name in gain_columns):
+            raise RuntimeError("Incomplete joint-gain metadata in CSV")
+        result["joint_gains"] = {}
+        for name in gain_columns:
+            values = np.unique(data[name])
+            if len(values) != 1 or values[0] < 0:
+                raise RuntimeError(f"Invalid or changing joint gain: {name}")
+            result["joint_gains"][name] = float(values[0])
+    if "centroidal_base_accel" in data.dtype.names:
+        sources = np.unique(data["centroidal_base_accel"])
+        if len(sources) != 1 or sources[0] not in (0, 1):
+            raise RuntimeError("Invalid or changing base acceleration source")
+        result["base_acceleration_source"] = "centroidal" if sources[0] else "tracking"
+    wbc_fields = (
+        "swing_kp", "swing_kd", "swing_acceleration_feedforward",
+        "base_weight", "swing_weight", "force_weight",
+        "joint_regularization", "torque_regularization",
+    )
+    if any(f"wbc_{name}" in data.dtype.names for name in wbc_fields):
+        if not all(f"wbc_{name}" in data.dtype.names for name in wbc_fields):
+            raise RuntimeError("Incomplete WBC settings in CSV")
+        result["wbc_settings"] = {}
+        for name in wbc_fields:
+            values = np.unique(data[f"wbc_{name}"])
+            if len(values) != 1:
+                raise RuntimeError(f"Changing WBC setting: {name}")
+            value = float(values[0])
+            if name == "swing_acceleration_feedforward":
+                if value not in (0, 1):
+                    raise RuntimeError("Invalid WBC acceleration-feedforward flag")
+                value = bool(value)
+            elif (value < 0 if name in ("swing_kp", "swing_kd") else value <= 0):
+                raise RuntimeError(f"Invalid WBC setting: {name}")
+            result["wbc_settings"][name] = value
     walking = data[data["mode"] != 15]
     if len(walking):
         result["first_non_stance_s"] = float(walking["time_s"][0])
@@ -94,6 +130,13 @@ def summarize(path, duration=20.0):
     print(f"Completed {duration:g} s / {len(data)} steps; modes: {result['mode_samples']}")
     if "policy_controller_samples" in result:
         print(f"Policy controller samples: {result['policy_controller_samples']}")
+    if "joint_gains" in result:
+        gains = result["joint_gains"]
+        print(f"Joint gains: Kp={gains['joint_kp']:g}, Kd={gains['joint_kd']:g}")
+    if "base_acceleration_source" in result:
+        print(f"Base acceleration source: {result['base_acceleration_source']}")
+    if "wbc_settings" in result:
+        print(f"WBC settings: {result['wbc_settings']}")
     print(f"Final x: {result['final_x_m']:.6f} m; yaw: {result['final_yaw_deg']:.3f} deg; "
           f"torque: {result['maximum_applied_torque_nm']:.3f} Nm; clipped steps: {result['clipped_steps']}")
     for name in ("control_ms", "loop_ms", "control_start_lateness_ms"):
