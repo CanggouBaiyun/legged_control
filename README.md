@@ -6,6 +6,8 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 
 **Current scope:** closed-loop standing, squatting, load transfer, a complete right-front single-leg cycle and in-place trot in MuJoCo, plus initial low-speed forward, ±10° yaw turns and return-to-stance validation. Go2 full-centroidal OCS2 MPC drives mode-dependent WBC through ROS 2 and a C++ MRT policy-query service. Turning foot motion and contact-point tangent speeds are recorded; transient tracking lag and touchdown slip remain to be investigated. State estimation, the Unitree SDK2 interface and hardware safety remain to be implemented.
 
+**Latest native C++ path (2026-10-17):** SQP → local MRT → C++ WBC → MuJoCo supports unlimited interactive keyboard sessions through `--online`. Low-speed forward, backward, lateral, left/right turn and combined-motion scenarios have completed; terminal keyboard input, manual exit and one positive yaw crossing through +π were also verified. Occasional control overruns and a prior WBC failure remain pending. Earlier Python-path results are retained below. See [keyboard operation and results](docs/cpp_model_baseline.md#常驻窗口与键盘入口).
+
 ## Status
 
 | Component | Status |
@@ -33,6 +35,7 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | OSQP workspace reuse | Latest 20 s trot/stop: 4 setups and 9996 updates across 10000 steps; mean WBC 0.628 ms, mean loop 1.733 ms, maximum start lateness 7.36 ms. 2118/10000 loops still exceeded 2 ms; fixed 500 Hz remains unverified |
 | Asynchronous forward/stop | 20 s with 4 ms policy polling completed: median policy age 28 → 22 ms and moving-phase x RMSE 13.770 → 12.218 mm; synchronous comparison 9.793 mm. Final x 0.090449 m for a 0.09 m goal; mean loop 1.700 ms, maximum start lateness 8.38 ms. Tracking lag and fixed 500 Hz execution remain unresolved. See [forward results](docs/ocs2_forward_trot.md) |
 | Asynchronous left/right turns and stop | Separate 20 s runs at ±10° completed with 4 ms polling: final yaw +9.829° / −9.794°, moving-phase target RMSE 2.171° / 2.174°, no torque clipping. Right-turn touchdown contact tangent-speed peak reached 103.88 mm/s; transients remain unresolved. See [turning results](docs/ocs2_trot_yaw.md) |
+| Native C++ online commands | Unlimited keyboard sessions; T/G gait, WASD motion, Q/E turning, Space stop. Finite 70 s motion scenarios and one positive +π crossing verified; reverse/repeated crossings remain pending. See [keyboard guide](docs/cpp_model_baseline.md#常驻窗口与键盘入口) |
 | Disturbance recovery | Planned |
 | SDK2, state estimation and hardware safety | Planned |
 

@@ -8,6 +8,8 @@
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/math/rpy.hpp>
 #include <fstream>
+#include <condition_variable>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <set>
@@ -159,7 +161,7 @@ struct Options {
   std::string target;
   std::string wbc_config;
   go2::WbcSettings wbc_settings;
-  bool headless=false,check_only=false;
+  bool headless=false,check_only=false,online=false,duration_given=false;
   bool centroidal_base_accel=false;
   double duration=20,trot_at=-1,stop_at=-1;
   double joint_kp=20.0,joint_kd=1.0;
@@ -172,29 +174,35 @@ Options options(int argc,char** argv) {
     if(key=="--project-root") result.root=value();
     else if(key=="--target") result.target=value();
     else if(key=="--csv") result.output=value();
-    else if(key=="--duration") result.duration=std::stod(value());
+    else if(key=="--duration") {result.duration=std::stod(value()); result.duration_given=true;}
     else if(key=="--trot-at") result.trot_at=std::stod(value());
     else if(key=="--stop-trot-at") result.stop_at=std::stod(value());
     else if(key=="--joint-kp") result.joint_kp=std::stod(value());
     else if(key=="--joint-kd") result.joint_kd=std::stod(value());
     else if(key=="--wbc-config") result.wbc_config=value();
     else if(key=="--centroidal-base-accel") result.centroidal_base_accel=true;
+    else if(key=="--online") result.online=true;
     else if(key=="--headless") result.headless=true;
     else if(key=="--check-only") result.check_only=true;
     else if(key=="--help") {
-      std::cout<<"Simulation only. --project-root ROOT --target JSON --csv CSV [--headless] "
+      std::cout<<"Simulation only. --project-root ROOT --target JSON --csv CSV [--headless] [--online] "
           "[--duration SECONDS] [--trot-at SECONDS] [--stop-trot-at SECONDS] "
           "[--joint-kp KP] [--joint-kd KD] [--centroidal-base-accel] [--wbc-config JSON] [--check-only]\n"
           "Joint gains default to Kp=20, Kd=1; both must be finite and non-negative.\n"
+          "Online mode accepts external targets and gait commands; scripted runs are limited to 20 s.\n"
+          "Online mode runs until user exit when --duration is omitted or zero.\n"
           "WBC paths are relative to the project root; omitting --wbc-config keeps built-in defaults.\n";
       std::exit(0);
     } else throw std::runtime_error("Unknown option: "+key);
   }
   if(result.root.empty() || result.target.empty()) throw std::runtime_error("--project-root and --target are required");
-  if(!std::isfinite(result.duration) || result.duration<=0 || result.duration>20 ||
+  if(result.online && !result.duration_given) result.duration=0;
+  if(!std::isfinite(result.duration) || result.duration<0 || (!result.online && result.duration==0) ||
+      (!result.online && result.duration>20) ||
       !std::isfinite(result.trot_at) || !std::isfinite(result.stop_at) ||
-      (result.trot_at!=-1 && (result.trot_at<=0 || result.trot_at>=result.duration)) ||
-      (result.stop_at!=-1 && (result.trot_at<0 || result.stop_at<=result.trot_at || result.stop_at>=result.duration)))
+      (result.trot_at!=-1 && (result.trot_at<=0 || (result.duration>0 && result.trot_at>=result.duration))) ||
+      (result.stop_at!=-1 && (result.trot_at<0 || result.stop_at<=result.trot_at ||
+                            (result.duration>0 && result.stop_at>=result.duration))))
     throw std::runtime_error("Invalid duration or gait times");
   if(!std::isfinite(result.joint_kp) || result.joint_kp<0 ||
       !std::isfinite(result.joint_kd) || result.joint_kd<0)
@@ -258,22 +266,93 @@ const std::string columns=
     "policy_controller_type,joint_kp,joint_kd,centroidal_base_accel,"
     "wbc_swing_kp,wbc_swing_kd,wbc_swing_acceleration_feedforward,"
     "wbc_base_weight,wbc_swing_weight,wbc_force_weight,wbc_joint_regularization,wbc_torque_regularization,"
-    "wbc_iterations,osqp_setup_count,osqp_update_count";
-using Row=std::array<double,70>;
-void write(const std::filesystem::path& path,const std::vector<Row>& rows) {
-  if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
-  std::ofstream out(path); out<<std::setprecision(17)<<columns<<'\n';
-  for(const auto& row:rows) {for(std::size_t j=0;j<row.size();++j) {if(j) out<<','; if(std::isfinite(row[j])) out<<row[j];} out<<'\n';}
-  out.close(); if(!out) throw std::runtime_error("Failed writing control CSV");
-}
+    "wbc_iterations,osqp_setup_count,osqp_update_count,"
+    "online_mode,goal_y_m,mpc_y_m,measured_y_m,"
+    "goal_com_vx_world_mps,goal_com_vy_world_mps,"
+    "measured_com_vx_world_mps,measured_com_vy_world_mps,"
+    "active_target_start_s,active_target_end_s";
+using Row=std::array<double,80>;
+// The controller submits one second of rows at a time. Disk I/O runs on a
+// separate thread, with a bounded queue even in an unlimited interactive run.
+class ControlLog {
+ public:
+  explicit ControlLog(const std::filesystem::path& path) {
+    if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+    out_.open(path);
+    out_<<std::setprecision(17)<<columns<<'\n';
+    if(!out_) throw std::runtime_error("Cannot open control CSV");
+    worker_=std::thread([this] {
+      try {
+        for(;;) {
+          std::vector<Row> chunk;
+          {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ready_.wait(lock,[this] {return stopping_ || !pending_.empty();});
+            if(pending_.empty()) break;
+            chunk=std::move(pending_.front()); pending_.pop_front();
+          }
+          for(const auto& row:chunk) {
+            for(std::size_t j=0;j<row.size();++j) {
+              if(j) out_<<',';
+              if(std::isfinite(row[j])) out_<<row[j];
+            }
+            out_<<'\n';
+          }
+          out_.flush();
+          if(!out_) throw std::runtime_error("Failed writing control CSV");
+        }
+      } catch(...) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        error_=std::current_exception(); stopping_=true; pending_.clear();
+      }
+    });
+  }
+  ~ControlLog() {stop();}
+  void submit(std::vector<Row>& rows, bool timed=false,Clock::time_point begin={}) {
+    if(rows.empty()) return;
+    std::vector<Row> replacement; replacement.reserve(500);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if(error_) std::rethrow_exception(error_);
+      if(pending_.size()>=8) throw std::runtime_error("Control CSV writer is not keeping up");
+      if(timed) {
+        const double elapsed=milliseconds(begin);
+        rows.back()[29]+=elapsed-rows.back()[31];
+        rows.back()[31]=elapsed;
+      }
+      samples_+=rows.size();
+      pending_.push_back(std::move(rows)); rows=std::move(replacement);
+    }
+    ready_.notify_one();
+  }
+  void finish(std::vector<Row>& rows) {
+    submit(rows); stop();
+    if(error_) std::rethrow_exception(error_);
+    out_.flush();
+    if(!out_) throw std::runtime_error("Failed flushing control CSV");
+  }
+  std::size_t samples() const {return samples_;}
+ private:
+  void stop() {
+    {std::lock_guard<std::mutex> lock(mutex_); stopping_=true;}
+    ready_.notify_one();
+    if(worker_.joinable()) worker_.join();
+  }
+  std::ofstream out_;
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<std::vector<Row>> pending_;
+  std::thread worker_;
+  std::exception_ptr error_;
+  bool stopping_=false;
+  std::size_t samples_=0;
+};
 void run(const Options& opts,const go2::RobotModel& robot,const Target& target,go2::ReferenceMapping& mapping) {
   go2::Simulation sim(opts.root,robot);
   if(std::abs(sim.timestep()-.002)>1e-12) throw std::runtime_error("Expected 2 ms simulation steps");
   Eigen::VectorXd q,v; sim.state(q,v);
   const auto initial=target.unpack(target.tree.get_child("initial"),robot);
   if((q-initial.first).norm()>1e-10 || (v-initial.second).norm()>1e-10) throw std::runtime_error("Target initial state differs from MuJoCo home");
-  if(opts.trot_at<0 && (target.tree.get<bool>("forward") || std::abs(target.tree.get<double>("turn_angle_deg"))>0))
-    throw std::runtime_error("Forward/turn targets require --trot-at");
   std::map<std::size_t,std::unique_ptr<go2::Wbc>> controllers;
   std::map<std::size_t,std::unique_ptr<go2::OsqpSolver>> solvers;
   for(std::size_t mode:{15,9,6}) {
@@ -282,7 +361,16 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
   }
   pinocchio::Data diagnostic_data(robot.model);
   go2::LocalMrt mrt;
-  mrt.initialize(target.trajectory);
+  auto startup_target=target.trajectory;
+  if(opts.online) {
+    const ocs2::vector_t initial_state=target.trajectory.stateTrajectory.front();
+    const ocs2::vector_t zero_input=ocs2::vector_t::Zero(24);
+    startup_target=ocs2::TargetTrajectories(
+        {0.0,1.0},
+        {initial_state,initial_state},
+        {zero_input,zero_input});
+  }
+  mrt.initialize(startup_target);
   ocs2::SystemObservation obs;
   obs.time=0; obs.mode=15; obs.state=mapping.state(q,v); obs.input=go2::CentroidalState::Zero();
   const auto deadline=Clock::now()+std::chrono::seconds(30);
@@ -307,21 +395,28 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
     <<"; joint_kp="<<opts.joint_kp
     <<"; joint_kd="<<opts.joint_kd
     <<"; base_accel="<<(opts.centroidal_base_accel ? "centroidal" : "tracking")
+    <<"; target="<<(opts.online ? "online" : "scripted")
+    <<"; session="<<(opts.duration==0 ? "until user exit" : "timed")
     <<std::endl;
   go2::CentroidalState last_input=go2::CentroidalState::Zero();
+  double continuous_yaw=obs.state[9];
   bool trot_sent=false,stance_sent=false;
   std::size_t mode=15,step=0;
-  std::vector<Row> rows; rows.reserve(std::lround(opts.duration/.002));
+  ControlLog log(opts.output);
+  std::vector<Row> rows; rows.reserve(500);
+  const auto requested_steps=opts.duration>0 ? static_cast<std::size_t>(std::lround(opts.duration/.002)) : 0;
   const auto wall_start=Clock::now();
   try {
-    for(;step<static_cast<std::size_t>(std::lround(opts.duration/.002)) && rclcpp::ok() && sim.running();++step) {
+    for(;(opts.duration==0 || step<requested_steps) && rclcpp::ok() && sim.running();++step) {
       const double stamp=sim.time();
       const auto scheduled=wall_start+std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(stamp));
       std::this_thread::sleep_until(scheduled);
       const auto begin=Clock::now();
       const double lateness=std::max(0.0,milliseconds(scheduled,begin));
       sim.state(q,v);
-      const auto current_state=mapping.state(q,v);
+      auto current_state=mapping.state(q,v);
+      continuous_yaw+=std::remainder(current_state[9]-continuous_yaw,2.0*std::acos(-1.0));
+      current_state[9]=continuous_yaw;
       const auto state_end=Clock::now();
       if(step%10==0) {
         if(opts.trot_at>0 && !trot_sent && stamp+1e-9>=opts.trot_at) {mrt.gait(true); trot_sent=true;}
@@ -352,7 +447,8 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
           !state_ref.allFinite() || !input_ref.allFinite() || !nominal_input.allFinite() ||
           !future_state.allFinite() || !future_input.allFinite())
         throw std::runtime_error("Invalid local MRT reference result");
-      if(opts.trot_at<0 && (mode!=15 || future_mode!=15)) throw std::runtime_error("Standing run received a walking mode");
+      if(!opts.online && opts.trot_at<0 && (mode!=15 || future_mode!=15))
+        throw std::runtime_error("Standing run received a walking mode");
       const auto mrt_end=Clock::now();
       // Current feedback input supplies joint-PD velocity references.
       const auto point=mapping.point(state_ref,input_ref);
@@ -411,7 +507,20 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       const auto command_end=Clock::now();
       sim.step();
       const auto simulation_end=Clock::now();
-      const auto goal=target.goal(stamp);
+      go2::CentroidalState goal;
+      const auto& active_target_trajectory=mrt.getCommand().mpcTargetTrajectories_;
+      if(opts.online) {
+        if(active_target_trajectory.empty() ||
+            active_target_trajectory.timeTrajectory.back()<stamp-1e-6)
+          throw std::runtime_error("Online MPC target expired");
+        const auto active_target=
+            active_target_trajectory.getDesiredState(stamp);
+        if(active_target.size()!=24 || !active_target.allFinite())
+          throw std::runtime_error("Invalid active MPC target state");
+        goal=active_target;
+      } else {
+        goal=target.goal(stamp);
+      }
       const Eigen::Matrix3d rotation=Eigen::Quaterniond(q[6],q[3],q[4],q[5]).toRotationMatrix();
       const Eigen::Vector3d rpy=pinocchio::rpy::matrixToRpy(rotation);
       pinocchio::forwardKinematics(robot.model,diagnostic_data,q);
@@ -419,7 +528,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       const auto floor=sim.floorForces();
       const auto& id=mrt.identity();
       Row row{};
-      row={stamp,double(mode),goal[6],state_ref[6],q[0],goal[9],state_ref[9],rpy[2],goal[8],state_ref[8],q[2],
+      row={stamp,double(mode),goal[6],state_ref[6],q[0],goal[9],state_ref[9],continuous_yaw,goal[8],state_ref[8],q[2],
           result.torques.cwiseAbs().maxCoeff(),feedback.cwiseAbs().maxCoeff(),sim.maximumAppliedTorque(),clip,
           result.dynamics_residual,result.contact_residual,double(id.epoch),double(id.sequence),1000*(stamp-id.observation_time),double(updated),
           milliseconds(begin,state_end),milliseconds(state_end,policy_end),milliseconds(policy_end,mrt_end),
@@ -446,27 +555,39 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       row[67]=double(result.qp_solution.iterations);
       row[68]=double(solvers.at(mode)->setupCount());
       row[69]=double(solvers.at(mode)->updateCount());
+      row[70]=double(opts.online);
+      row[71]=goal[7]; row[72]=state_ref[7]; row[73]=q[1];
+      row[74]=goal[0]; row[75]=goal[1];
+      row[76]=current_state[0]; row[77]=current_state[1];
+      row[78]=active_target_trajectory.timeTrajectory.front();
+      row[79]=active_target_trajectory.timeTrajectory.back();
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();
       row[28]=milliseconds(command_end,simulation_end); row[32]=lateness;
       rows.push_back(row);
       if(step%500==0) std::cout<<"t="<<std::fixed<<std::setprecision(3)<<stamp<<" mode="<<mode
-          <<" z="<<q[2]<<" x="<<q[0]<<" yaw="<<rpy[2]<<" age="<<row[19]<<"ms control="<<row[27]<<"ms"<<std::endl;
+          <<" z="<<q[2]<<" x="<<q[0]<<" yaw="<<continuous_yaw<<" age="<<row[19]<<"ms control="<<row[27]<<"ms"<<std::endl;
       const auto end=Clock::now();
       rows.back()[29]=milliseconds(simulation_end,diagnostics_end)+milliseconds(viewer_end,end);
       rows.back()[30]=milliseconds(diagnostics_end,viewer_end);
       rows.back()[31]=milliseconds(begin,end);
+      if(rows.size()>=500) log.submit(rows,true,begin);
     }
     sim.command(Eigen::VectorXd::Zero(12));
-    if(step!=static_cast<std::size_t>(std::lround(opts.duration/.002))) throw std::runtime_error("Simulation interrupted before requested duration");
-    write(opts.output,rows);
-    std::cout<<"Completed "<<rows.size()<<" steps; rejected policies="<<mrt.rejected()<<"; CSV: "<<opts.output<<std::endl;
+    if(opts.duration>0 && step!=requested_steps) throw std::runtime_error("Simulation interrupted before requested duration");
+    log.finish(rows);
+    std::cout<<"Completed "<<log.samples()<<" steps; rejected policies="<<mrt.rejected()<<"; CSV: "<<opts.output<<std::endl;
   } catch(...) {
+    const auto error=std::current_exception();
     sim.command(Eigen::VectorXd::Zero(12));
-    write(opts.output,rows);
+    log.finish(rows);
+    if(opts.duration==0 && !rclcpp::ok()) {
+      std::cout<<"Interactive session ended by user; "<<log.samples()<<" steps; CSV: "<<opts.output<<std::endl;
+    } else {
     std::cerr<<"Stopped at t="<<sim.time()<<"; partial CSV saved: "<<opts.output<<'\n';
-    throw;
+    std::rethrow_exception(error);
+    }
   }
    } catch(...) {control_error=std::current_exception();}
    sim.closeViewer();
@@ -495,6 +616,13 @@ int main(int argc,char** argv) {
     for(const auto& item:wbcSettingsTree(opts.wbc_settings))
       std::cout<<"  "<<item.first<<"="<<item.second.data()<<'\n';
     const Target target(opts.target,opts.root);
+    const bool scripted_motion=
+        target.tree.get<bool>("forward") ||
+        std::abs(target.tree.get<double>("turn_angle_deg"))>0;
+    if(opts.online && scripted_motion)
+      throw std::runtime_error("Online mode cannot use scripted forward/turn targets");
+    if(!opts.online && opts.trot_at<0 && scripted_motion)
+      throw std::runtime_error("Forward/turn targets require --trot-at");
     go2::ReferenceMapping mapping(robot.model,target.joints);
     target.check(mapping,robot);
     if(opts.check_only) return 0;
