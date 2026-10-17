@@ -3,6 +3,7 @@
 #include <Eigen/SparseCore>
 #include <dlfcn.h>
 #include <cmath>
+#include <sstream>
 #include <stdexcept>
 #include <type_traits>
 
@@ -132,9 +133,20 @@ QpSolution OsqpSolver::solve(const WbcQp& qp) {
     }
     ++impl.updates;
   }
-  if (impl.run(impl.solver)!=0 || !impl.solver->info || impl.solver->info->status_val!=OSQP_SOLVED ||
-      !impl.solver->solution || !impl.solver->solution->x)
-    throw std::runtime_error("OSQP solve failed or did not reach solved status");
+  const auto exit_code=impl.run(impl.solver);
+  if (exit_code!=0 || !impl.solver->info || impl.solver->info->status_val!=OSQP_SOLVED ||
+      !impl.solver->solution || !impl.solver->solution->x) {
+    std::ostringstream message;
+    message<<"OSQP solve failed: exit_code="<<exit_code;
+    if(impl.solver->info) {
+      const auto& info=*impl.solver->info;
+      message<<", status="<<info.status<<", status_value="<<info.status_val
+          <<", iterations="<<info.iter<<", primal="<<info.prim_res
+          <<", dual="<<info.dual_res;
+    }
+    message<<", setups="<<impl.setups<<", updates="<<impl.updates;
+    throw std::runtime_error(message.str());
+  }
   QpSolution result;
   result.x=Eigen::Map<Eigen::VectorXd>(impl.solver->solution->x,n);
   result.status=impl.solver->info->status;
