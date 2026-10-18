@@ -270,8 +270,17 @@ const std::string columns=
     "online_mode,goal_y_m,mpc_y_m,measured_y_m,"
     "goal_com_vx_world_mps,goal_com_vy_world_mps,"
     "measured_com_vx_world_mps,measured_com_vy_world_mps,"
-    "active_target_start_s,active_target_end_s";
-using Row=std::array<double,80>;
+    "active_target_start_s,active_target_end_s,"
+    "sensor_time_s,"
+    "imu_quat_w,imu_quat_x,imu_quat_y,imu_quat_z,"
+    "imu_gyro_x_radps,imu_gyro_y_radps,imu_gyro_z_radps,"
+    "imu_specific_force_x_mps2,imu_specific_force_y_mps2,imu_specific_force_z_mps2,"
+    "sensor_joint_position_max_error_rad,"
+    "sensor_joint_velocity_max_error_radps,"
+    "sensor_orientation_error_rad,"
+    "sensor_gyro_error_radps,"
+    "sensor_read_ms";
+using Row=std::array<double,96>;
 // The controller submits one second of rows at a time. Disk I/O runs on a
 // separate thread, with a bounded queue even in an unlimited interactive run.
 class ControlLog {
@@ -414,6 +423,40 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       const auto begin=Clock::now();
       const double lateness=std::max(0.0,milliseconds(scheduled,begin));
       sim.state(q,v);
+      const auto sensor_begin = Clock::now();
+      const auto sensors = sim.sensors();
+      const double sensor_read_ms = milliseconds(sensor_begin);
+
+      if(std::abs(sensors.time_s - stamp) > 1e-9){
+        throw std::runtime_error(
+          "Sensor time differs from current control time"
+        );
+      }
+
+      double joint_position_error = 0.0;
+      double joint_velocity_error = 0.0;
+
+      for (int i = 0; i<12; ++i){
+        const auto joint_id = robot.model.getJointId(robot.motor_names[i]);
+        const auto& joint = robot.model.joints[joint_id];
+      
+        joint_position_error = std::max(joint_position_error, std::abs(sensors.joint_position[i] - q[joint.idx_q()]));
+        joint_velocity_error = std::max(joint_velocity_error, std::abs(sensors.joint_velocity[i] - v[joint.idx_v()]));
+      }
+
+      const Eigen::Quaterniond truth_orientation(q[6], q[3], q[4], q[5]);
+
+      const double orientation_error =sensors.orientation_world_from_imu.angularDistance(truth_orientation);
+
+      //当前模型的IMU坐标轴与基座坐标系对齐
+      const double gyro_error = (sensors.angular_velocity_imu - v.segment<3>(3)).norm();
+
+      // 当前这些传感器未配置噪声，用严格误差检查映射
+      if (joint_position_error > 1e-8 ||
+          joint_velocity_error > 1e-8 ||
+          orientation_error > 1e-7 ||
+          gyro_error > 1e-8) {
+        throw std::runtime_error("Sensor measurements disagree with simulation state");}
       auto current_state=mapping.state(q,v);
       continuous_yaw+=std::remainder(current_state[9]-continuous_yaw,2.0*std::acos(-1.0));
       current_state[9]=continuous_yaw;
@@ -561,6 +604,24 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       row[76]=current_state[0]; row[77]=current_state[1];
       row[78]=active_target_trajectory.timeTrajectory.front();
       row[79]=active_target_trajectory.timeTrajectory.back();
+      row[80]=sensors.time_s;
+      const auto& imu_orientation = sensors.orientation_world_from_imu;
+      row[81]=imu_orientation.w();
+      row[82]=imu_orientation.x();
+      row[83]=imu_orientation.y();
+      row[84]=imu_orientation.z();
+
+      for (int axis = 0; axis < 3; ++axis) {
+        row[85 + axis] = sensors.angular_velocity_imu[axis];
+        row[88 + axis] = sensors.specific_force_imu[axis];
+      }
+
+      row[91] = joint_position_error;
+      row[92] = joint_velocity_error;
+      row[93] = orientation_error;
+      row[94] = gyro_error;
+      row[95] = sensor_read_ms;
+
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();
