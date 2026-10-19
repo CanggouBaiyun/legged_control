@@ -6,6 +6,7 @@ if [[ "${1:-}" == --help ]]; then
     '  [--mpc-solver ddp|sqp] (default: ddp)' \
     '  [--joint-kp KP] [--joint-kd KD] (defaults: 20, 1)' \
     '  [--centroidal-base-accel] (default: existing tracking task)' \
+    '  [--estimator-shadow] (log Kalman estimates; control uses simulation truth)' \
     '  [--wbc-config JSON] (relative to project root; default: built-in WBC settings)' \
     '  [--online] (starts /cmd_vel targets; permits duration >20 s; no --forward/--turn-angle-deg)' \
     '  Online mode without --duration (or --duration 0) runs until you close the window or press Ctrl+C.' \

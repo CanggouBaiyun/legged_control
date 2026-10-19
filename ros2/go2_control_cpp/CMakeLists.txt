@@ -14,7 +14,7 @@ target_include_directories(go2_model PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(go2_model PUBLIC pinocchio::pinocchio)
-add_library(go2_estimation STATIC src/state_estimation.cpp)
+add_library(go2_estimation STATIC src/state_estimation.cpp src/estimator_preprocessor.cpp)
 target_link_libraries(go2_estimation PUBLIC go2_model)
 
 set(GO2_OSQP_ROOT "" CACHE PATH "Prefix containing matching OSQP 1.x C headers and library")
