@@ -10,6 +10,12 @@ struct FootObservation{
     Eigen::Vector3d position_relative_world = Eigen::Vector3d::Zero();
     //上述向量对时间的导数，包含机身转动产生的影响
     Eigen::Vector3d velocity_relative_world = Eigen::Vector3d::Zero();
+    // 足部刚体角速度，由 IMU 和关节运动学得到。
+    Eigen::Vector3d angular_velocity_world = Eigen::Vector3d::Zero();
+    // 平地无滑动接触时，碰撞球心的世界系运动速度。
+    Eigen::Vector3d supported_velocity_world = Eigen::Vector3d::Zero();
+    // 实际触地后的渐变可信度；离地时由 contact=false 禁用支撑观测。
+    double contact_trust = 1.0;
 
     //触地时，这个足端点预期的世界系高度
     double support_height_world = 0.0;

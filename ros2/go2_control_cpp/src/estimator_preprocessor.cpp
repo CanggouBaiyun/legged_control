@@ -3,6 +3,7 @@
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
 #include <cmath>
+#include <algorithm>
 #include <stdexcept>
 
 namespace go2 {
@@ -26,6 +27,8 @@ EstimatorPreprocessor::EstimatorPreprocessor(
       !std::isfinite(settings_.foot_radius) ||
       settings_.foot_radius <= 0.0 ||
       !std::isfinite(settings_.ground_height_world) ||
+      !std::isfinite(settings_.contact_settling_time_s) ||
+      settings_.contact_settling_time_s <= 0.0 ||
       !model.gravity.linear().allFinite()){
     throw std::runtime_error("Invalid estimator mounting settings");
   }
@@ -63,6 +66,7 @@ void EstimatorPreprocessor::reset(){
   previous_angular_velocity_base_.setZero();
   previous_time_s_ = 0.0;
   has_previous_ = false;
+  contact_since_s_.fill(-1.0);
 }
 
 
@@ -153,11 +157,25 @@ EstimatorInput EstimatorPreprocessor::convert(
     foot.velocity_relative_world =
         velocity.linear() +
         velocity.angular().cross(offset_world);
+    foot.angular_velocity_world = velocity.angular();
 
     foot.support_height_world =
         settings_.ground_height_world + settings_.foot_radius;
 
     foot.contact = measurements.foot_contact[i];
+    if(foot.contact) {
+      if(contact_since_s_[i]<0.0) contact_since_s_[i]=measurements.time_s;
+      foot.contact_trust=std::clamp(
+          (measurements.time_s-contact_since_s_[i]-settings_.contact_settling_time_s)/
+          settings_.contact_settling_time_s,0.0,1.0);
+    } else {
+      contact_since_s_[i]=-1.0;
+      foot.contact_trust=0.0;
+    }
+    // 接触点速度 = 球心速度 + omega × (接触点 - 球心)。
+    // 平地无滑动时接触点瞬时速度为零，因此球心速度 = omega × (r * z)。
+    foot.supported_velocity_world=foot.angular_velocity_world.cross(
+        Eigen::Vector3d(0.0,0.0,settings_.foot_radius));
 
     if (!foot.position_relative_world.allFinite() ||
         !foot.velocity_relative_world.allFinite()) {

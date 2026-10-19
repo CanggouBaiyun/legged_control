@@ -308,7 +308,24 @@ const std::string columns=
     "estimator_control_active,"
     "control_base_x_m,control_base_y_m,control_base_z_m,"
     "control_base_vx_world_mps,control_base_vy_world_mps,control_base_vz_world_mps";
-using Row=std::array<double,127>;
+const std::string estimator_foot_columns=[] {
+  std::string result;
+  for(const std::string foot:{"fl","fr","rl","rr"}) {
+    for(const std::string axis:{"x","y","z"})
+      result+=",estimator_foot_"+foot+"_relative_"+axis+"_m";
+    for(const std::string axis:{"x","y","z"})
+      result+=",estimator_foot_"+foot+"_relative_v"+axis+"_mps";
+    for(const std::string axis:{"x","y","z"})
+      result+=",truth_foot_"+foot+"_v"+axis+"_world_mps";
+    for(const std::string axis:{"x","y","z"})
+      result+=",estimator_foot_"+foot+"_omega_"+axis+"_world_radps";
+    for(const std::string axis:{"x","y","z"})
+      result+=",estimator_foot_"+foot+"_supported_v"+axis+"_world_mps";
+    result+=",estimator_foot_"+foot+"_contact_trust";
+  }
+  return result;
+}();
+using Row=std::array<double,191>;
 // The controller submits one second of rows at a time. Disk I/O runs on a
 // separate thread, with a bounded queue even in an unlimited interactive run.
 class ControlLog {
@@ -316,7 +333,7 @@ class ControlLog {
   explicit ControlLog(const std::filesystem::path& path) {
     if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     out_.open(path);
-    out_<<std::setprecision(17)<<columns<<'\n';
+    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<'\n';
     if(!out_) throw std::runtime_error("Cannot open control CSV");
     worker_=std::thread([this] {
       try {
@@ -501,6 +518,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
           truth_rotation * v.head<3>();
 
         go2::EstimatorInput estimator_input;
+        std::array<go2::SimulatedFootMotion,4> truth_foot_motion{};
 
         Eigen::Vector3d estimated_position = Eigen::Vector3d::Zero();
         Eigen::Vector3d estimated_velocity = Eigen::Vector3d::Zero();
@@ -514,6 +532,17 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         const auto estimator_begin = Clock::now();
 
         estimator_input = estimator_preprocessor.convert(sensors);
+        // Independent simulator truth validates preprocessing only. It is not
+        // passed into reset/update or used to correct the estimated state.
+        truth_foot_motion=sim.footMotion();
+        for(int i=0;i<4;++i) {
+          const auto& foot=estimator_input.feet[i];
+          if((q.head<3>()+foot.position_relative_world-
+              truth_foot_motion[i].position_world).norm()>1e-8 ||
+             (truth_base_velocity_world+foot.velocity_relative_world-
+              truth_foot_motion[i].velocity_world).norm()>1e-8)
+            throw std::runtime_error("Estimator foot kinematics disagree with MuJoCo");
+        }
 
         if (!estimator_initialized) {
           double initial_height = 0.0;
@@ -790,6 +819,17 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       for (int axis=0;axis<3;++axis) {
         row[121+axis]=control_q[axis];
         row[124+axis]=control_base_velocity_world[axis];
+      }
+      for(int i=0;i<4;++i) {
+        const auto& foot=estimator_input.feet[i];
+        for(int axis=0;axis<3;++axis) {
+          row[127+16*i+axis]=foot.position_relative_world[axis];
+          row[130+16*i+axis]=foot.velocity_relative_world[axis];
+          row[133+16*i+axis]=truth_foot_motion[i].velocity_world[axis];
+          row[136+16*i+axis]=foot.angular_velocity_world[axis];
+          row[139+16*i+axis]=foot.supported_velocity_world[axis];
+        }
+        row[142+16*i]=foot.contact_trust;
       }
 
       const auto diagnostics_end=Clock::now();

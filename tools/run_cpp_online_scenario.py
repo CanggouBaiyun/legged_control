@@ -17,24 +17,34 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DURATION = 70.0
+DURATION = 80.0
+STANCE_AT = 70.0
+FINAL_STANCE_START = 73.0
 PHASES = (
-    ("backward", 6.0, 12.0, (-0.03, 0.0, 0.0)),
-    ("left", 15.0, 21.0, (0.0, 0.02, 0.0)),
-    ("right", 24.0, 30.0, (0.0, -0.02, 0.0)),
-    ("turn_left", 33.0, 39.0, (0.0, 0.0, 0.08)),
-    ("turn_right", 42.0, 48.0, (0.0, 0.0, -0.08)),
-    ("combined", 51.0, 57.0, (0.02, 0.01, 0.05)),
+    ("forward", 6.0,12.0,(0.10, 0.0, 0.0)),
+    ("backward", 15.0, 21.0, (-0.03, 0.0, 0.0)),
+    ("left", 24.0, 30.0, (0.0, 0.02, 0.0)),
+    ("right", 33.0, 39.0, (0.0, -0.02, 0.0)),
+    ("turn_left", 42.0, 48.0, (0.0, 0.0, 0.08)),
+    ("turn_right", 51.0, 57.0, (0.0, 0.0, -0.08)),
+    ("combined", 60.0, 66.0, (0.02, 0.01, 0.05)),
 )
 
-
-def evaluate(path):
+def evaluate(path, require_estimator=False):
     """Evaluate settled intervals in body-heading coordinates, including yaw."""
     fields = ("time_s", "mode", "measured_x_m", "measured_y_m",
               "measured_yaw_rad", "measured_com_vx_world_mps",
               "measured_com_vy_world_mps")
+    if require_estimator:
+        fields += ("estimator_control_active",)
+        fields += tuple(f"estimator_position_error_{axis}_m" for axis in "xyz")
+        fields += tuple(f"estimator_velocity_error_{axis}_mps" for axis in "xyz")
     with path.open() as stream:
-        rows = [{key: float(row[key]) for key in fields} for row in csv.DictReader(stream)]
+        reader = csv.DictReader(stream)
+        missing = set(fields) - set(reader.fieldnames or ())
+        if missing:
+            raise RuntimeError(f"Control CSV is missing columns: {sorted(missing)}")
+        rows = [{key: float(row[key]) for key in fields} for row in reader]
     if len(rows) != round(DURATION / 0.002):
         raise RuntimeError("Scenario control CSV is incomplete")
     yaw = None
@@ -77,22 +87,97 @@ def evaluate(path):
         print(f"{name}: requested={command}; measured="
               f"({measured[0]:.5f}, {measured[1]:.5f}, {measured[2]:.5f}); "
               f"{'PASS' if passed else 'FAIL'}", flush=True)
-    stopped = [row for row in rows if row["time_s"] >= 63.0]
+    stopped = [row for row in rows if row["time_s"] >= FINAL_STANCE_START]
     x_range = max(row["measured_x_m"] for row in stopped) - min(row["measured_x_m"] for row in stopped)
     y_range = max(row["measured_y_m"] for row in stopped) - min(row["measured_y_m"] for row in stopped)
     yaw_range = max(row["unwrapped_yaw"] for row in stopped) - min(row["unwrapped_yaw"] for row in stopped)
     stop_passed = (all(row["mode"] == 15 for row in stopped) and
                    x_range <= 0.005 and y_range <= 0.005 and yaw_range <= math.radians(1.0))
     summary = json.loads(path.with_suffix(".json").read_text())
+    estimator_check = {"requested": require_estimator}
+    estimator_passed = True
+
+    if require_estimator:
+        active_times = [
+            row["time_s"] for row in rows
+            if row["estimator_control_active"] == 1
+        ]
+
+        first_active = active_times[0] if active_times else None
+
+        estimator_passed = (
+            first_active is not None
+            and 2.0 <= first_active < 3.0
+            and all(
+                row["estimator_control_active"] in (0, 1)
+                for row in rows
+            )
+            and all(
+                row["estimator_control_active"] == 1
+                for row in rows if row["time_s"] >= first_active
+            )
+        )
+
+        estimator_check.update(
+            first_active_s=first_active,
+            active_samples=len(active_times),
+            passed=estimator_passed,
+        )
+
+        print(
+            f"Estimator control: first_active={first_active}; "
+            f"{'PASS' if estimator_passed else 'FAIL'}",
+            flush=True,
+        )
+        if first_active is not None:
+            active = [row for row in rows if row["time_s"] >= first_active]
+            max_horizontal_error = max(math.hypot(
+                row["estimator_position_error_x_m"],
+                row["estimator_position_error_y_m"]) for row in active)
+            vertical_velocity_rmse = math.sqrt(statistics.fmean(
+                row["estimator_velocity_error_z_mps"] ** 2 for row in active))
+            mean_velocity_errors = {}
+            for name, start, end, _ in PHASES:
+                selected = [row for row in active if start + 1.0 <= row["time_s"] < end - 0.2]
+                mean_velocity_errors[name] = [statistics.fmean(
+                    row[f"estimator_velocity_error_{axis}_mps"] for row in selected)
+                    for axis in "xyz"]
+            max_mean_horizontal_velocity_error = max(
+                math.hypot(error[0], error[1]) for error in mean_velocity_errors.values())
+            # Flat-ground, ideal-sensor simulation acceptance limits. Evaluate
+            # drift and sustained bias separately from commanded motion.
+            accuracy_passed = (max_horizontal_error <= 0.02 and
+                               max_mean_horizontal_velocity_error <= 0.003 and
+                               vertical_velocity_rmse <= 0.02)
+            estimator_check["accuracy"] = {
+                "max_horizontal_position_error_m": max_horizontal_error,
+                "phase_mean_velocity_error_xyz_mps": mean_velocity_errors,
+                "max_phase_mean_horizontal_velocity_error_mps": max_mean_horizontal_velocity_error,
+                "vertical_velocity_rmse_mps": vertical_velocity_rmse,
+                "limits": {"horizontal_position_m": 0.02,
+                           "phase_mean_horizontal_velocity_mps": 0.003,
+                           "vertical_velocity_rmse_mps": 0.02},
+                "passed": accuracy_passed,
+            }
+            estimator_passed = estimator_passed and accuracy_passed
+            estimator_check["passed"] = estimator_passed
+            print(f"Estimator accuracy: max horizontal error={max_horizontal_error * 1000:.3f} mm; "
+                  f"max phase velocity bias={max_mean_horizontal_velocity_error:.6f} m/s; "
+                  f"{'PASS' if accuracy_passed else 'FAIL'}", flush=True)
     result = {
         "schema": 1, "control_csv": str(path), "duration_s": DURATION,
         "phases": phases,
-        "final_stance": {"evaluation_start_s": 63.0, "x_range_m": x_range,
+        "final_stance": {"evaluation_start_s": FINAL_STANCE_START, "x_range_m": x_range,
                          "y_range_m": y_range, "yaw_range_rad": yaw_range,
                          "passed": stop_passed},
-        "passed": (all(phase["passed"] for phase in phases) and stop_passed and
-                   summary["clipped_steps"] == 0),
-        "note": "Initial low-speed simulation gates. Timing and historical solver failures remain separate deployment gates.",
+        "passed": (
+            all(phase["passed"] for phase in phases)
+            and stop_passed
+            and estimator_passed
+            and summary["clipped_steps"] == 0
+        ),
+        "note": "Initial flat-ground simulation gates; estimator accuracy is checked when requested. Timing, sensor robustness and historical solver failures remain separate deployment gates.",
+        "state_estimator": estimator_check,
     }
     output = path.with_suffix(".scenario.json")
     output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
@@ -141,6 +226,8 @@ def run(args):
                      "--csv", str(path)]
         if not args.viewer:
             arguments.append("--headless")
+        if args.estimator_control:
+            arguments.append("--estimator-control")
         process = subprocess.Popen(arguments, cwd=ROOT, env=environment, start_new_session=True)
         deadline = time.monotonic() + 180.0
         next_command = 0.0
@@ -161,7 +248,7 @@ def run(args):
                 gait.publish(message)
                 trot_sent = True
                 print(f"SCENARIO: trot at observation t={stamp:.3f}", flush=True)
-            if stamp >= 60.0 and not stance_sent and gait.get_subscription_count():
+            if stamp >= STANCE_AT and not stance_sent and gait.get_subscription_count():
                 message = ModeSchedule()
                 message.event_times = [0.0, 0.5]
                 message.mode_sequence = [15]
@@ -185,7 +272,7 @@ def run(args):
             raise RuntimeError(f"Simulation launcher exited with code {process.returncode}; inspect partial CSV and failure/log files")
         if not trot_sent or not stance_sent:
             raise RuntimeError("Scenario did not send both gait transitions")
-        return evaluate(path)
+        return evaluate(path, require_estimator=args.estimator_control)
     finally:
         if process is not None and process.poll() is None:
             process.send_signal(signal.SIGINT)
@@ -204,6 +291,10 @@ def main():
     parser.add_argument("--csv", type=Path, default=Path("artifacts/cpp_online_directions.csv"))
     parser.add_argument("--viewer", action="store_true", help="Open the official MuJoCo viewer")
     parser.add_argument("--ros-domain-id", type=int, default=217)
+    parser.add_argument(
+        "--estimator-control", action="store_true",
+        help="Use estimated-state control and verify activation stays latched",
+    )
     args = parser.parse_args()
     if not 0 <= args.ros_domain_id <= 232:
         parser.error("--ros-domain-id must be in [0,232]")

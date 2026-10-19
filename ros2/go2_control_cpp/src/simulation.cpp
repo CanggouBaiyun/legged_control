@@ -148,6 +148,19 @@ SensorMeasurements Simulation::sensors(){
   }
   return result;
 }
+std::array<SimulatedFootMotion,4> Simulation::footMotion() const {
+  std::array<SimulatedFootMotion,4> result;
+  for(int i=0;i<4;++i) {
+    const int geom=foot_geoms_[i];
+    mjtNum spatial_velocity[6]{};  // MuJoCo: angular first, linear last.
+    mj_objectVelocity(model_.get(),data_.get(),mjOBJ_GEOM,geom,spatial_velocity,0);
+    result[i].position_world=Eigen::Map<const Eigen::Vector3d>(data_->geom_xpos+3*geom);
+    result[i].velocity_world=Eigen::Map<const Eigen::Vector3d>(spatial_velocity+3);
+    if(!result[i].position_world.allFinite() || !result[i].velocity_world.allFinite())
+      throw std::runtime_error("Invalid simulated foot motion");
+  }
+  return result;
+}
 void Simulation::openViewer() {
   if(viewer_) return;
   if(mj_version()!=340 || std::string(mj_versionString())!="3.4.0")

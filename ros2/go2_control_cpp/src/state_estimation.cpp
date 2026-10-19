@@ -1,6 +1,7 @@
 #include "go2_control_cpp/state_estimation.hpp"
 
 #include <Eigen/Cholesky>
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -13,7 +14,10 @@ void validateInput(const EstimatorInput& input){
     }
 
     for (const auto& foot: input.feet){
-        if(!foot.position_relative_world.allFinite() || !foot.velocity_relative_world.allFinite() || !std::isfinite(foot.support_height_world)){
+        if(!foot.position_relative_world.allFinite() || !foot.velocity_relative_world.allFinite() ||
+           !foot.supported_velocity_world.allFinite() ||
+           !std::isfinite(foot.contact_trust) || foot.contact_trust<0.0 || foot.contact_trust>1.0 ||
+           !std::isfinite(foot.support_height_world)){
             throw std::runtime_error("Invalid estimator foot observation");
         }
     }
@@ -42,7 +46,7 @@ LinearKalmanFilter::LinearKalmanFilter(const KalmanNoise& noise): noise_(noise){
         observation_matrix_.block<3, 3>(3 * i, 0) = identity;
         observation_matrix_.block<3, 3>(3 * i, foot_state) = -identity;
 
-        //v_base = -relative_velocity
+        //v_base = supported_foot_velocity - relative_velocity
         observation_matrix_.block<3, 3>(12 + 3 * i, 3) = identity;
 
         // foot_z = support_height
@@ -85,9 +89,9 @@ void LinearKalmanFilter::update(const EstimatorInput& input){
     Covariance transition = Covariance::Identity();
     transition.block<3, 3>(0, 3) = dt * identity;
 
-    State predicted_state = transition * state_;
-    predicted_state.head<3>() += 0.5*dt*dt*input.base_acceleration_world;
-    predicted_state.segment<3>(3) += dt * input.base_acceleration_world;
+    State driven_motion = State::Zero();
+    driven_motion.head<3>() = 0.5*dt*dt*input.base_acceleration_world;
+    driven_motion.segment<3>(3) = dt * input.base_acceleration_world;
 
     Covariance process_noise = Covariance::Zero();
     process_noise.block<3, 3>(0, 0) = noise_.position_process * dt / 20.0 * identity;
@@ -95,10 +99,20 @@ void LinearKalmanFilter::update(const EstimatorInput& input){
 
     Observation measurement = Observation::Zero();
     ObservationCovariance measurement_noise = ObservationCovariance::Zero();
+    ObservationMatrix observation_matrix=observation_matrix_;
 
     for (int i = 0; i < 4; ++i) {
         const auto& foot = input.feet[i];
-        const double uncertainty = foot.contact ? 1.0 : 100.0;
+        const double trust = foot.contact ? foot.contact_trust : 0.0;
+        const double uncertainty = 1.0 + 99.0*(1.0-trust);
+
+        // 支撑时按球心滚动速度预测；摆动时 v_foot = v_base + dr/dt。
+        // 同步写入 transition，让协方差也包含对基座速度的依赖。
+        transition.block<3,3>(6+3*i,3)=(1.0-trust)*dt*identity;
+        driven_motion.segment<3>(6+3*i)=dt*(
+            trust*foot.supported_velocity_world+
+            (1.0-trust)*foot.velocity_relative_world)+
+            (1.0-trust)*0.5*dt*dt*input.base_acceleration_world;
 
         process_noise.block<3, 3>(6 + 3 * i, 6 + 3 * i) =
         noise_.foot_process * dt * uncertainty * identity;
@@ -106,28 +120,36 @@ void LinearKalmanFilter::update(const EstimatorInput& input){
         measurement.segment<3>(3 * i) =
             -foot.position_relative_world;
         measurement.segment<3>(12 + 3 * i) =
-            -foot.velocity_relative_world;
+            foot.supported_velocity_world-foot.velocity_relative_world;
         measurement[24 + i] = foot.support_height_world;
 
         measurement_noise.block<3, 3>(3 * i, 3 * i) =
             noise_.relative_position_measurement * uncertainty * identity;
 
         measurement_noise.block<3, 3>(12 + 3 * i, 12 + 3 * i) =
-            noise_.velocity_measurement * uncertainty * identity;
+            noise_.velocity_measurement / std::max(trust,1e-6) * identity;
 
         measurement_noise(24 + i, 24 + i) =
-            noise_.height_measurement * uncertainty;
+            noise_.height_measurement / std::max(trust,1e-6);
+        if(trust==0.0) {
+          // 离地时静止速度和地面高度均不成立，彻底移除这两项观测。
+          observation_matrix.block<3,18>(12+3*i,0).setZero();
+          observation_matrix.row(24+i).setZero();
+          measurement.segment<3>(12+3*i).setZero();
+          measurement[24+i]=0.0;
+        }
 }
 
+    const State predicted_state = transition*state_+driven_motion;
     const Covariance predicted_covariance = 
         transition * covariance_ * transition.transpose() + process_noise;
-    const Observation innovation = measurement - observation_matrix_ * predicted_state;
+    const Observation innovation = measurement - observation_matrix * predicted_state;
 
     const Eigen::Matrix<double, 18, 28> state_observation_covariance = 
-        predicted_covariance * observation_matrix_.transpose();
+        predicted_covariance * observation_matrix.transpose();
 
     const ObservationCovariance innovation_covariance= 
-        observation_matrix_ * state_observation_covariance + measurement_noise;
+        observation_matrix * state_observation_covariance + measurement_noise;
 
     Eigen::LDLT<ObservationCovariance> decomposition(innovation_covariance);
 
@@ -142,7 +164,7 @@ void LinearKalmanFilter::update(const EstimatorInput& input){
     const State corrected_state = predicted_state + gain * innovation;
 
     //Joseph形式：在浮点运算中更稳健地更新协方差
-    const Covariance correction = Covariance::Identity() - gain * observation_matrix_;
+    const Covariance correction = Covariance::Identity() - gain * observation_matrix;
     
     Covariance corrected_covariance =
       correction * predicted_covariance * correction.transpose() +

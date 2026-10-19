@@ -6,6 +6,10 @@
 #include <array>
 
 namespace go2 {
+struct SimulatedFootMotion {
+  Eigen::Vector3d position_world = Eigen::Vector3d::Zero();
+  Eigen::Vector3d velocity_world = Eigen::Vector3d::Zero();
+};
 class Simulation {
  public:
   Simulation(const std::filesystem::path& root, const RobotModel& robot);
@@ -28,6 +32,9 @@ class Simulation {
   double time() const { return data_->time; }
   double timestep() const { return model_->opt.timestep; }
   std::array<double,4> floorForces() const;
+  // Diagnostic truth at the collision-sphere centers, FL/FR/RL/RR.
+  // Call immediately after sensors(), before step(); never an estimator input.
+  std::array<SimulatedFootMotion,4> footMotion() const;
  private:
   struct Motor {int mj_q, mj_v, pin_q, pin_v;};
   int sensorAddress(

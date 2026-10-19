@@ -17,6 +17,8 @@ struct PreprocessorSettings
 
     double foot_radius = 0.022;
     double ground_height_world = 0.0;
+    // 先等待这一时长避开触地冲击，再用相同时长将可信度从 0 升至 1。
+    double contact_settling_time_s = 0.02;
 };
 
 class EstimatorPreprocessor {
@@ -47,6 +49,7 @@ class EstimatorPreprocessor {
 
   double previous_time_s_ = 0.0;
   bool has_previous_ = false;
+  std::array<double,4> contact_since_s_{{-1.0,-1.0,-1.0,-1.0}};
 };
 
 }  // namespace go2
