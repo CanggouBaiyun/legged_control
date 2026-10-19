@@ -279,8 +279,10 @@ const std::string columns=
     "sensor_joint_velocity_max_error_radps,"
     "sensor_orientation_error_rad,"
     "sensor_gyro_error_radps,"
-    "sensor_read_ms";
-using Row=std::array<double,96>;
+    "sensor_read_ms,"
+    "estimator_sim_contact_fl,estimator_sim_contact_fr,"
+    "estimator_sim_contact_rl,estimator_sim_contact_rr";
+using Row=std::array<double,100>;
 // The controller submits one second of rows at a time. Disk I/O runs on a
 // separate thread, with a bounded queue even in an unlimited interactive run.
 class ControlLog {
@@ -621,6 +623,10 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       row[93] = orientation_error;
       row[94] = gyro_error;
       row[95] = sensor_read_ms;
+
+      for (int i = 0; i < 4; ++i) {
+        row[96 + i] = sensors.foot_contact[i] ? 1.0 : 0.0;
+      }
 
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();

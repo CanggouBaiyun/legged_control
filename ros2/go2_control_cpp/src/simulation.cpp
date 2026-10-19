@@ -125,6 +125,16 @@ SensorMeasurements Simulation::sensors(){
         data_->sensordata[joint_velocity_addresses_[i]];
   }
 
+  const auto foot_forces = floorForces();
+
+  for(int i = 0; i<4; ++i){
+    if (!std::isfinite(foot_forces[i]) || foot_forces[i] < 0.0){
+      throw std::runtime_error("Invalid simulated foot contact force");
+    }
+
+    result.foot_contact[i] = foot_forces[i] > 1.0;
+  }
+
   const auto& orientation = result.orientation_world_from_imu;
 
   if (!std::isfinite(result.time_s) ||

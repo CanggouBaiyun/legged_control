@@ -38,7 +38,8 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 | Native C++ online commands | Unlimited keyboard sessions; T/G gait, WASD motion, Q/E turning, Space stop. Finite 70 s motion scenarios and one positive +π crossing verified; reverse/repeated crossings remain pending. See [keyboard guide](docs/cpp_model_baseline.md#常驻窗口与键盘入口) |
 | Disturbance recovery | Planned |
 | Estimator measurement interface | IMU orientation/gyro/accelerometer and named joint sensors recorded in a 20 s C++ trot/stop run; time, joint, orientation and gyro mapping checks passed. Position/velocity estimation remains pending. See [sensor results](docs/cpp_model_baseline.md#估计器测量入口2026-10-18) |
-| SDK2, state estimation and hardware safety | Planned |
+| Position/velocity estimation | 18-state Kalman core builds and passes ideal stationary/moving model checks; sensor preprocessing and simulation integration remain pending |
+| SDK2 and hardware safety | Planned |
 
 The OCS2 controller has completed a 20 s in-place trot and a headless low-speed forward run with measured forward swing for all four feet and a return to four-foot stance. Adding angular-acceleration feedforward improved a 10° yaw-turn experiment from 4.26° to 9.77° at the last recorded sample; a -10° run measured -9.79°. Transient lag remains, with approximately 2.31° goal-tracking RMSE during 8–12 s in both directions. Left-turn foot XY tracking RMSE is 2.87–4.39 mm; loaded contact tangent-speed p95 during 8–12 s is 2.34–2.78 mm/s, with an FR touchdown peak of 149.01 mm/s later in the run. These measurements do not establish slip-free locomotion. The single-leg cycle still uses scripted contact phases; hardware readiness remains unverified. See the [forward trot notes](docs/ocs2_forward_trot.md) and [yaw-turn results](docs/ocs2_trot_yaw.md).
 

@@ -14,6 +14,8 @@ target_include_directories(go2_model PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(go2_model PUBLIC pinocchio::pinocchio)
+add_library(go2_estimation STATIC src/state_estimation.cpp)
+target_link_libraries(go2_estimation PUBLIC go2_model)
 
 set(GO2_OSQP_ROOT "" CACHE PATH "Prefix containing matching OSQP 1.x C headers and library")
 if(GO2_OSQP_ROOT)
@@ -71,7 +73,12 @@ if(GO2_MUJOCO_ROOT)
   add_executable(control_simulation src/control_simulation.cpp src/local_mrt.cpp src/simulation.cpp)
   target_include_directories(control_simulation PRIVATE "${GO2_MUJOCO_ROOT}/include")
   ament_target_dependencies(control_simulation rclcpp ocs2_ros_interfaces ocs2_msgs)
-  target_link_libraries(control_simulation go2_reference go2_mujoco_simulate)
+  target_link_libraries(
+  control_simulation
+  go2_reference
+  go2_estimation
+  go2_mujoco_simulate
+  )
   target_compile_definitions(control_simulation PRIVATE GO2_OSQP_LIBRARY="${GO2_OSQP_LIBRARY}")
   set_target_properties(control_simulation PROPERTIES INSTALL_RPATH "${GO2_MUJOCO_ROOT}")
   install(TARGETS control_simulation DESTINATION lib/${PROJECT_NAME})
@@ -96,4 +103,5 @@ endif()
 install(TARGETS model_check dynamics_check DESTINATION lib/${PROJECT_NAME})
 install(TARGETS go2_model ARCHIVE DESTINATION lib)
 install(DIRECTORY include/ DESTINATION include)
+install(TARGETS go2_estimation ARCHIVE DESTINATION lib)
 ament_package()

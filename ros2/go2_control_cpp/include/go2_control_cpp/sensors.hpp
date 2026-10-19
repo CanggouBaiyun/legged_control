@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <array>
 
 namespace go2{
 
@@ -21,6 +22,10 @@ struct SensorMeasurements{
   Eigen::Matrix<double, 12, 1> joint_position = Eigen::Matrix<double, 12, 1>::Zero();
 
   Eigen::Matrix<double, 12, 1> joint_velocity = Eigen::Matrix<double, 12, 1>::Zero();
+
+  // 顺序：FL、FR、RL、RR，与 ocs2Feet() 一致。
+  // 当前由 MuJoCo 接触真值产生；实机阶段替换数据来源。
+  std::array<bool, 4> foot_contact{};
 };
 
 } // namespace go2
