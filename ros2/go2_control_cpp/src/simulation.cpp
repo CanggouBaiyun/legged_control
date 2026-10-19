@@ -2,6 +2,7 @@
 #include "go2_control_cpp/reference.hpp"
 #include "glfw_adapter.h"
 #include "simulate.h"
+#include <cmath>
 #include <algorithm>
 #include <set>
 #include <stdexcept>
@@ -27,6 +28,27 @@ Simulation::Simulation(const std::filesystem::path& root,const RobotModel& robot
   if(model_->nq!=19 || model_->nv!=18 || model_->nu!=12) throw std::runtime_error("Unexpected MuJoCo model dimensions");
   data_.reset(mj_makeData(model_.get()));
   if(!data_) throw std::runtime_error("MuJoCo data allocation failed");
+  imu_quat_address_ = sensorAddress("imu_quat", mjSENS_FRAMEQUAT, 4);
+  imu_gyro_address_ = sensorAddress("imu_gyro", mjSENS_GYRO, 3);
+  imu_acc_address_ = sensorAddress("imu_acc", mjSENS_ACCELEROMETER, 3);
+
+  if(robot.motor_names.size() != 12){
+    throw std::runtime_error("Expected 12 motor names");
+  }
+
+  for(std::size_t i = 0; i < robot.motor_names.size(); ++i){
+    const auto& name = robot.motor_names[i];
+
+    const std::string suffix = "_joint";
+    if(name.size() <= suffix.size() || name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0){
+      throw std::runtime_error("Unexpected motor name: " + name);
+    }
+
+    const auto prefix = name.substr(0, name.size() - suffix.size());
+
+    joint_position_addresses_[i] = sensorAddress(prefix + "_pos", mjSENS_JOINTPOS, 1);
+    joint_velocity_addresses_[i] = sensorAddress(prefix + "_vel", mjSENS_JOINTVEL, 1);
+  }
   for(const auto& name:robot.motor_names) {
     const int id=mj_name2id(model_.get(),mjOBJ_JOINT,name.c_str());
     if(id<0 || model_->jnt_type[id]!=mjJNT_HINGE) throw std::runtime_error("Missing MuJoCo motor: "+name);
@@ -56,6 +78,88 @@ Simulation::Simulation(const std::filesystem::path& root,const RobotModel& robot
   mj_resetDataKeyframe(model_.get(),data_.get(),home);
   std::fill_n(data_->ctrl,12,0.0);
   mj_forward(model_.get(),data_.get());
+}
+int Simulation::sensorAddress(
+  const std::string& name, int expected_type,
+  int expected_dimension) const{
+ const int id = mj_name2id(model_.get(), mjOBJ_SENSOR, name.c_str());
+ 
+ if (id < 0){
+  throw std::runtime_error("Missing MuJoCo sensor:" + name);
+ }
+
+ if (model_->sensor_type[id] != expected_type || model_->sensor_dim[id] != expected_dimension){
+  throw std::runtime_error(
+    "Unexpected MuJoCo sensor type or dimension: " + name);
+  
+ }
+ return model_->sensor_adr[id];
+}
+
+SensorMeasurements Simulation::sensors(){
+  // 刷新当前 q/v 下的传感器结果，不推进时间
+  mj_forward(model_.get(), data_.get());
+
+  SensorMeasurements result;
+  result.time_s = data_->time;
+
+  const auto* quat = data_->sensordata + imu_quat_address_;
+
+  // MuJoCo 四元数为 w,x,y,z；Eigen 构造函数也按此顺序
+  result.orientation_world_from_imu =
+      Eigen::Quaterniond(quat[0], quat[1], quat[2], quat[3]);
+
+  for (int axis = 0; axis < 3; ++axis) {
+    result.angular_velocity_imu[axis] =
+        data_->sensordata[imu_gyro_address_ + axis];
+
+    result.specific_force_imu[axis] =
+        data_->sensordata[imu_acc_address_ + axis];
+  }
+
+  for (int i =0; i<12; i++){
+    result.joint_position[i] =
+        data_->sensordata[joint_position_addresses_[i]];
+
+    result.joint_velocity[i] =
+        data_->sensordata[joint_velocity_addresses_[i]];
+  }
+
+  const auto foot_forces = floorForces();
+
+  for(int i = 0; i<4; ++i){
+    if (!std::isfinite(foot_forces[i]) || foot_forces[i] < 0.0){
+      throw std::runtime_error("Invalid simulated foot contact force");
+    }
+
+    result.foot_contact[i] = foot_forces[i] > 1.0;
+  }
+
+  const auto& orientation = result.orientation_world_from_imu;
+
+  if (!std::isfinite(result.time_s) ||
+      !orientation.coeffs().allFinite() ||
+      std::abs(orientation.norm() - 1.0) > 1e-6 ||
+      !result.angular_velocity_imu.allFinite() ||
+      !result.specific_force_imu.allFinite() ||
+      !result.joint_position.allFinite() ||
+      !result.joint_velocity.allFinite()) {
+    throw std::runtime_error("Invalid MuJoCo sensor measurement");
+  }
+  return result;
+}
+std::array<SimulatedFootMotion,4> Simulation::footMotion() const {
+  std::array<SimulatedFootMotion,4> result;
+  for(int i=0;i<4;++i) {
+    const int geom=foot_geoms_[i];
+    mjtNum spatial_velocity[6]{};  // MuJoCo: angular first, linear last.
+    mj_objectVelocity(model_.get(),data_.get(),mjOBJ_GEOM,geom,spatial_velocity,0);
+    result[i].position_world=Eigen::Map<const Eigen::Vector3d>(data_->geom_xpos+3*geom);
+    result[i].velocity_world=Eigen::Map<const Eigen::Vector3d>(spatial_velocity+3);
+    if(!result[i].position_world.allFinite() || !result[i].velocity_world.allFinite())
+      throw std::runtime_error("Invalid simulated foot motion");
+  }
+  return result;
 }
 void Simulation::openViewer() {
   if(viewer_) return;

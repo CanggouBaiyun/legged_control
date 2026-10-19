@@ -1,6 +1,7 @@
 #include "go2_control_cpp/reference.hpp"
 #include "go2_control_cpp/simulation.hpp"
 #include "go2_control_cpp/local_mrt.hpp"
+#include "go2_control_cpp/estimator_preprocessor.hpp"
 #include <ocs2_core/control/ControllerType.h>
 #include <ocs2_core/misc/LinearInterpolation.h>
 #include <boost/property_tree/json_parser.hpp>
@@ -163,6 +164,8 @@ struct Options {
   go2::WbcSettings wbc_settings;
   bool headless=false,check_only=false,online=false,duration_given=false;
   bool centroidal_base_accel=false;
+  bool estimator_shadow=false;
+  bool estimator_control=false;
   double duration=20,trot_at=-1,stop_at=-1;
   double joint_kp=20.0,joint_kd=1.0;
 };
@@ -181,21 +184,33 @@ Options options(int argc,char** argv) {
     else if(key=="--joint-kd") result.joint_kd=std::stod(value());
     else if(key=="--wbc-config") result.wbc_config=value();
     else if(key=="--centroidal-base-accel") result.centroidal_base_accel=true;
+    else if(key=="--estimator-shadow") result.estimator_shadow=true;
+    else if(key=="--estimator-control"){
+      result.estimator_control = true;
+      result.estimator_shadow = true;
+    }
     else if(key=="--online") result.online=true;
     else if(key=="--headless") result.headless=true;
     else if(key=="--check-only") result.check_only=true;
     else if(key=="--help") {
       std::cout<<"Simulation only. --project-root ROOT --target JSON --csv CSV [--headless] [--online] "
           "[--duration SECONDS] [--trot-at SECONDS] [--stop-trot-at SECONDS] "
-          "[--joint-kp KP] [--joint-kd KD] [--centroidal-base-accel] [--wbc-config JSON] [--check-only]\n"
+          "[--joint-kp KP] [--joint-kd KD] [--centroidal-base-accel] [--wbc-config JSON] [--estimator-shadow] [--estimator-control] [--check-only]\n"
           "Joint gains default to Kp=20, Kd=1; both must be finite and non-negative.\n"
           "Online mode accepts external targets and gait commands; scripted runs are limited to 20 s.\n"
           "Online mode runs until user exit when --duration is omitted or zero.\n"
+          "--estimator-shadow records Kalman estimates; control continues to use simulation truth.\n"
+          "--estimator-control switches after 2 s and 0.2 s of quiet four-foot support; stops if not ready by 3 s.\n"
           "WBC paths are relative to the project root; omitting --wbc-config keeps built-in defaults.\n";
       std::exit(0);
     } else throw std::runtime_error("Unknown option: "+key);
   }
   if(result.root.empty() || result.target.empty()) throw std::runtime_error("--project-root and --target are required");
+  if (result.estimator_control &&
+      ((result.duration > 0.0 && result.duration <= 3.0) ||
+       (result.trot_at > 0.0 && result.trot_at < 3.0))) {
+    throw std::runtime_error("Estimator control requires duration >3 s and trot-at >=3 s");
+  }
   if(result.online && !result.duration_given) result.duration=0;
   if(!std::isfinite(result.duration) || result.duration<0 || (!result.online && result.duration==0) ||
       (!result.online && result.duration>20) ||
@@ -270,8 +285,47 @@ const std::string columns=
     "online_mode,goal_y_m,mpc_y_m,measured_y_m,"
     "goal_com_vx_world_mps,goal_com_vy_world_mps,"
     "measured_com_vx_world_mps,measured_com_vy_world_mps,"
-    "active_target_start_s,active_target_end_s";
-using Row=std::array<double,80>;
+    "active_target_start_s,active_target_end_s,"
+    "sensor_time_s,"
+    "imu_quat_w,imu_quat_x,imu_quat_y,imu_quat_z,"
+    "imu_gyro_x_radps,imu_gyro_y_radps,imu_gyro_z_radps,"
+    "imu_specific_force_x_mps2,imu_specific_force_y_mps2,imu_specific_force_z_mps2,"
+    "sensor_joint_position_max_error_rad,"
+    "sensor_joint_velocity_max_error_radps,"
+    "sensor_orientation_error_rad,"
+    "sensor_gyro_error_radps,"
+    "sensor_read_ms,"
+    "estimator_sim_contact_fl,estimator_sim_contact_fr,"
+    "estimator_sim_contact_rl,estimator_sim_contact_rr,"
+    "estimator_shadow_enabled,"
+    "estimated_x_m,estimated_y_m,estimated_z_m,"
+    "estimated_vx_world_mps,estimated_vy_world_mps,estimated_vz_world_mps,"
+    "truth_base_vx_world_mps,truth_base_vy_world_mps,truth_base_vz_world_mps,"
+    "estimator_position_error_x_m,estimator_position_error_y_m,estimator_position_error_z_m,"
+    "estimator_velocity_error_x_mps,estimator_velocity_error_y_mps,estimator_velocity_error_z_mps,"
+    "estimator_base_ax_world_mps2,estimator_base_ay_world_mps2,estimator_base_az_world_mps2,"
+    "estimator_ms,"
+    "estimator_control_active,"
+    "control_base_x_m,control_base_y_m,control_base_z_m,"
+    "control_base_vx_world_mps,control_base_vy_world_mps,control_base_vz_world_mps";
+const std::string estimator_foot_columns=[] {
+  std::string result;
+  for(const std::string foot:{"fl","fr","rl","rr"}) {
+    for(const std::string axis:{"x","y","z"})
+      result+=",estimator_foot_"+foot+"_relative_"+axis+"_m";
+    for(const std::string axis:{"x","y","z"})
+      result+=",estimator_foot_"+foot+"_relative_v"+axis+"_mps";
+    for(const std::string axis:{"x","y","z"})
+      result+=",truth_foot_"+foot+"_v"+axis+"_world_mps";
+    for(const std::string axis:{"x","y","z"})
+      result+=",estimator_foot_"+foot+"_omega_"+axis+"_world_radps";
+    for(const std::string axis:{"x","y","z"})
+      result+=",estimator_foot_"+foot+"_supported_v"+axis+"_world_mps";
+    result+=",estimator_foot_"+foot+"_contact_trust";
+  }
+  return result;
+}();
+using Row=std::array<double,191>;
 // The controller submits one second of rows at a time. Disk I/O runs on a
 // separate thread, with a bounded queue even in an unlimited interactive run.
 class ControlLog {
@@ -279,7 +333,7 @@ class ControlLog {
   explicit ControlLog(const std::filesystem::path& path) {
     if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     out_.open(path);
-    out_<<std::setprecision(17)<<columns<<'\n';
+    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<'\n';
     if(!out_) throw std::runtime_error("Cannot open control CSV");
     worker_=std::thread([this] {
       try {
@@ -397,10 +451,19 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
     <<"; base_accel="<<(opts.centroidal_base_accel ? "centroidal" : "tracking")
     <<"; target="<<(opts.online ? "online" : "scripted")
     <<"; session="<<(opts.duration==0 ? "until user exit" : "timed")
+    <<"; estimator="<<(opts.estimator_control ? "control (waiting)" :
+                       (opts.estimator_shadow ? "shadow" : "off"))
     <<std::endl;
   go2::CentroidalState last_input=go2::CentroidalState::Zero();
   double continuous_yaw=obs.state[9];
+  double truth_continuous_yaw=obs.state[9];
   bool trot_sent=false,stance_sent=false;
+  go2::PreprocessorSettings estimator_settings;
+  go2::EstimatorPreprocessor estimator_preprocessor(robot,estimator_settings);
+  go2::LinearKalmanFilter estimator;
+  bool estimator_initialized = false;
+  bool estimator_control_active = false;
+  double estimator_ready_since = -1.0;
   std::size_t mode=15,step=0;
   ControlLog log(opts.output);
   std::vector<Row> rows; rows.reserve(500);
@@ -414,7 +477,161 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       const auto begin=Clock::now();
       const double lateness=std::max(0.0,milliseconds(scheduled,begin));
       sim.state(q,v);
-      auto current_state=mapping.state(q,v);
+      const auto sensor_begin = Clock::now();
+      const auto sensors = sim.sensors();
+      const double sensor_read_ms = milliseconds(sensor_begin);
+
+      if(std::abs(sensors.time_s - stamp) > 1e-9){
+        throw std::runtime_error(
+          "Sensor time differs from current control time"
+        );
+      }
+
+      double joint_position_error = 0.0;
+      double joint_velocity_error = 0.0;
+
+      for (int i = 0; i<12; ++i){
+        const auto joint_id = robot.model.getJointId(robot.motor_names[i]);
+        const auto& joint = robot.model.joints[joint_id];
+      
+        joint_position_error = std::max(joint_position_error, std::abs(sensors.joint_position[i] - q[joint.idx_q()]));
+        joint_velocity_error = std::max(joint_velocity_error, std::abs(sensors.joint_velocity[i] - v[joint.idx_v()]));
+      }
+
+      const Eigen::Quaterniond truth_orientation(q[6], q[3], q[4], q[5]);
+
+      const double orientation_error =sensors.orientation_world_from_imu.angularDistance(truth_orientation);
+
+      //当前模型的IMU坐标轴与基座坐标系对齐
+      const double gyro_error = (sensors.angular_velocity_imu - v.segment<3>(3)).norm();
+
+      // 当前这些传感器未配置噪声，用严格误差检查映射
+      if (joint_position_error > 1e-8 ||
+          joint_velocity_error > 1e-8 ||
+          orientation_error > 1e-7 ||
+          gyro_error > 1e-8) {
+        throw std::runtime_error("Sensor measurements disagree with simulation state");}
+        const Eigen::Matrix3d truth_rotation =
+          truth_orientation.toRotationMatrix();
+
+        const Eigen::Vector3d truth_base_velocity_world =
+          truth_rotation * v.head<3>();
+
+        go2::EstimatorInput estimator_input;
+        std::array<go2::SimulatedFootMotion,4> truth_foot_motion{};
+
+        Eigen::Vector3d estimated_position = Eigen::Vector3d::Zero();
+        Eigen::Vector3d estimated_velocity = Eigen::Vector3d::Zero();
+        Eigen::Vector3d estimator_position_error = Eigen::Vector3d::Zero();
+        Eigen::Vector3d estimator_velocity_error = Eigen::Vector3d::Zero();
+        
+
+        double estimator_ms = 0.0;
+
+        if (opts.estimator_shadow) {
+        const auto estimator_begin = Clock::now();
+
+        estimator_input = estimator_preprocessor.convert(sensors);
+        // Independent simulator truth validates preprocessing only. It is not
+        // passed into reset/update or used to correct the estimated state.
+        truth_foot_motion=sim.footMotion();
+        for(int i=0;i<4;++i) {
+          const auto& foot=estimator_input.feet[i];
+          if((q.head<3>()+foot.position_relative_world-
+              truth_foot_motion[i].position_world).norm()>1e-8 ||
+             (truth_base_velocity_world+foot.velocity_relative_world-
+              truth_foot_motion[i].velocity_world).norm()>1e-8)
+            throw std::runtime_error("Estimator foot kinematics disagree with MuJoCo");
+        }
+
+        if (!estimator_initialized) {
+          double initial_height = 0.0;
+          int support_count = 0;
+
+          for (const auto& foot : estimator_input.feet) {
+            if (foot.contact) {
+              initial_height +=
+                  foot.support_height_world - foot.position_relative_world.z();
+              ++support_count;
+            }
+          }
+
+          if (support_count == 0) {
+            throw std::runtime_error(
+                "Estimator initialization requires measured foot contact");
+          }
+
+          initial_height /= support_count;
+
+          const Eigen::Vector3d initial_position(
+              0.0, 0.0, initial_height);
+
+          estimator.reset(estimator_input, initial_position);
+          estimator_initialized = true;
+        } else {
+          estimator.update(estimator_input);
+        }
+
+        estimated_position = estimator.positionWorld();
+        estimated_velocity = estimator.velocityWorld();
+
+        estimator_ms = milliseconds(estimator_begin);
+
+        estimator_position_error =
+            estimated_position - q.head<3>();
+
+        estimator_velocity_error =
+            estimated_velocity - truth_base_velocity_world;
+      }
+      if (opts.estimator_control && !estimator_control_active) {
+        const bool all_feet_contact = std::all_of(
+            sensors.foot_contact.begin(),sensors.foot_contact.end(),
+            [](bool contact) {return contact;});
+        const bool ready = stamp>=2.0 && all_feet_contact &&
+            estimated_position.allFinite() && estimated_velocity.allFinite() &&
+            estimated_position.z()>0.12 && estimated_position.z()<0.50 &&
+            estimated_velocity.norm()<0.02 && sensors.angular_velocity_imu.norm()<0.10;
+        if (ready) {
+          if (estimator_ready_since<0.0) estimator_ready_since=stamp;
+          if (stamp-estimator_ready_since>=0.2-1e-9) {
+            estimator_control_active=true;
+            std::cout<<"Estimator control activated at t="<<stamp<<" s"<<std::endl;
+          }
+        } else {
+          estimator_ready_since=-1.0;
+        }
+        if (!estimator_control_active && stamp>=3.0)
+          throw std::runtime_error("Estimator did not become ready before 3 s");
+      }
+
+      Eigen::VectorXd control_q=q,control_v=v;
+      if (estimator_control_active) {
+        const Eigen::Matrix3d rotation_base_from_imu=
+            estimator_settings.rotation_base_from_imu.normalized().toRotationMatrix();
+        const Eigen::Matrix3d rotation_world_from_base=
+            sensors.orientation_world_from_imu.normalized().toRotationMatrix()*
+            rotation_base_from_imu.transpose();
+        control_q.head<3>()=estimated_position;
+        control_q.segment<4>(3)=Eigen::Quaterniond(rotation_world_from_base).coeffs();
+        control_v.head<3>()=rotation_world_from_base.transpose()*estimated_velocity;
+        control_v.segment<3>(3)=rotation_base_from_imu*sensors.angular_velocity_imu;
+        for (int i=0;i<12;++i) {
+          const auto& joint=robot.model.joints[robot.model.getJointId(robot.motor_names[i])];
+          control_q[joint.idx_q()]=sensors.joint_position[i];
+          control_v[joint.idx_v()]=sensors.joint_velocity[i];
+        }
+        if (!control_q.allFinite() || !control_v.allFinite() ||
+            control_q[2]<=0.12 || control_q[2]>=0.50)
+          throw std::runtime_error("Invalid estimated control state");
+      }
+      const Eigen::Matrix3d control_rotation=Eigen::Quaterniond(
+          control_q[6],control_q[3],control_q[4],control_q[5]).toRotationMatrix();
+      const Eigen::Vector3d control_base_velocity_world=control_rotation*control_v.head<3>();
+      const auto truth_centroidal_state=mapping.state(q,v);
+      truth_continuous_yaw+=std::remainder(
+          truth_centroidal_state[9]-truth_continuous_yaw,2.0*std::acos(-1.0));
+      auto current_state=estimator_control_active ?
+          mapping.state(control_q,control_v) : truth_centroidal_state;
       continuous_yaw+=std::remainder(current_state[9]-continuous_yaw,2.0*std::acos(-1.0));
       current_state[9]=continuous_yaw;
       const auto state_end=Clock::now();
@@ -424,7 +641,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         obs.time=stamp;
         obs.mode=mrt.getPolicy().modeSchedule_.modeAtTime(stamp);
         obs.state=current_state; obs.input=last_input;
-        obs.input.tail<12>()=mapping.jointVelocities(v); mrt.observe(obs);
+        obs.input.tail<12>()=mapping.jointVelocities(control_v); mrt.observe(obs);
       }
       const bool updated=step%2==0 && mrt.select(stamp,stamp+.009);
       mrt.checkCoverage(stamp,stamp+.005);
@@ -456,17 +673,18 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       const auto nominal=mapping.point(state_ref,nominal_input);
       const auto future=mapping.point(future_state,future_input);
       // Contact-force references retain the current feedback correction.
-      auto reference=mapping.reference(q,nominal,future,input_ref,mode,future_mode,.005);
+      auto reference=mapping.reference(control_q,nominal,future,input_ref,mode,future_mode,.005);
       if(opts.centroidal_base_accel) {
         Eigen::VectorXd joint_acceleration=Eigen::VectorXd::Zero(12);
         if(step>0)
           joint_acceleration=(input_ref.tail<12>()-last_input.tail<12>())/sim.timestep();
         const auto desired_acceleration=mapping.centroidalBaseAcceleration(point,input_ref,joint_acceleration);
-        reference.base_acceleration=go2::baseAccelerationInMeasuredFrame(point,desired_acceleration,q,v);
+        reference.base_acceleration=go2::baseAccelerationInMeasuredFrame(
+            point,desired_acceleration,control_q,control_v);
       }
       const auto reference_end=Clock::now();
       auto& wbc=*controllers.at(mode);
-      const auto qp=wbc.formulate(q,v,reference);
+      const auto qp=wbc.formulate(control_q,control_v,reference);
       const auto result=[&]() {
         try { return wbc.solve(qp,*solvers.at(mode)); }
         catch(const std::exception& error) {
@@ -477,7 +695,9 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
             failure.put("policy_sequence",mrt.identity().sequence);
             failure.put("error",error.what());
             failure.add_child("wbc_settings",wbcSettingsTree(opts.wbc_settings));
-            failure.add_child("q",vectorTree(q)); failure.add_child("v",vectorTree(v));
+            failure.add_child("q",vectorTree(control_q)); failure.add_child("v",vectorTree(control_v));
+            failure.add_child("truth_q",vectorTree(q)); failure.add_child("truth_v",vectorTree(v));
+            failure.put("estimator_control_active",estimator_control_active);
             failure.add_child("input",vectorTree(input_ref));
             failure.add_child("previous_input",vectorTree(last_input));
             failure.add_child("qp.H",matrixTree(qp.H)); failure.add_child("qp.g",vectorTree(qp.g));
@@ -499,8 +719,8 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       }();
       const auto wbc_end=Clock::now();
       const Eigen::VectorXd feedback=
-          opts.joint_kp*(point.q.tail<12>()-q.tail<12>())+
-          opts.joint_kd*(point.v.tail<12>()-v.tail<12>());
+          opts.joint_kp*(point.q.tail<12>()-control_q.tail<12>())+
+          opts.joint_kd*(point.v.tail<12>()-control_v.tail<12>());
       const Eigen::VectorXd torques=result.torques+feedback;
       const double clip=sim.command(torques);
       last_input=input_ref;
@@ -528,7 +748,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       const auto floor=sim.floorForces();
       const auto& id=mrt.identity();
       Row row{};
-      row={stamp,double(mode),goal[6],state_ref[6],q[0],goal[9],state_ref[9],continuous_yaw,goal[8],state_ref[8],q[2],
+      row={stamp,double(mode),goal[6],state_ref[6],q[0],goal[9],state_ref[9],truth_continuous_yaw,goal[8],state_ref[8],q[2],
           result.torques.cwiseAbs().maxCoeff(),feedback.cwiseAbs().maxCoeff(),sim.maximumAppliedTorque(),clip,
           result.dynamics_residual,result.contact_residual,double(id.epoch),double(id.sequence),1000*(stamp-id.observation_time),double(updated),
           milliseconds(begin,state_end),milliseconds(state_end,policy_end),milliseconds(policy_end,mrt_end),
@@ -558,16 +778,67 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       row[70]=double(opts.online);
       row[71]=goal[7]; row[72]=state_ref[7]; row[73]=q[1];
       row[74]=goal[0]; row[75]=goal[1];
-      row[76]=current_state[0]; row[77]=current_state[1];
+      row[76]=truth_centroidal_state[0]; row[77]=truth_centroidal_state[1];
       row[78]=active_target_trajectory.timeTrajectory.front();
       row[79]=active_target_trajectory.timeTrajectory.back();
+      row[80]=sensors.time_s;
+      const auto& imu_orientation = sensors.orientation_world_from_imu;
+      row[81]=imu_orientation.w();
+      row[82]=imu_orientation.x();
+      row[83]=imu_orientation.y();
+      row[84]=imu_orientation.z();
+
+      for (int axis = 0; axis < 3; ++axis) {
+        row[85 + axis] = sensors.angular_velocity_imu[axis];
+        row[88 + axis] = sensors.specific_force_imu[axis];
+      }
+
+      row[91] = joint_position_error;
+      row[92] = joint_velocity_error;
+      row[93] = orientation_error;
+      row[94] = gyro_error;
+      row[95] = sensor_read_ms;
+
+      for (int i = 0; i < 4; ++i) {
+        row[96 + i] = sensors.foot_contact[i] ? 1.0 : 0.0;
+      }
+
+      row[100] = opts.estimator_shadow ? 1.0 : 0.0;
+
+      for (int axis = 0; axis < 3; ++axis) {
+        row[101 + axis] = estimated_position[axis];
+        row[104 + axis] = estimated_velocity[axis];
+        row[107 + axis] = truth_base_velocity_world[axis];
+        row[110 + axis] = estimator_position_error[axis];
+        row[113 + axis] = estimator_velocity_error[axis];
+        row[116 + axis] = estimator_input.base_acceleration_world[axis];
+      }
+
+      row[119] = estimator_ms;
+      row[120] = estimator_control_active ? 1.0 : 0.0;
+      for (int axis=0;axis<3;++axis) {
+        row[121+axis]=control_q[axis];
+        row[124+axis]=control_base_velocity_world[axis];
+      }
+      for(int i=0;i<4;++i) {
+        const auto& foot=estimator_input.feet[i];
+        for(int axis=0;axis<3;++axis) {
+          row[127+16*i+axis]=foot.position_relative_world[axis];
+          row[130+16*i+axis]=foot.velocity_relative_world[axis];
+          row[133+16*i+axis]=truth_foot_motion[i].velocity_world[axis];
+          row[136+16*i+axis]=foot.angular_velocity_world[axis];
+          row[139+16*i+axis]=foot.supported_velocity_world[axis];
+        }
+        row[142+16*i]=foot.contact_trust;
+      }
+
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();
       row[28]=milliseconds(command_end,simulation_end); row[32]=lateness;
       rows.push_back(row);
       if(step%500==0) std::cout<<"t="<<std::fixed<<std::setprecision(3)<<stamp<<" mode="<<mode
-          <<" z="<<q[2]<<" x="<<q[0]<<" yaw="<<continuous_yaw<<" age="<<row[19]<<"ms control="<<row[27]<<"ms"<<std::endl;
+          <<" z="<<q[2]<<" x="<<q[0]<<" yaw="<<truth_continuous_yaw<<" age="<<row[19]<<"ms control="<<row[27]<<"ms"<<std::endl;
       const auto end=Clock::now();
       rows.back()[29]=milliseconds(simulation_end,diagnostics_end)+milliseconds(viewer_end,end);
       rows.back()[30]=milliseconds(diagnostics_end,viewer_end);
