@@ -1331,3 +1331,62 @@ export ROS_DOMAIN_ID=216
 键盘输出在按 T 前出现一次“观测连接中断”，随后恢复。该提示由键盘端 `connected()` 的观测新鲜度（0.2 s）与速度话题订阅连接检查触发；没有键盘端时间戳，无法确定究竟哪一项短暂未满足，不认定为已定位的启动问题。本轮成功控制样本中的最大策略年龄为 26 ms，在线目标发布记录的最大仿真观测时间间隔为 60 ms、最大墙钟发布间隔为 100 ms（发生在观测时间仍为 0 的初始化阶段）；未触发原生 MPC 策略过期。保留该现象，不为本次短暂恢复提示放宽检查或重复整轮测试。
 
 至此，本分支的规定准备姿态传感器启动、共用关节命令、在线主动停止和仿真故障检测/退出均有阶段结果及一次窗口人工观察。当前修改尚未提交，下一步提交/push 并通过 PR 收尾本阶段；合并同步后再创建 SDK2 LowCmd 离线构造/映射分支。噪声/延迟/接触异常、定量外力、目标机时序及实机故障动作仍按路线图推进。
+
+
+## SDK2 离线关节命令适配（2026-10-20）
+
+启动/会话流程通过 PR #20 合并，`main` 与 `origin/main` 已同步到 `c797335`，随后创建 `feature/sdk2-command-adapter`。本节点新增独立的 `hardware/sdk2_adapter` 静态库和离线检查入口，复用现有 `JointCommand`。程序只构造和核对 SDK 类型，不初始化 DDS、创建发布者或切换运动控制权。
+
+### 数据如何转换
+
+```text
+JointCommand（按 RobotModel::motor_names 排列）
+  → 按关节名称映射至 SDK JointIndex
+  → 写入 MotorCmd 的 q/dq/kp/kd/tau
+  → 计算 LowCmd CRC
+```
+
+索引直接使用当前 SDK2 `d1abf001` 的 [Go2 JointIndex 枚举](https://github.com/unitreerobotics/unitree_sdk2/blob/d1abf001220d3e5f59e00a0c4aaa595e00089a4a/include/unitree/dds_wrapper/robots/go2/defines.h)：
+
+| 关节 | SDK motor 索引 |
+| --- | --- |
+| FR hip/thigh/calf | 0 / 1 / 2 |
+| FL hip/thigh/calf | 3 / 4 / 5 |
+| RR hip/thigh/calf | 6 / 7 / 8 |
+| RL hip/thigh/calf | 9 / 10 / 11 |
+
+映射根据名称建立，即使模型/命令数组换了顺序也能正确填入对应的 SDK 槽位；缺少、重复或未知关节名会被拒绝。反向 `decodeJoints()` 将 LowState 的 q/dq/tau_est 读回相同的模型关节顺序，只返回关节字段，不生成默认的 IMU/接触数据，不把电机估计力矩当作足端力。
+
+对应字段是 `position→q`、`velocity→dq`、`kp→kp`、`kd→kd`、`feedforward_torque→tau`。**tau 只填前馈力矩**，不预先把关节 PD 加进去；目标和增益单独传递，避免底层再执行 PD 时重复叠加。
+
+头部、level_flag、mode 及未使用槽位沿用当前 SDK2 [go2_low_level.cpp](https://github.com/unitreerobotics/unitree_sdk2/blob/d1abf001220d3e5f59e00a0c4aaa595e00089a4a/example/go2/go2_low_level.cpp) 的初始化约定：head=FE/EF、level_flag=FF、mode=01；总共 20 个 motor_cmd 槽位，12～19 保留 q=2.146e9、dq=16000、Kp/Kd/tau=0 的初始化值。本次未验证解锁 Air 固件对这些字段的实际处理。
+
+### CRC 与输入检查
+
+CRC 按该 SDK 示例的 32 位字序和多项式计算。当前 LowCmd 对象大小为 812 字节；检查器核对 CRC 为最后 4 字节、float 为 IEEE 32 位及小端布局。构造前清零全部字节（包含参与 CRC 的 ABI 填充），最后在调用者提供的最终对象中写入 CRC。计算使用 memcpy 读取字，避免示例指针转换的对齐/别名问题；参考算法及 SDK 的 BSD-3-Clause 条款保存在同目录 `UNITREE_LICENSE`。
+
+适配器检查现有命令的有限性、非负增益及 double 到 SDK float 的可表示范围；数值溢出会被拒绝。时间字段仅保留现有命令验证，**未执行真实数据新鲜度、总力矩/物理限位、电机健康或控制权检查**，这些属于后续真实读写环节。CRC 用于检查消息内容一致性，不代表动作已经通过物理验收。
+
+### 已完成检查
+
+使用 GCC 13.3 Release、系统 Eigen 和已安装 SDK2 成功构建，入口为 `bash scripts/check_sdk2_commands.sh`。离线检查包含：打乱关节顺序后逐个核对五字段；LowState 关节反向映射；重复/缺少/未知名字；负增益、NaN、float 溢出及无效关节状态；未使用 motor 槽位和附加字段初始化；重复构造的字节一致性；修改命令后 CRC 必须失效；逐包与 SDK 示例参考循环核对 CRC。
+
+另使用已有官方窗口键盘 CSV，逐条构造并核对全部 **16,706 条**命令，覆盖准备、接管、trot、前进和主动停止。结果为 `artifacts/sdk2_command_adapter_verified_20261020.json`：通过，DDS 初始化=0，发送命令=0，hardware_verified=false。`reference_sdk_commit` 记录本实现使用的 SDK 协议参考版本；本轮本地 SDK2 checkout 的 HEAD 也已核对为该提交。
+
+| 字段 | double→float 最大绝对数值差 |
+| --- | --- |
+| q | 1.19209e-7 rad |
+| dq | 2.38264e-7 rad/s |
+| Kp | 1.52588e-6 |
+| Kd | 1.14441e-7 |
+| tau_ff | 8.54038e-7 Nm |
+
+已执行的命令如下，报告已存在，复跑应更换 `--report` 路径：
+
+```bash
+bash scripts/check_sdk2_commands.sh \
+  --csv artifacts/cpp_session_keyboard_20261020.csv \
+  --report artifacts/sdk2_command_adapter_verified_20261020.json
+```
+
+这些结果验证了软件索引、传值和消息构造；真实关节方向/零位、IMU 约定、接触有效性、发送频率/时延、驱动限幅和控制权仍待接机确认。本节点没有新增实机写入入口。代码和文档尚未提交，提交/push 后可通过 PR 收尾此离线适配节点；合并后进入集中仿真验收，把噪声/延迟、接触异常和已知外力的恢复表现按工况记录。实际只读采样可在用户方便连接机器人时并行推进，真实写入需要接机映射及保护流程确认。
