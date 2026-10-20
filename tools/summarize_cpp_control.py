@@ -6,6 +6,97 @@ from pathlib import Path
 import numpy as np
 
 
+def summarize_push(data):
+    """Describe a single pulse; recovery thresholds are a scoped experiment definition."""
+    fields = ("push_enabled", "push_start_s", "push_duration_s", "push_fx_n", "push_fy_n", "push_fz_n",
+              "push_point_x_world_m", "push_point_y_world_m", "push_point_z_world_m")
+    if not any(name in data.dtype.names for name in fields):
+        return None  # Historical CSVs remain readable.
+    if not all(name in data.dtype.names for name in fields):
+        raise RuntimeError("Incomplete push metadata")
+    for name in fields:
+        if not np.isfinite(data[name]).all():
+            raise RuntimeError(f"Non-finite push metadata: {name}")
+    enabled = np.unique(data["push_enabled"])
+    if len(enabled) != 1 or enabled[0] not in (0, 1):
+        raise RuntimeError("Invalid push enable flag")
+    force = np.column_stack([data[f"push_f{axis}_n"] for axis in "xyz"])
+    if not enabled[0]:
+        if np.any(force):
+            raise RuntimeError("Disabled push contains force")
+        return {"enabled": False}
+    for name in ("push_start_s", "push_duration_s"):
+        if len(np.unique(data[name])) != 1:
+            raise RuntimeError("Push configuration changed during run")
+    start, duration = float(data["push_start_s"][0]), float(data["push_duration_s"][0])
+    if start < 3 or duration < 0.002 or not np.allclose(
+            np.array([start, duration]) / 0.002, np.round(np.array([start, duration]) / 0.002), atol=1e-7, rtol=0):
+        raise RuntimeError("Invalid pulse timing")
+    t, end = data["time_s"], start + duration
+    active = (t >= start - 1e-9) & (t < end - 1e-9)
+    if active.sum() != round(duration / 0.002) or not (t >= end - 1e-9).any():
+        raise RuntimeError("Push pulse or post-push observation incomplete")
+    vector = force[active][0]
+    if not np.any(vector) or not np.allclose(force[active], vector, atol=1e-10, rtol=0) or np.any(force[~active]):
+        raise RuntimeError("Push force differs from a single constant pulse")
+    # This protocol measures return to the previous tracking offset of a fixed horizontal target.
+    window = (t >= start - 0.5 - 1e-9) & (t < end + 5 - 1e-9)
+    baseline = (t >= start - 0.5 - 1e-9) & (t < start - 1e-9)
+    if baseline.sum() != 250:
+        raise RuntimeError("Missing 0.5 s push baseline")
+    goals = np.column_stack([data[f"goal_{axis}_m"] for axis in "xyz"])
+    yaw_error = np.arctan2(np.sin(data["measured_yaw_rad"] - data["goal_yaw_rad"]),
+                           np.cos(data["measured_yaw_rad"] - data["goal_yaw_rad"]))
+    error = np.column_stack([data[f"measured_{axis}_m"] for axis in "xyz"]) - goals
+    position_change = error - error[baseline].mean(axis=0)
+    velocity = np.column_stack([data[f"truth_base_v{axis}_world_mps"] for axis in "xyz"])
+    velocity_change = velocity - velocity[baseline].mean(axis=0)
+    tilt = np.maximum(np.abs(data["measured_roll_rad"]), np.abs(data["measured_pitch_rad"]))
+    horizontal = np.linalg.norm(position_change[:, :2], axis=1)
+    speed = np.linalg.norm(velocity_change[:, :2], axis=1)
+    after = (t >= end - 1e-9) & window
+    during_and_after = (t >= start - 1e-9) & window
+    fixed_target = (np.ptp(goals[window, :2], axis=0).max() < 1e-8 and
+                    np.ptp(np.unwrap(data["goal_yaw_rad"][window])) < 1e-8)
+    good = (horizontal <= 0.02) & (np.abs(position_change[:, 2]) <= 0.02) & (speed <= 0.03) & (
+        tilt <= np.deg2rad(3)) & (np.abs(yaw_error) <= np.deg2rad(5))
+    recovery, confirmed, count = None, None, 0
+    if fixed_target:
+        for i in np.flatnonzero(after):
+            count = count + 1 if good[i] else 0
+            if count >= 250:  # All 250 consecutive 2 ms intervals satisfy the thresholds.
+                recovery = max(0.0, float(t[i - 249] - end))
+                confirmed = float(t[i] + 0.002)
+                break
+    points = np.column_stack([data[f"push_point_{axis}_world_m"] for axis in "xyz"])
+    result = {
+        "enabled": True, "start_s": start, "duration_s": duration,
+        "force_world_n": vector.tolist(), "impulse_world_ns": (force.sum(axis=0) * 0.002).tolist(),
+        "application": "base_link center of mass (not whole-robot COM), world axes; no direct torque",
+        "point_at_onset_world_m": points[active][0].tolist(),
+        "baseline_window_s": [start - 0.5, start],
+        "evaluation_end_s": float(t[after][-1] + 0.002),
+        "max_horizontal_tracking_offset_change_m": float(horizontal[during_and_after].max()),
+        "max_roll_pitch_deg": float(np.rad2deg(tilt[during_and_after].max())),
+        "max_horizontal_velocity_change_mps": float(speed[during_and_after].max()),
+        "max_estimated_horizontal_position_error_m": (float(np.hypot(
+            data["estimator_position_error_x_m"][during_and_after], data["estimator_position_error_y_m"][during_and_after]).max())
+            if "estimator_shadow_enabled" in data.dtype.names and (data["estimator_shadow_enabled"][during_and_after] == 1).all()
+            else None),
+        "maximum_applied_torque_nm": float(data["max_applied_torque_nm"][during_and_after].max()),
+        "clipped_steps": int((data["max_torque_clip_nm"][during_and_after] > 1e-9).sum()),
+        "recovery_applicable": bool(fixed_target), "recovery_time_after_force_end_s": recovery,
+        "recovery_confirmed_at_s": confirmed,
+        "thresholds": {"horizontal_offset_change_m": 0.02, "vertical_offset_change_m": 0.02,
+                       "horizontal_velocity_change_mps": 0.03, "absolute_roll_pitch_deg": 3,
+                       "absolute_yaw_tracking_error_deg": 5, "continuous_duration_s": 0.5},
+        "note": "0.5 s pre-push mean is the baseline. Evaluate at most 5 s after force end. "
+                "Recovery is not evaluated for moving horizontal/yaw targets; height tracking offset is baseline-relative. "
+                "No mouse interaction during quantitative runs. A recovered window is not a guarantee for larger pushes.",
+    }
+    return result
+
+
 def summarize_commands(path, allow_empty=False):
     """Summarize commands sampled when targets were published, outside control."""
     data = np.atleast_1d(np.genfromtxt(path, delimiter=",", names=True))
@@ -372,6 +463,9 @@ def summarize(path, duration=20.0, commands=None):
         result["swing_height_tracking_rmse_mm"][leg] = (
             1000 * rmse(evaluated[f"foot_z_{leg}_m"][swing] - target[swing]) if swing.any() else None
         )
+    push = summarize_push(data)
+    if push is not None:
+        result["push"] = push
     output = path.with_suffix(".json")
     output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     print(f"Completed {duration:g} s / {len(data)} steps; modes: {result['mode_samples']}")
@@ -402,6 +496,12 @@ def summarize(path, duration=20.0, commands=None):
         print(f"Control session: {session['reason']}; report: {session_path}")
     if "joint_command" in result:
         print("Joint commands: q/dq/Kp/Kd/tau_ff; all 12 joints and handoff gains verified")
+    if push is not None and push["enabled"]:
+        print(f"Push: {push['force_world_n']} N for {push['duration_s']:g} s; "
+              f"impulse={push['impulse_world_ns']} N*s")
+        print(f"Push response: max roll/pitch={push['max_roll_pitch_deg']:.3f} deg; "
+              f"horizontal offset change={1000 * push['max_horizontal_tracking_offset_change_m']:.3f} mm; "
+              f"recovery after force end={push['recovery_time_after_force_end_s']} s (None=not confirmed/applicable)")
     print(f"Final x: {result['final_x_m']:.6f} m; yaw: {result['final_yaw_deg']:.3f} deg; "
           f"torque: {result['maximum_applied_torque_nm']:.3f} Nm; clipped steps: {result['clipped_steps']}")
     for name in ("control_ms", "loop_ms", "control_start_lateness_ms"):

@@ -75,6 +75,8 @@ Simulation::Simulation(const std::filesystem::path& root,const RobotModel& robot
     if(foot_geoms_[i]<0) throw std::runtime_error("Missing foot collision geom");
   }
   floor_=mj_name2id(model_.get(),mjOBJ_GEOM,"floor");
+  base_body_=mj_name2id(model_.get(),mjOBJ_BODY,"base_link");
+  if(base_body_<=0) throw std::runtime_error("Missing push body base_link");
   const int home=mj_name2id(model_.get(),mjOBJ_KEY,"home");
   if(home<0 || floor_<0) throw std::runtime_error("Missing floor or home keyframe");
   mj_resetDataKeyframe(model_.get(),data_.get(),home);
@@ -100,7 +102,12 @@ int Simulation::sensorAddress(
 
 SensorMeasurements Simulation::sensors(){
   // 刷新当前 q/v 下的传感器结果，不推进时间
+  auto* wrench=data_->xfrc_applied+6*base_body_;
+  const Eigen::Vector3d saved_force=Eigen::Map<const Eigen::Vector3d>(wrench);
+  Eigen::Map<Eigen::Vector3d> force(wrench);
+  force+=push_force_world_;
   mj_forward(model_.get(), data_.get());
+  force=saved_force;
 
   SensorMeasurements result;
   result.time_s = data_->time;
@@ -239,9 +246,21 @@ double Simulation::maximumAppliedTorque() const {
   return result;
 }
 void Simulation::step() {
+  auto* wrench=data_->xfrc_applied+6*base_body_;
+  const Eigen::Vector3d saved_force=Eigen::Map<const Eigen::Vector3d>(wrench);
+  Eigen::Map<Eigen::Vector3d> force(wrench);
+  force+=push_force_world_;
   mj_step(model_.get(),data_.get());
+  force=saved_force;  // Keep mouse forces separate; never accumulate the pulse.
   for(int i=0;i<mjNWARNING;++i) if(data_->warning[i].number>0)
     throw std::runtime_error("MuJoCo warning during native control: "+std::to_string(i));
+}
+void Simulation::setPushForce(const Eigen::Vector3d& force_world) {
+  if(!force_world.allFinite()) throw std::runtime_error("Non-finite external push");
+  push_force_world_=force_world;
+}
+Eigen::Vector3d Simulation::pushPointWorld() const {
+  return Eigen::Map<const Eigen::Vector3d>(data_->xipos+3*base_body_);
 }
 std::array<double,4> Simulation::floorForces() const {
   std::array<double,4> forces{};

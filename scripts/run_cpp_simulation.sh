@@ -10,6 +10,7 @@ if [[ "${1:-}" == --help ]]; then
     '  [--estimator-control] (simulation truth startup, then estimated state after readiness checks)' \
     '  [--sensor-startup] (nominal joint preparation -> estimated-state MPC/WBC; no base p/v truth in control)' \
     '  [--request-stop-at SECONDS] (zero target + stance, settle 0.3 s, end session; timeout 5 s)' \
+    '  [--push-at 8 --push-duration 0.2 --push-fy 20] (world-frame N at base_link COM; --push-fx/--push-fz also supported)' \
     '  Stop topic: /go2_control/stop (std_msgs/msg/Empty); this ends the simulation session.' \
     '  Fault checks: --inject-fault sensor-stale|estimator-invalid|policy-stale|wbc-invalid --inject-at SECONDS' \
     '  [--wbc-config JSON] (relative to project root; default: built-in WBC settings)' \

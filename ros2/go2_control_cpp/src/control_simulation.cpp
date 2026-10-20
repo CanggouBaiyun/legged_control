@@ -177,6 +177,9 @@ struct Options {
   double joint_kp=20.0,joint_kd=1.0;
   double request_stop_at=-1,inject_at=-1;
   std::string inject_fault;
+  double push_at=-1,push_duration=0.2;
+  Eigen::Vector3d push_force=Eigen::Vector3d::Zero();
+  bool push_specified=false;
 };
 Options options(int argc,char** argv) {
   Options result;
@@ -190,6 +193,11 @@ Options options(int argc,char** argv) {
     else if(key=="--trot-at") result.trot_at=std::stod(value());
     else if(key=="--stop-trot-at") result.stop_at=std::stod(value());
     else if(key=="--request-stop-at") result.request_stop_at=std::stod(value());
+    else if(key=="--push-at") {result.push_at=std::stod(value());result.push_specified=true;}
+    else if(key=="--push-duration") {result.push_duration=std::stod(value());result.push_specified=true;}
+    else if(key=="--push-fx") {result.push_force[0]=std::stod(value());result.push_specified=true;}
+    else if(key=="--push-fy") {result.push_force[1]=std::stod(value());result.push_specified=true;}
+    else if(key=="--push-fz") {result.push_force[2]=std::stod(value());result.push_specified=true;}
     else if(key=="--inject-fault") result.inject_fault=value();
     else if(key=="--inject-at") result.inject_at=std::stod(value());
     else if(key=="--joint-kp") result.joint_kp=std::stod(value());
@@ -223,6 +231,9 @@ Options options(int argc,char** argv) {
           "MPC is prewarmed before simulation time starts; this is not a hardware startup implementation.\n"
           "--request-stop-at SECONDS requests zero velocity and stance, then ends after 0.3 s stable stance (5 s timeout).\n"
           "The same request is available on /go2_control/stop (std_msgs/Empty).\n"
+          "Push: --push-at SECONDS --push-duration SECONDS --push-fx N --push-fy N --push-fz N.\n"
+          "Force is world-frame, applied at base_link COM; unspecified axes are zero. Default duration=0.2 s.\n"
+          "Start must be >=3 s; start/duration must be multiples of 0.002 s, fully inside the run.\n"
           "Simulation fault checks: --inject-fault sensor-stale|estimator-invalid|policy-stale|wbc-invalid --inject-at SECONDS (>=3).\n"
           "WBC paths are relative to the project root; omitting --wbc-config keeps built-in defaults.\n";
       std::exit(0);
@@ -245,6 +256,13 @@ Options options(int argc,char** argv) {
   if(!std::isfinite(result.request_stop_at) || (result.request_stop_at!=-1 &&
       (result.request_stop_at<=0 || (result.duration>0 && result.request_stop_at>=result.duration))))
     throw std::runtime_error("Invalid --request-stop-at");
+  const auto aligned=[](double t){return std::abs(t/.002-std::round(t/.002))<1e-7;};
+  if(result.push_specified && (!std::isfinite(result.push_at) || result.push_at<3 ||
+      !std::isfinite(result.push_duration) || result.push_duration<.002 ||
+      !result.push_force.allFinite() || !std::isfinite(result.push_force.norm()) || result.push_force.norm()==0 ||
+      !aligned(result.push_at) || !aligned(result.push_duration) ||
+      (result.duration>0 && result.push_at+result.push_duration>result.duration)))
+    throw std::runtime_error("Push needs finite nonzero force, --push-at >=3, positive 2 ms-aligned duration, fully inside run");
   const std::set<std::string> injections{"sensor-stale","estimator-invalid","policy-stale","wbc-invalid"};
   if(!std::isfinite(result.inject_at) ||
       (result.inject_fault.empty() ? result.inject_at!=-1 :
@@ -370,7 +388,9 @@ std::string jointCommandColumns(const std::vector<std::string>& names) {
       result+=",cmd_"+name+"_"+field;
   return result;
 }
-using Row=std::array<double,256>;
+const std::string push_columns=",push_enabled,push_start_s,push_duration_s,push_fx_n,push_fy_n,push_fz_n,"
+    "push_point_x_world_m,push_point_y_world_m,push_point_z_world_m";
+using Row=std::array<double,265>;
 // The controller submits one second of rows at a time. Disk I/O runs on a
 // separate thread, with a bounded queue even in an unlimited interactive run.
 class ControlLog {
@@ -378,7 +398,7 @@ class ControlLog {
   explicit ControlLog(const std::filesystem::path& path,const std::vector<std::string>& motor_names) {
     if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     out_.open(path);
-    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<startup_columns<<jointCommandColumns(motor_names)<<",control_session_state"<<'\n';
+    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<startup_columns<<jointCommandColumns(motor_names)<<",control_session_state"<<push_columns<<'\n';
     if(!out_) throw std::runtime_error("Cannot open control CSV");
     worker_=std::thread([this] {
       try {
@@ -456,6 +476,10 @@ void writeSession(const Options& opts,const go2::ControlSession& session) {
   report.put("requested_duration_s",opts.duration);report.put("csv_flushed",session.csv_flushed);
   report.put("controlled_stop",session.reason()=="controlled_stop");
   report.put("injected_fault",opts.inject_fault);report.put("inject_at_s",opts.inject_at);
+  report.put("push.enabled",opts.push_specified);
+  report.put("push.start_s",opts.push_at);report.put("push.duration_s",opts.push_duration);
+  report.put("push.fx_n",opts.push_force[0]);report.put("push.fy_n",opts.push_force[1]);report.put("push.fz_n",opts.push_force[2]);
+  report.put("push.application","world force at base_link center of mass; no added torque");
   report.put("fault_action","clear MuJoCo actuation and freeze simulation; real robot stopping behavior is not implemented");
   for(const auto& event:session.events()) {
     Tree node;node.put("time_s",event.time_s);node.put("state",go2::sessionStateName(event.state));
@@ -579,6 +603,11 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       std::this_thread::sleep_until(scheduled);
       const auto begin=Clock::now();
       const double lateness=std::max(0.0,milliseconds(scheduled,begin));
+      const bool pushing=opts.push_specified &&
+          step>=static_cast<std::size_t>(std::llround(opts.push_at/.002)) &&
+          step<static_cast<std::size_t>(std::llround((opts.push_at+opts.push_duration)/.002));
+      const Eigen::Vector3d push_force=pushing?opts.push_force:Eigen::Vector3d::Zero();
+      sim.setPushForce(push_force);
       sim.state(q,v);
       const auto sensor_begin = Clock::now();
       auto sensors = sim.sensors();
@@ -881,6 +910,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       last_input=input_ref;
       const auto command_end=Clock::now();
       session.fault_source="simulation";
+      const Eigen::Vector3d push_point=sim.pushPointWorld();
       sim.step();
       session.time_s=sim.time();
       session.fault_source="diagnostics";
@@ -990,6 +1020,8 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       }
 
       row[255]=static_cast<int>(session.state());
+      row[256]=double(opts.push_specified);row[257]=opts.push_at;row[258]=opts.push_duration;
+      for(int axis=0;axis<3;++axis) {row[259+axis]=push_force[axis];row[262+axis]=push_point[axis];}
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();

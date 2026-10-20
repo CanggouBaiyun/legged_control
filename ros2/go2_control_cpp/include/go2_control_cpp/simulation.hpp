@@ -29,6 +29,9 @@ class Simulation {
   // Clear simulator actuation on exit; not a hardware stopping strategy.
   void clearCommand();
   double maximumAppliedTorque() const;
+  // World-frame force at base_link's own center of mass, added to viewer forces.
+  void setPushForce(const Eigen::Vector3d& force_world);
+  Eigen::Vector3d pushPointWorld() const;
   void step();
   void render();
   bool running() const;
@@ -58,6 +61,8 @@ class Simulation {
   std::vector<int> command_indices_;
   std::array<int,4> foot_geoms_;
   int floor_=-1;
+  int base_body_=-1;
+  Eigen::Vector3d push_force_world_=Eigen::Vector3d::Zero();
   struct Viewer;
   std::unique_ptr<Viewer> viewer_;
 };
