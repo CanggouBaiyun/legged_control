@@ -1,6 +1,7 @@
 #include <ocs2_core/misc/LoadData.h>
 #include <ocs2_ros_interfaces/command/TargetTrajectoriesRosPublisher.h>
 #include <geometry_msgs/msg/twist.hpp>
+#include <std_msgs/msg/empty.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 #include <algorithm>
@@ -61,7 +62,7 @@ class OnlineCommand {
             "target_vx_world_mps,target_vy_world_mps,"
             "target_x_m,target_y_m,target_yaw_rad,"
             "target_end_time_s,target_end_x_m,target_end_y_m,target_end_yaw_rad,"
-            "integrated_reference,reference_lead_x_m,reference_lead_y_m,reference_lead_yaw_rad\n";
+            "integrated_reference,reference_lead_x_m,reference_lead_y_m,reference_lead_yaw_rad,stop_latched\n";
     }
 
     observation_sub_=node_->create_subscription<
@@ -75,6 +76,16 @@ class OnlineCommand {
         "/cmd_vel",1,
         [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
           receiveCommand(*msg);
+        });
+
+    stop_sub_=node_->create_subscription<std_msgs::msg::Empty>("/go2_control/stop",1,
+        [this](std_msgs::msg::Empty::ConstSharedPtr) {
+          if(stop_latched_) return;
+          stop_latched_=true;
+          command_.setZero(); command_valid_=false; was_moving_=false;
+          previous_world_velocity_.setZero(); previous_yaw_rate_=0;
+          if(ready_) hold_pose_=observation_.state.segment<6>(6);
+          RCLCPP_INFO(node_->get_logger(),"Session stop latched; holding zero-velocity targets, ignoring new motion commands");
         });
 
     timer_=node_->create_wall_timer(
@@ -134,7 +145,8 @@ class OnlineCommand {
     command_received_=Clock::now();
     ++command_sequence_;
     requested_<<msg.linear.x,msg.linear.y,msg.angular.z;
-    command_valid_=valid;
+    command_valid_=valid && !stop_latched_;
+    if(stop_latched_) {command_.setZero();return;}
 
     if(!valid) {
       command_.setZero();
@@ -242,7 +254,7 @@ class OnlineCommand {
           <<','<<future[6]<<','<<future[7]<<','<<future[9]
           <<','<<int(integrate_reference_)
           <<','<<pose[0]-observed_pose[0]<<','<<pose[1]-observed_pose[1]
-          <<','<<pose[3]-observed_pose[3]<<std::endl;
+          <<','<<pose[3]-observed_pose[3]<<','<<int(stop_latched_)<<std::endl;
       if(!command_log_)
         throw std::runtime_error("Failed writing online command log");
     }
@@ -255,6 +267,7 @@ class OnlineCommand {
       ocs2_msgs::msg::MpcObservation>::SharedPtr observation_sub_;
   rclcpp::Subscription<
       geometry_msgs::msg::Twist>::SharedPtr command_sub_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   ocs2::SystemObservation observation_;
@@ -273,6 +286,7 @@ class OnlineCommand {
   double reference_time_=0,previous_yaw_rate_=0;
   bool integrate_reference_=true;
   bool ready_=false,was_moving_=false,command_valid_=false;
+  bool stop_latched_=false;
 };
 }
 

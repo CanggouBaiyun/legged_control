@@ -1,5 +1,6 @@
 #pragma once
 #include <ocs2_ros_interfaces/mrt/MRT_ROS_Interface.h>
+#include <std_msgs/msg/empty.hpp>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -19,6 +20,9 @@ class LocalMrt : public ocs2::MRT_ROS_Interface {
   void gait(bool trot);
   bool select(double time, double required_until);
   void checkCoverage(double time, double required_until) const;
+  bool stopRequested() const {return stop_requested_.load();}
+  void requestStop();
+  void holdTarget(const ocs2::TargetTrajectories& target);
   const PolicyIdentity& identity() const { return active_; }
   std::size_t rejected() const { return rejected_.load(); }
  private:
@@ -34,6 +38,9 @@ class LocalMrt : public ocs2::MRT_ROS_Interface {
   rclcpp::Publisher<ocs2_msgs::msg::ModeSchedule>::SharedPtr gait_pub_;
   rclcpp::Subscription<ocs2_msgs::msg::MpcFlattenedController>::SharedPtr policy_sub_;
   rclcpp::Client<ocs2_msgs::srv::Reset>::SharedPtr reset_client_;
+  rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr stop_pub_;
+  rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_sub_;
+  rclcpp::Publisher<ocs2_msgs::msg::MpcTargetTrajectories>::SharedPtr hold_target_pub_;
   rclcpp::executors::SingleThreadedExecutor executor_;
   std::thread thread_;
   std::mutex pending_mutex_;
@@ -42,5 +49,6 @@ class LocalMrt : public ocs2::MRT_ROS_Interface {
   double received_observation_=-1;
   PolicyIdentity active_;
   std::atomic_size_t rejected_{0};
+  std::atomic_bool stop_requested_{false};
 };
 }  // namespace go2

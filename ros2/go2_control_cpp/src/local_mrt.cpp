@@ -18,6 +18,17 @@ LocalMrt::LocalMrt() : MRT_ROS_Interface("legged_robot"),
       "/legged_robot_mpc_policy",rclcpp::QoS(8).reliable().durability_volatile(),
       [this](ocs2_msgs::msg::MpcFlattenedController::ConstSharedPtr msg){receive(msg);});
   reset_client_=node_->create_client<ocs2_msgs::srv::Reset>("/legged_robot_mpc_reset");
+  stop_pub_=node_->create_publisher<std_msgs::msg::Empty>("/go2_control/stop",1);
+  stop_sub_=node_->create_subscription<std_msgs::msg::Empty>("/go2_control/stop",1,
+      [this](std_msgs::msg::Empty::ConstSharedPtr){stop_requested_=true;});
+}
+void LocalMrt::requestStop() {stop_requested_=true;stop_pub_->publish(std_msgs::msg::Empty{});}
+void LocalMrt::holdTarget(const ocs2::TargetTrajectories& target) {
+  if(!hold_target_pub_)
+    hold_target_pub_=node_->create_publisher<ocs2_msgs::msg::MpcTargetTrajectories>("/legged_robot_mpc_target",1);
+  if(node_->count_publishers("/legged_robot_mpc_target")>1)
+    throw std::runtime_error("Multiple MPC target publishers during scripted stop");
+  hold_target_pub_->publish(ocs2::ros_msg_conversions::createTargetTrajectoriesMsg(target));
 }
 LocalMrt::~LocalMrt() {
   executor_.cancel();

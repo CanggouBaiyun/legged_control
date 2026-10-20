@@ -9,6 +9,9 @@ if [[ "${1:-}" == --help ]]; then
     '  [--estimator-shadow] (log Kalman estimates; control uses simulation truth)' \
     '  [--estimator-control] (simulation truth startup, then estimated state after readiness checks)' \
     '  [--sensor-startup] (nominal joint preparation -> estimated-state MPC/WBC; no base p/v truth in control)' \
+    '  [--request-stop-at SECONDS] (zero target + stance, settle 0.3 s, end session; timeout 5 s)' \
+    '  Stop topic: /go2_control/stop (std_msgs/msg/Empty); this ends the simulation session.' \
+    '  Fault checks: --inject-fault sensor-stale|estimator-invalid|policy-stale|wbc-invalid --inject-at SECONDS' \
     '  [--wbc-config JSON] (relative to project root; default: built-in WBC settings)' \
     '  [--online] (starts /cmd_vel targets; permits duration >20 s; no --forward/--turn-angle-deg)' \
     '  Online mode without --duration (or --duration 0) runs until you close the window or press Ctrl+C.' \
@@ -176,10 +179,21 @@ GO2_WORKER_FAILED=0
 while kill -0 "${GO2_CONTROL_PID}" 2>/dev/null; do
   if [[ "${GO2_USER_EXIT}" == 0 ]] && ! kill -0 "${GO2_MPC_PID}" 2>/dev/null; then
     printf 'MPC exited; stopping control. See %s\n' "${GO2_MPC_LOG}" >&2
+    # Give the native policy-age guard up to 0.3 s to latch/report this loss.
+    # If native control is unresponsive, EXIT cleanup still terminates it.
+    for ((go2_watchdog_wait=0;go2_watchdog_wait<15;go2_watchdog_wait++)); do
+      if ! kill -0 "${GO2_CONTROL_PID}" 2>/dev/null; then break; fi
+      sleep 0.02
+    done
     GO2_WORKER_FAILED=1; break
   fi
   if [[ "${GO2_USER_EXIT}" == 0 && -n "${GO2_COMMAND_PID}" ]] && ! kill -0 "${GO2_COMMAND_PID}" 2>/dev/null; then
     printf 'Online command node exited; stopping control. See %s\n' "${GO2_COMMAND_LOG}" >&2
+    kill -USR1 "${GO2_CONTROL_PID}" 2>/dev/null || true
+    for ((go2_watchdog_wait=0;go2_watchdog_wait<15;go2_watchdog_wait++)); do
+      if ! kill -0 "${GO2_CONTROL_PID}" 2>/dev/null; then break; fi
+      sleep 0.02
+    done
     GO2_WORKER_FAILED=1; break
   fi
   sleep 0.1

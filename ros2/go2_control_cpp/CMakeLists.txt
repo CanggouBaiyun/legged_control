@@ -38,6 +38,7 @@ if(GO2_MUJOCO_ROOT)
   endif()
   find_package(rclcpp REQUIRED)
   find_package(geometry_msgs REQUIRED)
+  find_package(std_msgs REQUIRED)
   find_package(ocs2_ros_interfaces REQUIRED)
   find_package(ocs2_msgs REQUIRED)
   find_package(Boost REQUIRED COMPONENTS system filesystem log_setup log)
@@ -67,12 +68,12 @@ if(GO2_MUJOCO_ROOT)
   target_compile_features(online_command PRIVATE cxx_std_17)
   ament_target_dependencies(
     online_command
-    rclcpp geometry_msgs ocs2_ros_interfaces ocs2_msgs
+    rclcpp geometry_msgs std_msgs ocs2_ros_interfaces ocs2_msgs
   )
   install(TARGETS online_command DESTINATION lib/${PROJECT_NAME})
   add_executable(control_simulation src/control_simulation.cpp src/local_mrt.cpp src/simulation.cpp)
   target_include_directories(control_simulation PRIVATE "${GO2_MUJOCO_ROOT}/include")
-  ament_target_dependencies(control_simulation rclcpp ocs2_ros_interfaces ocs2_msgs)
+  ament_target_dependencies(control_simulation rclcpp std_msgs ocs2_ros_interfaces ocs2_msgs)
   target_link_libraries(
   control_simulation
   go2_reference
@@ -100,6 +101,10 @@ target_compile_features(joint_command_check PRIVATE cxx_std_17)
 target_include_directories(joint_command_check PRIVATE include)
 target_link_libraries(joint_command_check PRIVATE Eigen3::Eigen)
 install(TARGETS joint_command_check DESTINATION lib/${PROJECT_NAME})
+add_executable(control_session_check src/control_session_check.cpp)
+target_compile_features(control_session_check PRIVATE cxx_std_17)
+target_include_directories(control_session_check PRIVATE include)
+install(TARGETS control_session_check DESTINATION lib/${PROJECT_NAME})
 if(TARGET go2_wbc)
   add_executable(wbc_replay src/wbc_replay.cpp)
   target_link_libraries(wbc_replay PRIVATE go2_wbc)

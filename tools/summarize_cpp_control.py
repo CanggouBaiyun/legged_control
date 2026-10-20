@@ -105,7 +105,25 @@ def summarize(path, duration=20.0, commands=None):
     if not np.isfinite(duration) or duration < 0:
         raise RuntimeError("Duration must be finite and non-negative")
     interactive = duration == 0
+    requested_duration = duration
     data = np.atleast_1d(np.genfromtxt(path, delimiter=",", names=True))
+    session_path = path.with_suffix(".session.json")
+    session = None
+    if session_path.exists():
+        session = json.loads(session_path.read_text())
+        if (int(session["schema"]) != 1 or session["state"] != "stopped" or
+                session["csv_flushed"] not in (True, "true") or
+                int(session["samples"]) != len(data) or
+                abs(float(session["time_s"]) - len(data) * 0.002) > 1e-8):
+            raise RuntimeError("Session report does not describe a completed, flushed CSV")
+        controlled_stop = session["controlled_stop"] in (True, "true")
+        if controlled_stop != (session["reason"] == "controlled_stop"):
+            raise RuntimeError("Inconsistent controlled-stop report")
+        if abs(float(session["requested_duration_s"]) - duration) > 1e-8:
+            raise RuntimeError("Requested duration differs from session report")
+        intentional_early_exit = controlled_stop or session["reason"] == "viewer_closed"
+        if intentional_early_exit and duration > 0 and len(data) <= round(duration / 0.002):
+            duration = len(data) * 0.002
     if interactive and not len(data):
         result = {"samples": 0, "duration_s": 0.0, "requested_duration_s": 0.0,
                   "session_mode": "interactive", "status": "closed_before_first_control_step"}
@@ -173,6 +191,19 @@ def summarize(path, duration=20.0, commands=None):
         "raised_swing_contact_samples": {},
         "swing_height_tracking_rmse_mm": {},
     }
+    if session is not None:
+        result["control_session"] = session
+        result["requested_duration_s"] = requested_duration
+        if requested_duration > 0 and duration < requested_duration:
+            result["session_mode"] = "ended_early"
+        if "control_session_state" not in data.dtype.names or not np.isin(data["control_session_state"], (1, 2, 3, 4)).all():
+            raise RuntimeError("Invalid control-session state samples")
+        if session["reason"] == "controlled_stop":
+            if not len(data) or data["control_session_state"][-1] != 4:
+                raise RuntimeError("Controlled stop has no stopping state samples")
+            settled = data[data["time_s"] >= data["time_s"][-1] - 0.3 + 1e-9]
+            if (settled["mode"] != 15).any() or (settled["startup_pd_weight"] != 0).any():
+                raise RuntimeError("Controlled stop did not finish in running four-foot stance")
     if interactive:
         result["session_mode"] = "interactive"
         result["requested_duration_s"] = 0.0
@@ -367,6 +398,8 @@ def summarize(path, duration=20.0, commands=None):
         startup = result["sensor_startup"]
         print(f"Sensor startup: handoff {startup['handoff_start_s']} -> {startup['handoff_complete_s']} s; "
               "estimated base state used from the first sample")
+    if session is not None:
+        print(f"Control session: {session['reason']}; report: {session_path}")
     if "joint_command" in result:
         print("Joint commands: q/dq/Kp/Kd/tau_ff; all 12 joints and handoff gains verified")
     print(f"Final x: {result['final_x_m']:.6f} m; yaw: {result['final_yaw_deg']:.3f} deg; "
