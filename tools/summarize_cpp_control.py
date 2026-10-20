@@ -66,9 +66,52 @@ def summarize_sensor_errors(data, session):
             evaluated["estimator_position_error_y_m"]).max()) if len(evaluated) else None),
         "actuator_feedback_verified_on_unclipped_samples": int(unclipped.sum()),
         "note": "Per-sample independent Gaussian errors plus constant biases, injected from the first sample. "
-                "Seed reproducible on the same C++ standard-library/toolchain. Simulation contact flags and time unchanged. "
+                "Seed reproducible on the same C++ standard-library/toolchain. This noise stage leaves contacts/time unchanged; see sensor_event for downstream impairment. "
                 "Parameters are simulation assumptions, not calibrated Go2 sensor specifications.",
     }
+
+
+def summarize_sensor_event(data, session):
+    if "sensor_event_type" not in data.dtype.names:
+        return None
+    codes = np.unique(data["sensor_event_type"])
+    names = {0: "none", 1: "delay", 2: "dropout", 3: "contact-on", 4: "contact-off"}
+    if len(codes) != 1 or codes[0] not in names:
+        raise RuntimeError("Invalid or changing sensor event type")
+    event_type = names[int(codes[0])]
+    raw = np.column_stack([data[f"raw_contact_{leg}"] for leg in ("fl", "fr", "rl", "rr")])
+    delivered = np.column_stack([data[f"estimator_sim_contact_{leg}"] for leg in ("fl", "fr", "rl", "rr")])
+    changed = np.column_stack([data[f"changed_contact_{leg}"] for leg in ("fl", "fr", "rl", "rr")])
+    if (not np.isin(raw, (0, 1)).all() or not np.isin(delivered, (0, 1)).all() or
+            not np.array_equal(changed, raw != delivered)):
+        raise RuntimeError("Invalid raw/delivered contact diagnostics")
+    if not np.allclose(data["sensor_sample_age_ms"], 1000 * (data["time_s"] - data["sensor_time_s"]), atol=1e-8, rtol=0):
+        raise RuntimeError("Sensor age diagnostics disagree with acquisition time")
+    if event_type == "none":
+        if np.any(changed) or np.any(data["sensor_event_active"]):
+            raise RuntimeError("Disabled sensor event changed contact")
+        return {"type": "none"}
+    if session is None or session.get("sensor_event", {}).get("type") != event_type:
+        raise RuntimeError("Missing or inconsistent sensor event configuration")
+    config = session["sensor_event"]
+    start, duration = float(config["start_s"]), float(config["duration_s"])
+    active = (data["time_s"] >= start - 1e-9) & (data["time_s"] < start + duration - 1e-9)
+    if not np.array_equal(data["sensor_event_active"], active):
+        raise RuntimeError("Sensor event active interval disagrees with configuration")
+    if int(config["changed_contact_samples"]) != int((changed != 0).any(axis=1).sum()):
+        raise RuntimeError("Sensor event changed-sample count mismatch")
+    result = {"type": event_type, "start_s": start, "duration_s": duration,
+              "active_samples": int(active.sum()), "max_age_ms": float(data["sensor_sample_age_ms"].max()), "feet": {}}
+    for i, leg in enumerate(("fl", "fr", "rl", "rr")):
+        false_positive = (raw[:, i] == 0) & (delivered[:, i] == 1)
+        false_negative = (raw[:, i] == 1) & (delivered[:, i] == 0)
+        result["feet"][leg] = {
+            "false_positive_samples": int(false_positive.sum()), "false_negative_samples": int(false_negative.sum()),
+            "max_false_positive_trust": (float(data[f"estimator_foot_{leg}_contact_trust"][false_positive].max())
+                                         if false_positive.any() else None)}
+    result["note"] = "Contact changes apply only to measured flags; simulated floor contact and MPC gait schedule remain independent. " \
+                     "Delay/dropout are expected to fault under the existing same-step freshness rule; fault metadata is in the session report."
+    return result
 
 
 def summarize_push(data):
@@ -534,6 +577,9 @@ def summarize(path, duration=20.0, commands=None):
     sensor_errors = summarize_sensor_errors(data, session)
     if sensor_errors is not None:
         result["sensor_errors"] = sensor_errors
+    sensor_event = summarize_sensor_event(data, session)
+    if sensor_event is not None:
+        result["sensor_event"] = sensor_event
     output = path.with_suffix(".json")
     output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     print(f"Completed {duration:g} s / {len(data)} steps; modes: {result['mode_samples']}")

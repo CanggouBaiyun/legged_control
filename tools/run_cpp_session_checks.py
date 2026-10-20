@@ -12,7 +12,8 @@ import subprocess
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = ("normal", "stop", "sensor-stale", "estimator-invalid", "mpc-exit", "wbc-invalid", "command-exit")
+SENSOR_CASES = ("sensor-delay", "sensor-dropout", "contact-on", "contact-off")
+CASES = ("normal", "stop", "sensor-stale", "estimator-invalid", "mpc-exit", "wbc-invalid", "command-exit") + SENSOR_CASES
 
 
 def run_case(case, prefix, node, observation, velocity, Twist):
@@ -24,10 +25,18 @@ def run_case(case, prefix, node, observation, velocity, Twist):
         raise RuntimeError(f"Existing case results: {stem}")
     path = stem.with_suffix(".csv")
     args = ["bash", str(ROOT / "scripts/run_cpp_simulation.sh"), "--mpc-solver", "sqp",
-            "--headless", "--duration", "20" if case in ("normal", "stop") else "8",
+            "--headless", "--duration", "20" if case in ("normal", "stop") + SENSOR_CASES else "8",
             "--sensor-startup", "--joint-kp", "0", "--joint-kd", "1", "--centroidal-base-accel",
             "--wbc-config", "config/wbc/upstream_a1_tasks_go2.json", "--csv", str(path)]
-    if case == "normal":
+    if case in SENSOR_CASES:
+        event = {"sensor-delay": "delay", "sensor-dropout": "dropout"}.get(case, case)
+        args += ["--sensor-errors", "config/sensors/moderate_errors.json", "--sensor-event", event,
+                 "--sensor-event-at", "9" if case == "contact-off" else "8",
+                 "--sensor-event-duration", "0.1" if case in ("sensor-delay", "sensor-dropout") else "0.01"]
+        if case in ("contact-on", "contact-off"):
+            args += ["--sensor-contact-foot", "fl"]
+        args += ["--trot-at", "3", "--stop-trot-at", "15"]
+    elif case == "normal":
         args += ["--trot-at", "3", "--stop-trot-at", "15", "--forward"]
     elif case == "stop":
         args += ["--online", "--trot-at", "3", "--request-stop-at", "8"]
@@ -84,15 +93,43 @@ def run_case(case, prefix, node, observation, velocity, Twist):
         samples = sum(1 for _ in csv) - 1
     if samples != int(report["samples"]) or abs(float(report["time_s"]) - samples * 0.002) > 1e-8:
         raise RuntimeError(f"Report/CSV mismatch: {case}")
-    if case in ("normal", "stop"):
-        expected = "duration_limit" if case == "normal" else "controlled_stop"
+    details = {}
+    if case in ("normal", "stop", "contact-on", "contact-off"):
+        expected = "controlled_stop" if case == "stop" else "duration_limit"
         if code != 0 or report["state"] != "stopped" or report["reason"] != expected:
             raise RuntimeError(f"Unexpected normal termination: {case}, code={code}, {report}")
         summary = json.loads(path.with_suffix(".json").read_text())
         if summary["clipped_steps"]:
             raise RuntimeError(f"Torque clipping: {case}")
-        if case == "normal" and samples != 10000:
+        if case != "stop" and samples != 10000:
             raise RuntimeError("Normal run ended early")
+        if case in ("contact-on", "contact-off"):
+            import csv as csv_module
+            active = changed = 0
+            max_changed_trust = 0.0
+            with path.open() as csv:
+                for row in csv_module.DictReader(csv):
+                    if int(float(row["sensor_event_active"])):
+                        active += 1
+                    if int(float(row["changed_contact_fl"])):
+                        changed += 1
+                        raw, delivered = int(float(row["raw_contact_fl"])), int(float(row["estimator_sim_contact_fl"]))
+                        expected = (0, 1) if case == "contact-on" else (1, 0)
+                        if (raw, delivered) != expected:
+                            raise RuntimeError("Contact event changed unexpected physical contact")
+                        max_changed_trust = max(max_changed_trust, float(row["estimator_foot_fl_contact_trust"]))
+            if active != 5 or not 1 <= changed <= 5 or max_changed_trust > 1e-12:
+                raise RuntimeError(f"Contact event not exercised or false support trusted: active={active}, changed={changed}, trust={max_changed_trust}")
+            event = report["sensor_event"]
+            if int(event["changed_contact_samples"]) != changed:
+                raise RuntimeError("Contact event report disagrees with CSV")
+            if not all(summary["mode_samples"].get(m, 0) > 0 for m in ("6", "9", "15")) or summary["last_non_stance_s"] >= 19.5:
+                raise RuntimeError("Contact case did not complete trot and final stance")
+            details = {"changed_contact_samples": changed, "active_samples": active,
+                       "max_changed_contact_trust": max_changed_trust,
+                       "max_horizontal_estimation_error_m": summary["sensor_errors"]["after_2p4s_max_horizontal_position_estimation_error_m"],
+                       "maximum_applied_torque_nm": summary["maximum_applied_torque_nm"],
+                       "control_over_2ms": summary["control_over_2ms"], "loop_over_2ms": summary["loop_over_2ms"]}
         if case == "stop":
             import csv as csv_module
             with stem.with_suffix(".commands.csv").open() as csv:
@@ -105,23 +142,32 @@ def run_case(case, prefix, node, observation, velocity, Twist):
                     summary["final_x_m"] < 0.03):
                 raise RuntimeError("Stop did not reject subsequent motion commands, or motion was not exercised")
     else:
-        expected = {"sensor-stale": "sensors", "estimator-invalid": "estimator",
+        expected = {"sensor-stale": "sensors", "sensor-delay": "sensors", "sensor-dropout": "sensors", "estimator-invalid": "estimator",
                     "mpc-exit": "policy", "wbc-invalid": "wbc", "command-exit": "worker"}[case]
         if code == 0 or report["state"] != "fault" or report["fault_source"] != expected:
             raise RuntimeError(f"Expected {expected} fault: code={code}, {report}")
         if case in ("mpc-exit", "command-exit") and not killed:
             raise RuntimeError("Worker exit was not injected")
-        if not 4 - 1e-8 <= float(report["time_s"]) < 4.5:
+        injection_time = 8 if case in ("sensor-delay", "sensor-dropout") else 4
+        if not injection_time - 1e-8 <= float(report["time_s"]) < injection_time + 0.5:
             raise RuntimeError(f"Fault was detected outside its expected window: {report}")
+        if case in ("sensor-delay", "sensor-dropout"):
+            event = report["sensor_event"]
+            if (event["active"] not in (True, "true") or abs(float(event["current_time_s"]) - 8) > 1e-8 or
+                    abs(float(event["delivered_time_s"]) - 7.998) > 1e-8 or abs(float(event["age_s"]) - 0.002) > 1e-8 or samples != 4000):
+                raise RuntimeError("Stale cached measurement/timing not confirmed")
+            if case == "sensor-dropout" and int(event["dropped_samples"]) != 1:
+                raise RuntimeError("Dropout was not exercised")
+            details = {"event": event, "fault_source": report["fault_source"], "fault_reason": report["reason"]}
     print(f"PASS {case}: t={report['time_s']}, samples={samples}, reason={report['reason']}", flush=True)
     return {"case": case, "exit_code": code, "session_report": str(stem.with_suffix(".session.json")),
-            "time_s": float(report["time_s"]), "samples": samples, "passed": True}
+            "time_s": float(report["time_s"]), "samples": samples, "passed": True, "details": details}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prefix", type=Path, required=True)
-    parser.add_argument("--case", choices=CASES, help="Omit to run all cases")
+    parser.add_argument("--case", choices=CASES + ("sensor-robustness",), help="Omit for all; sensor-robustness runs four sensor event cases")
     args = parser.parse_args()
     prefix = args.prefix if args.prefix.is_absolute() else ROOT / args.prefix
     if prefix.suffix:
@@ -145,8 +191,11 @@ def main():
     subscription = node.create_subscription(MpcObservation, "/legged_robot_mpc_observation", observe, 1)
     velocity = node.create_publisher(Twist, "/cmd_vel", 1)
     try:
-        results = [run_case(c, prefix, node, observation, velocity, Twist)
-                   for c in ((args.case,) if args.case else CASES)]
+        selected = SENSOR_CASES if args.case == "sensor-robustness" else ((args.case,) if args.case else CASES)
+        results = []
+        for c in selected:
+            results.append(run_case(c, prefix, node, observation, velocity, Twist))
+            report_path.write_text(json.dumps({"passed": len(results) == len(selected), "complete": len(results) == len(selected), "cases": results}, indent=2) + "\n")
         report_path.write_text(json.dumps({"passed": True, "cases": results}, indent=2) + "\n")
         print(f"All requested session checks passed: {report_path}", flush=True)
     finally:

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <random>
+#include <deque>
 
 namespace go2 {
 // Simulation measurement errors. Standard deviations are per sample, per axis;
@@ -33,5 +34,34 @@ class SensorErrorModel {
   std::normal_distribution<double> normal_{0,1};
   bool have_sample_=false;
   SensorMeasurements previous_raw_,previous_measured_;
+};
+
+enum class SensorEvent {None=0,Delay=1,Dropout=2,ContactOn=3,ContactOff=4};
+const char* sensorEventName(SensorEvent event);
+struct SensorEventSettings {
+  SensorEvent event=SensorEvent::None;
+  double start_s=-1,duration_s=.01,delay_s=.002;
+  int foot=0; // FL/FR/RL/RR
+  void validate() const;
+};
+struct SensorEventStatus {
+  double current_time_s=-1,delivered_time_s=-1,age_s=0,max_age_s=0;
+  bool active=false;
+  std::size_t changed_contact_samples=0,dropped_samples=0;
+  std::array<bool,4> raw_contact{},delivered_contact{};
+};
+// Test-only stream impairment. Delay/dropout return actual cached measurements
+// with their acquisition timestamp intact; no prediction or re-stamping.
+class SensorEventModel {
+ public:
+  explicit SensorEventModel(const SensorEventSettings& settings={});
+  SensorMeasurements apply(const SensorMeasurements& current);
+  const SensorEventStatus& status() const {return status_;}
+ private:
+  SensorEventSettings settings_;
+  SensorEventStatus status_;
+  std::deque<SensorMeasurements> history_;
+  SensorMeasurements delivered_;
+  bool have_sample_=false;
 };
 }  // namespace go2

@@ -1,5 +1,6 @@
 #include "go2_control_cpp/sensor_errors.hpp"
 #include <boost/property_tree/json_parser.hpp>
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <set>
@@ -120,5 +121,62 @@ SensorMeasurements SensorErrorModel::apply(const SensorMeasurements& raw) {
   validateSample(measured);
   previous_raw_=raw;previous_measured_=measured;have_sample_=true;
   return measured;
+}
+const char* sensorEventName(SensorEvent event) {
+  switch(event) {
+    case SensorEvent::None:return "none";
+    case SensorEvent::Delay:return "delay";
+    case SensorEvent::Dropout:return "dropout";
+    case SensorEvent::ContactOn:return "contact-on";
+    case SensorEvent::ContactOff:return "contact-off";
+  }
+  throw std::runtime_error("Unknown sensor event");
+}
+void SensorEventSettings::validate() const {
+  sensorEventName(event);
+  if(event==SensorEvent::None) {
+    if(start_s!=-1) throw std::runtime_error("Sensor event type missing");
+    return;
+  }
+  const auto aligned=[](double time){return std::abs(time/.002-std::round(time/.002))<1e-7;};
+  if(!std::isfinite(start_s) || start_s<3 || !std::isfinite(duration_s) || duration_s<.002 ||
+      !std::isfinite(delay_s) || delay_s<.002 || delay_s>.1 ||
+      !aligned(start_s) || !aligned(duration_s) || !aligned(delay_s) || foot<0 || foot>3)
+    throw std::runtime_error("Sensor event requires start>=3 s, positive 2 ms-aligned duration/delay (delay<=100 ms), foot FL/FR/RL/RR");
+}
+SensorEventModel::SensorEventModel(const SensorEventSettings& settings):settings_(settings) {settings_.validate();}
+SensorMeasurements SensorEventModel::apply(const SensorMeasurements& current) {
+  validateSample(current);
+  if(have_sample_ && current.time_s<=status_.current_time_s)
+    throw std::runtime_error("Sensor event model requires increasing acquisition time");
+  status_.current_time_s=current.time_s;
+  status_.raw_contact=current.foot_contact;
+  status_.active=settings_.event!=SensorEvent::None && current.time_s+1e-9>=settings_.start_s &&
+      current.time_s<settings_.start_s+settings_.duration_s-1e-9;
+  auto result=current;
+  if(settings_.event==SensorEvent::Delay) {
+    history_.push_back(current);
+    // Only delay+one sample of history is needed; bound memory in unlimited sessions.
+    while(history_.size()>static_cast<std::size_t>(std::llround(settings_.delay_s/.002))+2) history_.pop_front();
+    if(status_.active) {
+      const double cutoff=current.time_s-settings_.delay_s;
+      bool found=false;
+      for(auto frame=history_.rbegin();frame!=history_.rend();++frame)
+        if(frame->time_s<=cutoff+1e-9) {result=*frame;found=true;break;}
+      if(!found) throw std::runtime_error("No cached sample for requested delay");
+    }
+  } else if(status_.active && settings_.event==SensorEvent::Dropout) {
+    if(!have_sample_) throw std::runtime_error("Dropout before first sensor sample");
+    result=delivered_;++status_.dropped_samples;
+  } else if(status_.active && (settings_.event==SensorEvent::ContactOn || settings_.event==SensorEvent::ContactOff)) {
+    result.foot_contact[settings_.foot]=settings_.event==SensorEvent::ContactOn;
+  }
+  status_.delivered_time_s=result.time_s;
+  status_.age_s=current.time_s-result.time_s;
+  status_.max_age_s=std::max(status_.max_age_s,status_.age_s);
+  status_.delivered_contact=result.foot_contact;
+  if(result.foot_contact!=current.foot_contact) ++status_.changed_contact_samples;
+  delivered_=result;have_sample_=true;
+  return result;
 }
 }  // namespace go2

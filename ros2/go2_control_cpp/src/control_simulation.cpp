@@ -183,6 +183,8 @@ struct Options {
   bool push_specified=false;
   std::string sensor_error_config;
   go2::SensorErrorSettings sensor_error_settings;
+  go2::SensorEventSettings sensor_event;
+  bool sensor_event_specified=false;
 };
 Options options(int argc,char** argv) {
   Options result;
@@ -207,6 +209,23 @@ Options options(int argc,char** argv) {
     else if(key=="--joint-kd") result.joint_kd=std::stod(value());
     else if(key=="--wbc-config") result.wbc_config=value();
     else if(key=="--sensor-errors") result.sensor_error_config=value();
+    else if(key=="--sensor-event") {
+      const auto event=value();result.sensor_event_specified=true;
+      if(event=="delay") result.sensor_event.event=go2::SensorEvent::Delay;
+      else if(event=="dropout") result.sensor_event.event=go2::SensorEvent::Dropout;
+      else if(event=="contact-on") result.sensor_event.event=go2::SensorEvent::ContactOn;
+      else if(event=="contact-off") result.sensor_event.event=go2::SensorEvent::ContactOff;
+      else throw std::runtime_error("Unknown sensor event: "+event);
+    }
+    else if(key=="--sensor-event-at") {result.sensor_event.start_s=std::stod(value());result.sensor_event_specified=true;}
+    else if(key=="--sensor-event-duration") {result.sensor_event.duration_s=std::stod(value());result.sensor_event_specified=true;}
+    else if(key=="--sensor-delay-ms") {result.sensor_event.delay_s=.001*std::stod(value());result.sensor_event_specified=true;}
+    else if(key=="--sensor-contact-foot") {
+      const auto foot=value();const std::vector<std::string> feet{"fl","fr","rl","rr"};
+      const auto found=std::find(feet.begin(),feet.end(),foot);
+      if(found==feet.end()) throw std::runtime_error("Sensor contact foot must be fl/fr/rl/rr");
+      result.sensor_event.foot=found-feet.begin();result.sensor_event_specified=true;
+    }
     else if(key=="--centroidal-base-accel") result.centroidal_base_accel=true;
     else if(key=="--estimator-shadow") result.estimator_shadow=true;
     else if(key=="--estimator-control"){
@@ -232,6 +251,9 @@ Options options(int argc,char** argv) {
           "--estimator-control switches after 2 s and 0.2 s of quiet four-foot support; stops if not ready by 3 s.\n"
           "--sensor-startup uses measured nominal joints with Kp=60/Kd=3, then a 0.2 s MPC/WBC handoff.\n"
           "--sensor-errors JSON adds seeded measurement noise/bias from startup; requires --sensor-startup.\n"
+          "Sensor events: --sensor-event delay|dropout|contact-on|contact-off --sensor-event-at SECONDS "
+          "[--sensor-event-duration 0.01] [--sensor-delay-ms 2] [--sensor-contact-foot fl].\n"
+          "Requires --sensor-startup. Delay/dropout preserve cached acquisition times; same-step freshness guard remains active.\n"
           "Requires nominal preparation pose, quiet four-foot support, and no gait command before readiness.\n"
           "MPC is prewarmed before simulation time starts; this is not a hardware startup implementation.\n"
           "--request-stop-at SECONDS requests zero velocity and stance, then ends after 0.3 s stable stance (5 s timeout).\n"
@@ -280,6 +302,11 @@ Options options(int argc,char** argv) {
       !std::isfinite(result.joint_kd) || result.joint_kd<0)
     throw std::runtime_error("Joint gains must be finite and non-negative");
   if(result.output.empty()) result.output=result.root/"artifacts/cpp_control.csv";
+  result.sensor_event.validate();
+  if(result.sensor_event_specified && (result.sensor_event.event==go2::SensorEvent::None || !result.sensor_startup ||
+      !result.inject_fault.empty() || (result.duration>0 &&
+      result.sensor_event.start_s+result.sensor_event.duration_s>result.duration)))
+    throw std::runtime_error("Sensor event needs a type, --sensor-startup, full duration coverage and no --inject-fault");
   if(!result.sensor_error_config.empty()) {
     if(!result.sensor_startup) throw std::runtime_error("--sensor-errors requires --sensor-startup");
     std::filesystem::path path=result.sensor_error_config;
@@ -411,7 +438,10 @@ std::string sensorErrorColumns(const std::vector<std::string>& names) {
     for(const auto& name:names) result+=","+prefix+name+"_q_rad,"+prefix+name+"_dq_radps";
   return result+",measured_foot_kinematic_position_max_error_m,measured_foot_kinematic_velocity_max_error_mps";
 }
-using Row=std::array<double,328>;
+const std::string sensor_event_columns=",sensor_event_type,sensor_event_active,sensor_sample_age_ms,"
+    "raw_contact_fl,raw_contact_fr,raw_contact_rl,raw_contact_rr,"
+    "changed_contact_fl,changed_contact_fr,changed_contact_rl,changed_contact_rr";
+using Row=std::array<double,339>;
 // The controller submits one second of rows at a time. Disk I/O runs on a
 // separate thread, with a bounded queue even in an unlimited interactive run.
 class ControlLog {
@@ -419,7 +449,7 @@ class ControlLog {
   explicit ControlLog(const std::filesystem::path& path,const std::vector<std::string>& motor_names) {
     if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     out_.open(path);
-    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<startup_columns<<jointCommandColumns(motor_names)<<",control_session_state"<<push_columns<<sensorErrorColumns(motor_names)<<'\n';
+    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<startup_columns<<jointCommandColumns(motor_names)<<",control_session_state"<<push_columns<<sensorErrorColumns(motor_names)<<sensor_event_columns<<'\n';
     if(!out_) throw std::runtime_error("Cannot open control CSV");
     worker_=std::thread([this] {
       try {
@@ -487,7 +517,7 @@ class ControlLog {
   bool stopping_=false;
   std::size_t samples_=0;
 };
-void writeSession(const Options& opts,const go2::ControlSession& session) {
+void writeSession(const Options& opts,const go2::ControlSession& session,const go2::SensorEventStatus& sensor_status) {
   Tree report,events;
   report.put("schema",1);
   report.put("state",go2::sessionStateName(session.state()));
@@ -504,6 +534,16 @@ void writeSession(const Options& opts,const go2::ControlSession& session) {
   report.put("sensor_errors.enabled",!opts.sensor_error_config.empty());
   report.put("sensor_errors.config",opts.sensor_error_config);
   report.add_child("sensor_errors.settings",go2::sensorErrorSettingsTree(opts.sensor_error_settings));
+  report.put("sensor_event.type",go2::sensorEventName(opts.sensor_event.event));
+  report.put("sensor_event.start_s",opts.sensor_event.start_s);report.put("sensor_event.duration_s",opts.sensor_event.duration_s);
+  report.put("sensor_event.delay_s",opts.sensor_event.delay_s);report.put("sensor_event.foot_index",opts.sensor_event.foot);
+  report.put("sensor_event.active",sensor_status.active);
+  report.put("sensor_event.current_time_s",sensor_status.current_time_s);
+  report.put("sensor_event.delivered_time_s",sensor_status.delivered_time_s);
+  report.put("sensor_event.age_s",sensor_status.age_s);report.put("sensor_event.max_age_s",sensor_status.max_age_s);
+  report.put("sensor_event.changed_contact_samples",sensor_status.changed_contact_samples);
+  report.put("sensor_event.dropped_samples",sensor_status.dropped_samples);
+  report.put("sensor_event.delay_policy","same-control-step acquisition required; delayed samples fault before estimator/actuation");
   report.put("fault_action","clear MuJoCo actuation and freeze simulation; real robot stopping behavior is not implemented");
   for(const auto& event:session.events()) {
     Tree node;node.put("time_s",event.time_s);node.put("state",go2::sessionStateName(event.state));
@@ -516,7 +556,8 @@ void writeSession(const Options& opts,const go2::ControlSession& session) {
   std::cout<<"Session "<<go2::sessionStateName(session.state())<<": "<<session.reason()
            <<"; report: "<<path<<std::endl;
 }
-void run(const Options& opts,const go2::RobotModel& robot,const Target& target,go2::ReferenceMapping& mapping,go2::ControlSession& session) {
+void run(const Options& opts,const go2::RobotModel& robot,const Target& target,go2::ReferenceMapping& mapping,go2::ControlSession& session,
+         go2::SensorEventStatus& sensor_status) {
   go2::Simulation sim(opts.root,robot);
   if(std::abs(sim.timestep()-.002)>1e-12) throw std::runtime_error("Expected 2 ms simulation steps");
   Eigen::VectorXd q,v; sim.state(q,v);
@@ -533,6 +574,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
   go2::EstimatorPreprocessor estimator_preprocessor(robot,estimator_settings);
   go2::EstimatorPreprocessor raw_preprocessor(robot,estimator_settings);
   go2::SensorErrorModel sensor_errors(opts.sensor_error_settings);
+  go2::SensorEventModel sensor_events(opts.sensor_event);
   if(!opts.sensor_error_config.empty())
     std::cout<<"Sensor measurement errors: "<<opts.sensor_error_config<<"; seed="<<opts.sensor_error_settings.seed<<std::endl;
   go2::LinearKalmanFilter estimator;
@@ -642,13 +684,14 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       const auto sensor_begin = Clock::now();
       // t=0 is the same physical sample already used to initialize the filter.
       const auto raw_sensors=opts.sensor_startup && step==0 ? startup_raw : sim.sensors();
-      auto sensors=sensor_errors.apply(raw_sensors);
+      auto sensors=sensor_events.apply(sensor_errors.apply(raw_sensors));
+      sensor_status=sensor_events.status();
       if(injecting && opts.inject_fault=="sensor-stale") sensors.time_s-=.002;
       const double sensor_read_ms = milliseconds(sensor_begin);
 
       if(std::abs(sensors.time_s - stamp) > 1e-9){
         throw std::runtime_error(
-          "Sensor time differs from current control time"
+          "Sensor time differs from current control time; age_ms="+std::to_string(1000*(stamp-sensors.time_s))
         );
       }
 
@@ -1079,6 +1122,11 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         row[302+2*i]=sensors.joint_position[i];row[303+2*i]=sensors.joint_velocity[i];
       }
       row[326]=measured_foot_position_error;row[327]=measured_foot_velocity_error;
+      row[328]=static_cast<int>(opts.sensor_event.event);row[329]=double(sensor_status.active);row[330]=1000*sensor_status.age_s;
+      for(int i=0;i<4;++i) {
+        row[331+i]=double(raw_sensors.foot_contact[i]);
+        row[335+i]=double(raw_sensors.foot_contact[i]!=sensors.foot_contact[i]);
+      }
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();
@@ -1160,17 +1208,18 @@ int main(int argc,char** argv) {
     rclcpp::init(0,nullptr);
     std::signal(SIGUSR1,workerExitSignal);
     go2::ControlSession session(opts.sensor_startup);
-    try {run(opts,robot,target,mapping,session);}
+    go2::SensorEventStatus sensor_status;
+    try {run(opts,robot,target,mapping,session,sensor_status);}
     catch(const std::exception& error) {
       session.fault(session.time_s,error.what());
       rclcpp::shutdown();
-      try {writeSession(opts,session);} catch(const std::exception& report_error) {
+      try {writeSession(opts,session,sensor_status);} catch(const std::exception& report_error) {
         std::cerr<<"Failed writing session report: "<<report_error.what()<<'\n';
       }
       throw;
     }
     rclcpp::shutdown();
-    writeSession(opts,session);
+    writeSession(opts,session,sensor_status);
     return 0;
   } catch(const std::exception& error) {
     std::cerr<<"control_simulation: "<<error.what()<<'\n'; return 1;

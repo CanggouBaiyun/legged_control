@@ -10,6 +10,8 @@ if [[ "${1:-}" == --help ]]; then
     '  [--estimator-control] (simulation truth startup, then estimated state after readiness checks)' \
     '  [--sensor-startup] (nominal joint preparation -> estimated-state MPC/WBC; no base p/v truth in control)' \
     '  [--sensor-errors config/sensors/moderate_errors.json] (seeded measurement errors; requires --sensor-startup)' \
+    '  [--sensor-event delay|dropout|contact-on|contact-off --sensor-event-at 8 --sensor-event-duration 0.01]' \
+    '  [--sensor-delay-ms 2] [--sensor-contact-foot fl]; same-step freshness guard stays active.' \
     '  [--request-stop-at SECONDS] (zero target + stance, settle 0.3 s, end session; timeout 5 s)' \
     '  [--push-at 8 --push-duration 0.2 --push-fy 20] (world-frame N at base_link COM; --push-fx/--push-fz also supported)' \
     '  Stop topic: /go2_control/stop (std_msgs/msg/Empty); this ends the simulation session.' \

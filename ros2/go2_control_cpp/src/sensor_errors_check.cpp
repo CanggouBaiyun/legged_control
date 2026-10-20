@@ -12,6 +12,40 @@ go2::SensorMeasurements sample() {
   for(int i=0;i<12;++i) {raw.joint_position[i]=i*.01;raw.joint_velocity[i]=-i*.02;}
   raw.foot_contact={true,false,false,true};return raw;
 }
+void checkEvents() {
+  for(const auto event:{go2::SensorEvent::Delay,go2::SensorEvent::Dropout}) {
+    go2::SensorEventSettings settings;settings.event=event;settings.start_s=3;settings.duration_s=.01;
+    settings.delay_s=.004;go2::SensorEventModel model(settings);
+    for(int i=0;i<=1505;++i) {
+      auto input=sample();input.time_s=i*.002;input.joint_position[0]=i;
+      const auto output=model.apply(input);
+      const bool active=i>=1500 && i<1505;
+      const int expected=active ? (event==go2::SensorEvent::Delay ? i-2 : 1499) : i;
+      require(std::abs(output.time_s-expected*.002)<1e-12 && output.joint_position[0]==expected,
+          "Delay/dropout changed only timestamp, selected wrong packet, or did not recover delivery");
+    }
+  }
+  for(const auto event:{go2::SensorEvent::ContactOn,go2::SensorEvent::ContactOff}) {
+    go2::SensorEventSettings settings;settings.event=event;settings.start_s=3;settings.duration_s=.01;settings.foot=2;
+    go2::SensorEventModel model(settings);
+    for(int i=0;i<=1505;++i) {
+      auto input=sample();input.time_s=i*.002;
+      input.foot_contact[2]=event==go2::SensorEvent::ContactOff;
+      auto output=model.apply(input);
+      const bool active=i>=1500 && i<1505;
+      auto expected=input.foot_contact;
+      if(active) expected[2]=event==go2::SensorEvent::ContactOn;
+      require(output.time_s==input.time_s && output.joint_position==input.joint_position && output.foot_contact==expected,
+          "Contact event affected wrong foot, timing or measurement fields");
+    }
+    require(model.status().changed_contact_samples==5,"Contact event did not change exactly five samples");
+  }
+  go2::SensorEventSettings invalid;invalid.event=go2::SensorEvent::Delay;invalid.start_s=3;invalid.delay_s=.003;
+  bool rejected=false;
+  try {go2::SensorEventModel model(invalid);} catch(const std::runtime_error&) {rejected=true;}
+  require(rejected,"Unaligned sensor delay accepted");
+  std::cout<<"Sensor events: real cached packets/timestamps, dropout hold, recovery and isolated contact override passed\n";
+}
 }
 int main(int argc,char** argv) {
  try {
@@ -62,6 +96,7 @@ int main(int argc,char** argv) {
   try {identity.apply(raw);} catch(const std::runtime_error&) {rejected=true;}require(rejected,"NaN sample accepted");
   if(argc==2) go2::loadSensorErrorSettings(argv[1]);
   else if(argc!=1) throw std::runtime_error("Usage: sensor_errors_check [CONFIG]");
+  checkEvents();
   std::cout<<"Sensor errors: identity, signed biases/local rotation, cache/seed, normalized attitude, invalid inputs passed\n"
            <<"10000-sample gyro error: mean="<<mean<<", std="<<sd<<" rad/s (configured 0.002)\n";
  } catch(const std::exception& error) {std::cerr<<error.what()<<'\n';return 1;}
