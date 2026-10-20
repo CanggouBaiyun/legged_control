@@ -1,6 +1,7 @@
 #pragma once
 #include "go2_control_cpp/model.hpp"
 #include "go2_control_cpp/sensors.hpp"
+#include "go2_control_cpp/joint_command.hpp"
 #include <mujoco/mujoco.h>
 #include <memory>
 #include <array>
@@ -24,7 +25,9 @@ class Simulation {
   // 由拥有仿真数据的控制线程调用。
   SensorMeasurements sensors();
   // Returns the maximum torque removed by the final actuator limit.
-  double command(const Eigen::VectorXd& torques);
+  double command(const JointCommand& command,const SensorMeasurements& measured);
+  // Clear simulator actuation on exit; not a hardware stopping strategy.
+  void clearCommand();
   double maximumAppliedTorque() const;
   void step();
   void render();
@@ -52,7 +55,7 @@ class Simulation {
   std::unique_ptr<mjModel,void(*)(mjModel*)> model_{nullptr,mj_deleteModel};
   std::unique_ptr<mjData,void(*)(mjData*)> data_{nullptr,mj_deleteData};
   std::vector<Motor> motors_;
-  std::vector<int> torque_indices_;
+  std::vector<int> command_indices_;
   std::array<int,4> foot_geoms_;
   int floor_=-1;
   struct Viewer;

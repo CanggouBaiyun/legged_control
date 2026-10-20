@@ -337,15 +337,23 @@ const std::string estimator_foot_columns=[] {
 const std::string startup_columns=
     ",sensor_startup_enabled,startup_stage,startup_pd_weight,control_uses_estimate";
 // Stage: 0=legacy path, 1=joint preparation, 2=handoff, 3=MPC/WBC.
-using Row=std::array<double,195>;
+std::string jointCommandColumns(const std::vector<std::string>& names) {
+  if(names.size()!=12) throw std::runtime_error("Expected 12 command motor names");
+  std::string result;
+  for(const auto& name:names)
+    for(const std::string field:{"q_rad","dq_radps","kp","kd","tau_ff_nm"})
+      result+=",cmd_"+name+"_"+field;
+  return result;
+}
+using Row=std::array<double,255>;
 // The controller submits one second of rows at a time. Disk I/O runs on a
 // separate thread, with a bounded queue even in an unlimited interactive run.
 class ControlLog {
  public:
-  explicit ControlLog(const std::filesystem::path& path) {
+  explicit ControlLog(const std::filesystem::path& path,const std::vector<std::string>& motor_names) {
     if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     out_.open(path);
-    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<startup_columns<<'\n';
+    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<startup_columns<<jointCommandColumns(motor_names)<<'\n';
     if(!out_) throw std::runtime_error("Cannot open control CSV");
     worker_=std::thread([this] {
       try {
@@ -505,7 +513,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
   bool handoff_complete=false;
   bool wbc_was_active=false;
   std::size_t mode=15,step=0;
-  ControlLog log(opts.output);
+  ControlLog log(opts.output,robot.motor_names);
   std::vector<Row> rows; rows.reserve(500);
   const auto requested_steps=opts.duration>0 ? static_cast<std::size_t>(std::lround(opts.duration/.002)) : 0;
   const auto wall_start=Clock::now();
@@ -698,6 +706,14 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       result.torques=Eigen::VectorXd::Zero(12);
       result.contact_forces=Eigen::MatrixXd::Zero(go2::stanceFeet(mode).size(),3);
       Eigen::VectorXd feedback=Eigen::VectorXd::Zero(12);
+      go2::JointCommand preparation_command,running_command;
+      preparation_command.time_s=stamp; running_command.time_s=stamp;
+      preparation_command.kp.setConstant(60.0);
+      preparation_command.kd.setConstant(3.0);
+      for(int i=0;i<12;++i) {
+        const auto& joint=robot.model.joints[robot.model.getJointId(robot.motor_names[i])];
+        preparation_command.position[i]=robot.nominal_q[joint.idx_q()];
+      }
       auto reference_end=Clock::now(),wbc_end=reference_end;
       if(opts.sensor_startup && startup_stage<3 && (mode!=15 || future_mode!=15))
         throw std::runtime_error("Wait for sensor startup handoff before commanding a gait");
@@ -753,17 +769,20 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         }
       }();
       wbc_end=Clock::now();
-      feedback=
-          opts.joint_kp*(point.q.tail<12>()-control_q.tail<12>())+
-          opts.joint_kd*(point.v.tail<12>()-control_v.tail<12>());
+      for(int i=0;i<12;++i) {
+        const auto& joint=robot.model.joints[robot.model.getJointId(robot.motor_names[i])];
+        running_command.position[i]=point.q[joint.idx_q()];
+        running_command.velocity[i]=point.v[joint.idx_v()];
+        running_command.kp[i]=opts.joint_kp;
+        running_command.kd[i]=opts.joint_kd;
+        running_command.feedforward_torque[i]=result.torques[joint.idx_v()-6];
       }
-      // Nominal pose is a desired preparation posture, not a base-state measurement.
-      const Eigen::VectorXd preparation_torque=
-          60.0*(robot.nominal_q.tail<12>()-control_q.tail<12>())-3.0*control_v.tail<12>();
-      const Eigen::VectorXd torques=(1.0-startup_pd_weight)*(result.torques+feedback)+
-          startup_pd_weight*preparation_torque;
+      feedback=running_command.torque(sensors)-running_command.feedforward_torque;
+      }
+      const auto joint_command=go2::blendJointCommands(
+          preparation_command,running_command,startup_pd_weight);
       wbc_was_active=!preparing;
-      const double clip=sim.command(torques);
+      const double clip=sim.command(joint_command,sensors);
       last_input=input_ref;
       const auto command_end=Clock::now();
       sim.step();
@@ -878,6 +897,14 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       row[193]=startup_pd_weight;
       row[194]=double(control_uses_estimate);
 
+      for(int i=0;i<12;++i) {
+        row[195+5*i]=joint_command.position[i];
+        row[196+5*i]=joint_command.velocity[i];
+        row[197+5*i]=joint_command.kp[i];
+        row[198+5*i]=joint_command.kd[i];
+        row[199+5*i]=joint_command.feedforward_torque[i];
+      }
+
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();
       const auto viewer_end=Clock::now();
@@ -891,13 +918,13 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       rows.back()[31]=milliseconds(begin,end);
       if(rows.size()>=500) log.submit(rows,true,begin);
     }
-    sim.command(Eigen::VectorXd::Zero(12));
+    sim.clearCommand();
     if(opts.duration>0 && step!=requested_steps) throw std::runtime_error("Simulation interrupted before requested duration");
     log.finish(rows);
     std::cout<<"Completed "<<log.samples()<<" steps; rejected policies="<<mrt.rejected()<<"; CSV: "<<opts.output<<std::endl;
   } catch(...) {
     const auto error=std::current_exception();
-    sim.command(Eigen::VectorXd::Zero(12));
+    sim.clearCommand();
     log.finish(rows);
     if(opts.duration==0 && !rclcpp::ok()) {
       std::cout<<"Interactive session ended by user; "<<log.samples()<<" steps; CSV: "<<opts.output<<std::endl;

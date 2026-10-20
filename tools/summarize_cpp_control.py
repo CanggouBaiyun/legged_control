@@ -302,6 +302,28 @@ def summarize(path, duration=20.0, commands=None):
                 "preparation_wbc_executed": False,
                 "note": "Flat-ground nominal preparation pose; ideal IMU attitude and simulation contact flags. MPC prewarmed before physics starts.",
             }
+    command_columns = [name for name in data.dtype.names if name.startswith("cmd_")]
+    if command_columns:
+        joints = [name[4:-3] for name in command_columns if name.endswith("_kp")]
+        fields = ("q_rad", "dq_radps", "kp", "kd", "tau_ff_nm")
+        expected = {f"cmd_{joint}_{field}" for joint in joints for field in fields}
+        if len(joints) != 12 or set(command_columns) != expected:
+            raise RuntimeError("Incomplete joint-command fields")
+        weight = data["startup_pd_weight"]
+        for joint in joints:
+            kp, kd = data[f"cmd_{joint}_kp"], data[f"cmd_{joint}_kd"]
+            if (kp < 0).any() or (kd < 0).any():
+                raise RuntimeError("Negative joint-command gains")
+            if (not np.allclose(kp, 60 * weight + (1 - weight) * data["joint_kp"], rtol=0, atol=1e-10) or
+                    not np.allclose(kd, 3 * weight + (1 - weight) * data["joint_kd"], rtol=0, atol=1e-10)):
+                raise RuntimeError("Joint-command gains disagree with the handoff")
+            if (data[f"cmd_{joint}_tau_ff_nm"][weight == 1] != 0).any():
+                raise RuntimeError("Preparation command unexpectedly contained feedforward torque")
+        result["joint_command"] = {
+            "fields": list(fields), "order": joints,
+            "execution": "MuJoCo evaluates tau_ff + Kp*(q_des-q_sensor) + Kd*(dq_des-dq_sensor), then clips total torque to actuator limits.",
+            "hardware_mapping_verified": False,
+        }
     walking = data[data["mode"] != 15]
     if len(walking):
         result["first_non_stance_s"] = float(walking["time_s"][0])
@@ -345,6 +367,8 @@ def summarize(path, duration=20.0, commands=None):
         startup = result["sensor_startup"]
         print(f"Sensor startup: handoff {startup['handoff_start_s']} -> {startup['handoff_complete_s']} s; "
               "estimated base state used from the first sample")
+    if "joint_command" in result:
+        print("Joint commands: q/dq/Kp/Kd/tau_ff; all 12 joints and handoff gains verified")
     print(f"Final x: {result['final_x_m']:.6f} m; yaw: {result['final_yaw_deg']:.3f} deg; "
           f"torque: {result['maximum_applied_torque_nm']:.3f} Nm; clipped steps: {result['clipped_steps']}")
     for name in ("control_ms", "loop_ms", "control_start_lateness_ms"):
