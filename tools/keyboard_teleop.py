@@ -21,7 +21,8 @@ HELP = """
   T：原地 trot       G：零速并请求四足站立
   W / S：前进 / 后退     A / D：左移 / 右移
   Q / E：左转 / 右转     空格 / X：所有速度归零
-  方向键也可前后、左右移动；H：显示帮助
+  P：零速、站立后结束仿真会话（等待稳定）；H：显示帮助
+  方向键也可前后、左右移动
   Esc / Ctrl+C：退出键盘程序，请求零速和站立，仿真窗口继续运行
 
 按一下方向键会持续运动；不同轴可以叠加。空格停止移动但保留 trot。
@@ -32,9 +33,13 @@ HELP = """
 class KeyboardControl:
     def __init__(self, node, args):
         from geometry_msgs.msg import Twist
+        from std_msgs.msg import Empty
         from ocs2_msgs.msg import ModeSchedule, MpcObservation
         self.node, self.args = node, args
         self.Twist, self.ModeSchedule = Twist, ModeSchedule
+        self.Empty = Empty
+        self.stop = node.create_publisher(Empty, "/go2_control/stop", 1)
+        self.session_stop_requested = False
         self.velocity = node.create_publisher(Twist, "/cmd_vel", 1)
         self.gait = node.create_publisher(ModeSchedule, "/legged_robot_mpc_mode_schedule", 1)
         self.observation_sub = node.create_subscription(
@@ -82,6 +87,14 @@ class KeyboardControl:
         if key in (" ", "x"):
             self.command = [0.0, 0.0, 0.0]
             print("所有速度已归零。", flush=True)
+        elif key == "p":
+            if not self.connected() or self.stop.get_subscription_count() == 0:
+                print("等待仿真连接后再请求结束会话。", flush=True)
+                return
+            self.command = [0.0, 0.0, 0.0]
+            self.session_stop_requested = True
+            self.stop.publish(self.Empty())
+            print("已请求零速、站立并结束会话，等待控制器确认稳定。", flush=True)
         elif key in ("t", "g"):
             self.request_gait(key == "t")
         elif key == "h":
@@ -167,6 +180,8 @@ def main():
                 if not key and not sys.stdin.isatty():
                     break
                 control.key(key)
+                if control.session_stop_requested:
+                    break
             now = time.monotonic()
             if now >= next_publish:
                 control.publish()
@@ -177,14 +192,19 @@ def main():
         termios.tcsetattr(fd, termios.TCSADRAIN, original)
         signal.signal(signal.SIGTERM, previous_term)
         if rclpy.ok():
-            stance_requested = control.request_gait(False)
+            stance_requested = False if control.session_stop_requested else control.request_gait(False)
             until = time.monotonic() + 0.3
             while time.monotonic() < until:
                 control.command = [0.0, 0.0, 0.0]
+                if control.session_stop_requested:
+                    control.stop.publish(control.Empty())
                 control.publish()
                 rclpy.spin_once(node, timeout_sec=0.05)
-            print("键盘控制已退出；已发送零速和站立请求，仿真窗口继续运行。" if stance_requested
-                  else "键盘控制已退出；未连接到仿真，未发送步态请求。", flush=True)
+            if control.session_stop_requested:
+                print("键盘已退出；仿真将在稳定站立后结束，具体结果见仿真终端。", flush=True)
+            else:
+                print("键盘控制已退出；已发送零速和站立请求，仿真窗口继续运行。" if stance_requested
+                      else "键盘控制已退出；未连接到仿真，未发送步态请求。", flush=True)
         node.destroy_node()
         rclpy.try_shutdown()
     return 0

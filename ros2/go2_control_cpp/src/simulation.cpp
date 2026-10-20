@@ -65,7 +65,9 @@ Simulation::Simulation(const std::filesystem::path& root,const RobotModel& robot
         !model_->actuator_ctrllimited[a]) throw std::runtime_error("Expected bounded direct torque actuators");
     const char* name=mj_id2name(model_.get(),mjOBJ_JOINT,joint_id);
     if(!name || !robot.model.existJointName(name)) throw std::runtime_error("Unexpected actuator joint");
-    torque_indices_.push_back(robot.model.joints[robot.model.getJointId(name)].idx_v()-6);
+    const auto motor=std::find(robot.motor_names.begin(),robot.motor_names.end(),name);
+    if(motor==robot.motor_names.end()) throw std::runtime_error("Actuator missing from command motor order");
+    command_indices_.push_back(std::distance(robot.motor_names.begin(),motor));
   }
   for(int i=0;i<4;++i) {
     const auto name=ocs2Feet()[i].substr(0,2);
@@ -218,16 +220,19 @@ void Simulation::state(Eigen::VectorXd& q,Eigen::VectorXd& v) const {
   if(!q.allFinite() || !v.allFinite() || std::abs(q.segment<4>(3).norm()-1)>1e-8 || q[2]<=.12 || q[2]>=.50)
     throw std::runtime_error("Invalid state or unsafe base height");
 }
-double Simulation::command(const Eigen::VectorXd& torques) {
-  if(torques.size()!=12 || !torques.allFinite()) throw std::runtime_error("Invalid actuator torque");
+double Simulation::command(const JointCommand& command,const SensorMeasurements& measured) {
+  if(std::abs(measured.time_s-time())>1e-9)
+    throw std::runtime_error("Stale joint command measurements");
+  const auto torques=command.torque(measured);
   double clip=0;
   for(int a=0;a<12;++a) {
-    const double raw=torques[torque_indices_[a]];
+    const double raw=torques[command_indices_[a]];
     data_->ctrl[a]=std::clamp(raw,model_->actuator_ctrlrange[2*a],model_->actuator_ctrlrange[2*a+1]);
     clip=std::max(clip,std::abs(raw-data_->ctrl[a]));
   }
   return clip;
 }
+void Simulation::clearCommand() {std::fill_n(data_->ctrl,12,0.0);}
 double Simulation::maximumAppliedTorque() const {
   double result=0;
   for(int a=0;a<12;++a) result=std::max(result,std::abs(data_->ctrl[a]));

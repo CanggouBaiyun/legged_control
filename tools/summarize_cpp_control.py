@@ -105,7 +105,25 @@ def summarize(path, duration=20.0, commands=None):
     if not np.isfinite(duration) or duration < 0:
         raise RuntimeError("Duration must be finite and non-negative")
     interactive = duration == 0
+    requested_duration = duration
     data = np.atleast_1d(np.genfromtxt(path, delimiter=",", names=True))
+    session_path = path.with_suffix(".session.json")
+    session = None
+    if session_path.exists():
+        session = json.loads(session_path.read_text())
+        if (int(session["schema"]) != 1 or session["state"] != "stopped" or
+                session["csv_flushed"] not in (True, "true") or
+                int(session["samples"]) != len(data) or
+                abs(float(session["time_s"]) - len(data) * 0.002) > 1e-8):
+            raise RuntimeError("Session report does not describe a completed, flushed CSV")
+        controlled_stop = session["controlled_stop"] in (True, "true")
+        if controlled_stop != (session["reason"] == "controlled_stop"):
+            raise RuntimeError("Inconsistent controlled-stop report")
+        if abs(float(session["requested_duration_s"]) - duration) > 1e-8:
+            raise RuntimeError("Requested duration differs from session report")
+        intentional_early_exit = controlled_stop or session["reason"] == "viewer_closed"
+        if intentional_early_exit and duration > 0 and len(data) <= round(duration / 0.002):
+            duration = len(data) * 0.002
     if interactive and not len(data):
         result = {"samples": 0, "duration_s": 0.0, "requested_duration_s": 0.0,
                   "session_mode": "interactive", "status": "closed_before_first_control_step"}
@@ -173,6 +191,19 @@ def summarize(path, duration=20.0, commands=None):
         "raised_swing_contact_samples": {},
         "swing_height_tracking_rmse_mm": {},
     }
+    if session is not None:
+        result["control_session"] = session
+        result["requested_duration_s"] = requested_duration
+        if requested_duration > 0 and duration < requested_duration:
+            result["session_mode"] = "ended_early"
+        if "control_session_state" not in data.dtype.names or not np.isin(data["control_session_state"], (1, 2, 3, 4)).all():
+            raise RuntimeError("Invalid control-session state samples")
+        if session["reason"] == "controlled_stop":
+            if not len(data) or data["control_session_state"][-1] != 4:
+                raise RuntimeError("Controlled stop has no stopping state samples")
+            settled = data[data["time_s"] >= data["time_s"][-1] - 0.3 + 1e-9]
+            if (settled["mode"] != 15).any() or (settled["startup_pd_weight"] != 0).any():
+                raise RuntimeError("Controlled stop did not finish in running four-foot stance")
     if interactive:
         result["session_mode"] = "interactive"
         result["requested_duration_s"] = 0.0
@@ -260,6 +291,70 @@ def summarize(path, duration=20.0, commands=None):
             elif (value < 0 if name in ("swing_kp", "swing_kd") else value <= 0):
                 raise RuntimeError(f"Invalid WBC setting: {name}")
             result["wbc_settings"][name] = value
+    startup_fields = ("sensor_startup_enabled", "startup_stage", "startup_pd_weight", "control_uses_estimate")
+    if any(name in data.dtype.names for name in startup_fields):
+        if not all(name in data.dtype.names for name in startup_fields):
+            raise RuntimeError("Incomplete sensor-startup metadata")
+        enabled = np.unique(data["sensor_startup_enabled"])
+        if len(enabled) != 1 or enabled[0] not in (0, 1):
+            raise RuntimeError("Invalid or changing sensor-startup mode")
+        if enabled[0]:
+            stage, weight = data["startup_stage"], data["startup_pd_weight"]
+            if (not np.isin(stage, (1, 2, 3)).all() or stage[0] != 1 or
+                    (np.diff(stage) < 0).any() or (np.diff(stage) > 1).any() or
+                    (weight < 0).any() or (weight > 1).any() or
+                    (np.diff(weight) > 1e-9).any() or
+                    (data["control_uses_estimate"] != 1).any()):
+                raise RuntimeError("Invalid sensor-startup stage, blend or state source")
+            for axis in ("x", "y", "z"):
+                if (not np.allclose(data[f"control_base_{axis}_m"], data[f"estimated_{axis}_m"], atol=1e-10, rtol=0) or
+                        not np.allclose(data[f"control_base_v{axis}_world_mps"], data[f"estimated_v{axis}_world_mps"], atol=1e-10, rtol=0)):
+                    raise RuntimeError("Sensor-startup control did not use the estimated base state")
+            preparing, blending, running = stage == 1, stage == 2, stage == 3
+            if ((data["mode"][~running] != 15).any() or
+                    (weight[preparing] != 1).any() or (weight[running] != 0).any() or
+                    (data["max_wbc_torque_nm"][preparing] != 0).any() or
+                    (data["estimator_control_active"][preparing] != 0).any() or
+                    (data["estimator_control_active"][~preparing] != 1).any()):
+                raise RuntimeError("Invalid preparation or MPC/WBC handoff")
+            if not interactive and (not blending.any() or not running.any()):
+                raise RuntimeError("Sensor startup did not complete its handoff")
+            handoff = float(data["time_s"][blending][0]) if blending.any() else None
+            completed = float(data["time_s"][running][0]) if running.any() else None
+            if handoff is not None and not 2.2 - 1e-9 <= handoff < 3.0:
+                raise RuntimeError("Sensor startup activated outside its readiness window")
+            if completed is not None and abs(completed - handoff - 0.2) > 0.002 + 1e-9:
+                raise RuntimeError("Sensor startup did not blend for 0.2 seconds")
+            result["sensor_startup"] = {
+                "stage_samples": {str(int(value)): int((stage == value).sum()) for value in np.unique(stage)},
+                "handoff_start_s": handoff, "handoff_complete_s": completed,
+                "control_uses_estimate_from_first_sample": True,
+                "preparation_joint_kp": 60.0, "preparation_joint_kd": 3.0,
+                "preparation_wbc_executed": False,
+                "note": "Flat-ground nominal preparation pose; ideal IMU attitude and simulation contact flags. MPC prewarmed before physics starts.",
+            }
+    command_columns = [name for name in data.dtype.names if name.startswith("cmd_")]
+    if command_columns:
+        joints = [name[4:-3] for name in command_columns if name.endswith("_kp")]
+        fields = ("q_rad", "dq_radps", "kp", "kd", "tau_ff_nm")
+        expected = {f"cmd_{joint}_{field}" for joint in joints for field in fields}
+        if len(joints) != 12 or set(command_columns) != expected:
+            raise RuntimeError("Incomplete joint-command fields")
+        weight = data["startup_pd_weight"]
+        for joint in joints:
+            kp, kd = data[f"cmd_{joint}_kp"], data[f"cmd_{joint}_kd"]
+            if (kp < 0).any() or (kd < 0).any():
+                raise RuntimeError("Negative joint-command gains")
+            if (not np.allclose(kp, 60 * weight + (1 - weight) * data["joint_kp"], rtol=0, atol=1e-10) or
+                    not np.allclose(kd, 3 * weight + (1 - weight) * data["joint_kd"], rtol=0, atol=1e-10)):
+                raise RuntimeError("Joint-command gains disagree with the handoff")
+            if (data[f"cmd_{joint}_tau_ff_nm"][weight == 1] != 0).any():
+                raise RuntimeError("Preparation command unexpectedly contained feedforward torque")
+        result["joint_command"] = {
+            "fields": list(fields), "order": joints,
+            "execution": "MuJoCo evaluates tau_ff + Kp*(q_des-q_sensor) + Kd*(dq_des-dq_sensor), then clips total torque to actuator limits.",
+            "hardware_mapping_verified": False,
+        }
     walking = data[data["mode"] != 15]
     if len(walking):
         result["first_non_stance_s"] = float(walking["time_s"][0])
@@ -299,6 +394,14 @@ def summarize(path, duration=20.0, commands=None):
         print(f"Base acceleration source: {result['base_acceleration_source']}")
     if "wbc_settings" in result:
         print(f"WBC settings: {result['wbc_settings']}")
+    if "sensor_startup" in result:
+        startup = result["sensor_startup"]
+        print(f"Sensor startup: handoff {startup['handoff_start_s']} -> {startup['handoff_complete_s']} s; "
+              "estimated base state used from the first sample")
+    if session is not None:
+        print(f"Control session: {session['reason']}; report: {session_path}")
+    if "joint_command" in result:
+        print("Joint commands: q/dq/Kp/Kd/tau_ff; all 12 joints and handoff gains verified")
     print(f"Final x: {result['final_x_m']:.6f} m; yaw: {result['final_yaw_deg']:.3f} deg; "
           f"torque: {result['maximum_applied_torque_nm']:.3f} Nm; clipped steps: {result['clipped_steps']}")
     for name in ("control_ms", "loop_ms", "control_start_lateness_ms"):
