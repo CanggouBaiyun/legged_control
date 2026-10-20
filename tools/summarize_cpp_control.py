@@ -6,6 +6,114 @@ from pathlib import Path
 import numpy as np
 
 
+def summarize_sensor_errors(data, session):
+    if "sensor_errors_enabled" not in data.dtype.names:
+        return None
+    enabled, seeds = np.unique(data["sensor_errors_enabled"]), np.unique(data["sensor_error_seed"])
+    if len(enabled) != 1 or enabled[0] not in (0, 1) or len(seeds) != 1 or not 0 <= seeds[0] <= 2**32 - 1 or seeds[0] != int(seeds[0]):
+        raise RuntimeError("Invalid or changing sensor error mode/seed")
+    if not np.allclose(data["raw_sensor_time_s"], data["sensor_time_s"], atol=1e-12, rtol=0):
+        raise RuntimeError("Sensor error model changed sample timestamps")
+    settings = None
+    if session is not None and "sensor_errors" in session:
+        meta = session["sensor_errors"]
+        if (meta["enabled"] in (True, "true")) != bool(enabled[0]) or int(meta["settings"]["seed"]) != int(seeds[0]):
+            raise RuntimeError("Sensor error metadata differs between CSV and session")
+        settings = {key: ([float(x) for x in value] if isinstance(value, list) else
+                          int(value) if key in ("seed", "schema") else float(value))
+                    for key, value in meta["settings"].items()}
+    if enabled[0] and (settings is None or (data["sensor_startup_enabled"] != 1).any() or
+                       (data["control_uses_estimate"] != 1).any()):
+        raise RuntimeError("Measurement-error run lacks configuration or estimated-state startup")
+    raw = np.column_stack([data[f"raw_imu_quat_{a}"] for a in "wxyz"])
+    measured = np.column_stack([data[f"imu_quat_{a}"] for a in "wxyz"])
+    for q in (raw, measured):
+        if not np.allclose(np.linalg.norm(q, axis=1), 1, atol=1e-6, rtol=0):
+            raise RuntimeError("Invalid raw/measured attitude quaternion")
+    w = np.sum(raw * measured, axis=1)
+    v = raw[:, :1] * measured[:, 1:] - measured[:, :1] * raw[:, 1:] - np.cross(raw[:, 1:], measured[:, 1:])
+    sign = np.where(w < 0, -1, 1)
+    w, v = w * sign, v * sign[:, None]
+    norm = np.linalg.norm(v, axis=1)
+    angle = 2 * np.arctan2(norm, w)
+    factor = np.divide(angle, norm, out=np.full_like(angle, 2), where=norm > 1e-14)
+    joints = [name[len("raw_joint_"):-len("_q_rad")] for name in data.dtype.names
+              if name.startswith("raw_joint_") and name.endswith("_q_rad")]
+    if len(joints) != 12:
+        raise RuntimeError("Missing raw/measured joint sensor columns")
+    groups = {
+        "orientation_local_rotation_rad": v * factor[:, None],
+        "gyro_radps": np.column_stack([data[f"imu_gyro_{a}_radps"] - data[f"raw_imu_gyro_{a}_radps"] for a in "xyz"]),
+        "specific_force_mps2": np.column_stack([data[f"imu_specific_force_{a}_mps2"] - data[f"raw_imu_specific_force_{a}_mps2"] for a in "xyz"]),
+        "joint_position_rad": np.column_stack([data[f"measured_joint_{j}_q_rad"] - data[f"raw_joint_{j}_q_rad"] for j in joints]),
+        "joint_velocity_radps": np.column_stack([data[f"measured_joint_{j}_dq_radps"] - data[f"raw_joint_{j}_dq_radps"] for j in joints]),
+    }
+    if not enabled[0] and any(np.abs(values).max() > 1e-12 for values in groups.values()):
+        raise RuntimeError("Disabled sensor error model changed measurements")
+    # Independently confirm that local joint feedback used the delivered readings.
+    torque = np.column_stack([
+        data[f"cmd_{j}_tau_ff_nm"] + data[f"cmd_{j}_kp"] * (data[f"cmd_{j}_q_rad"] - data[f"measured_joint_{j}_q_rad"]) +
+        data[f"cmd_{j}_kd"] * (data[f"cmd_{j}_dq_radps"] - data[f"measured_joint_{j}_dq_radps"]) for j in joints])
+    unclipped = data["max_torque_clip_nm"] <= 1e-9
+    if not np.allclose(np.max(np.abs(torque[unclipped]), axis=1), data["max_applied_torque_nm"][unclipped], atol=1e-8, rtol=0):
+        raise RuntimeError("Simulated actuator feedback did not use logged delivered joint measurements")
+    evaluated = data[(data["time_s"] >= 2.4 - 1e-9) & (data["estimator_shadow_enabled"] == 1)]
+    return {
+        "enabled": bool(enabled[0]), "seed": int(seeds[0]), "settings": settings, "joint_order": joints,
+        "measurement_error_statistics": {key: {"mean": values.mean(axis=0).tolist(), "std": values.std(axis=0).tolist(),
+                                                "max_abs": float(np.abs(values).max())} for key, values in groups.items()},
+        "after_2p4s_max_horizontal_position_estimation_error_m": (float(np.hypot(evaluated["estimator_position_error_x_m"],
+            evaluated["estimator_position_error_y_m"]).max()) if len(evaluated) else None),
+        "actuator_feedback_verified_on_unclipped_samples": int(unclipped.sum()),
+        "note": "Per-sample independent Gaussian errors plus constant biases, injected from the first sample. "
+                "Seed reproducible on the same C++ standard-library/toolchain. This noise stage leaves contacts/time unchanged; see sensor_event for downstream impairment. "
+                "Parameters are simulation assumptions, not calibrated Go2 sensor specifications.",
+    }
+
+
+def summarize_sensor_event(data, session):
+    if "sensor_event_type" not in data.dtype.names:
+        return None
+    codes = np.unique(data["sensor_event_type"])
+    names = {0: "none", 1: "delay", 2: "dropout", 3: "contact-on", 4: "contact-off"}
+    if len(codes) != 1 or codes[0] not in names:
+        raise RuntimeError("Invalid or changing sensor event type")
+    event_type = names[int(codes[0])]
+    raw = np.column_stack([data[f"raw_contact_{leg}"] for leg in ("fl", "fr", "rl", "rr")])
+    delivered = np.column_stack([data[f"estimator_sim_contact_{leg}"] for leg in ("fl", "fr", "rl", "rr")])
+    changed = np.column_stack([data[f"changed_contact_{leg}"] for leg in ("fl", "fr", "rl", "rr")])
+    if (not np.isin(raw, (0, 1)).all() or not np.isin(delivered, (0, 1)).all() or
+            not np.array_equal(changed, raw != delivered)):
+        raise RuntimeError("Invalid raw/delivered contact diagnostics")
+    if not np.allclose(data["sensor_sample_age_ms"], 1000 * (data["time_s"] - data["sensor_time_s"]), atol=1e-8, rtol=0):
+        raise RuntimeError("Sensor age diagnostics disagree with acquisition time")
+    if event_type == "none":
+        if np.any(changed) or np.any(data["sensor_event_active"]):
+            raise RuntimeError("Disabled sensor event changed contact")
+        return {"type": "none"}
+    if session is None or session.get("sensor_event", {}).get("type") != event_type:
+        raise RuntimeError("Missing or inconsistent sensor event configuration")
+    config = session["sensor_event"]
+    start, duration = float(config["start_s"]), float(config["duration_s"])
+    active = (data["time_s"] >= start - 1e-9) & (data["time_s"] < start + duration - 1e-9)
+    if not np.array_equal(data["sensor_event_active"], active):
+        raise RuntimeError("Sensor event active interval disagrees with configuration")
+    if int(config["changed_contact_samples"]) != int((changed != 0).any(axis=1).sum()):
+        raise RuntimeError("Sensor event changed-sample count mismatch")
+    result = {"type": event_type, "start_s": start, "duration_s": duration,
+              "active_samples": int(active.sum()), "max_age_ms": float(data["sensor_sample_age_ms"].max()), "feet": {}}
+    for i, leg in enumerate(("fl", "fr", "rl", "rr")):
+        false_positive = (raw[:, i] == 0) & (delivered[:, i] == 1)
+        false_negative = (raw[:, i] == 1) & (delivered[:, i] == 0)
+        result["feet"][leg] = {
+            "false_positive_samples": int(false_positive.sum()), "false_negative_samples": int(false_negative.sum()),
+            "max_false_positive_trust": (float(data[f"estimator_foot_{leg}_contact_trust"][false_positive].max())
+                                         if false_positive.any() else None)}
+    result["note"] = "Contact changes apply only to measured flags; simulated floor contact and MPC gait schedule remain independent. " \
+                     "Delay/dropout are expected to fault under the existing same-step freshness rule; fault metadata is in the session report."
+    return result
+
+
 def summarize_push(data):
     """Describe a single pulse; recovery thresholds are a scoped experiment definition."""
     fields = ("push_enabled", "push_start_s", "push_duration_s", "push_fx_n", "push_fy_n", "push_fz_n",
@@ -422,7 +530,7 @@ def summarize(path, duration=20.0, commands=None):
                 "control_uses_estimate_from_first_sample": True,
                 "preparation_joint_kp": 60.0, "preparation_joint_kd": 3.0,
                 "preparation_wbc_executed": False,
-                "note": "Flat-ground nominal preparation pose; ideal IMU attitude and simulation contact flags. MPC prewarmed before physics starts.",
+                "note": "Flat-ground nominal preparation pose; simulation contact flags. See sensor_errors for the configured IMU/joint measurement model. MPC prewarmed before physics starts.",
             }
     command_columns = [name for name in data.dtype.names if name.startswith("cmd_")]
     if command_columns:
@@ -466,6 +574,12 @@ def summarize(path, duration=20.0, commands=None):
     push = summarize_push(data)
     if push is not None:
         result["push"] = push
+    sensor_errors = summarize_sensor_errors(data, session)
+    if sensor_errors is not None:
+        result["sensor_errors"] = sensor_errors
+    sensor_event = summarize_sensor_event(data, session)
+    if sensor_event is not None:
+        result["sensor_event"] = sensor_event
     output = path.with_suffix(".json")
     output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     print(f"Completed {duration:g} s / {len(data)} steps; modes: {result['mode_samples']}")
@@ -496,6 +610,9 @@ def summarize(path, duration=20.0, commands=None):
         print(f"Control session: {session['reason']}; report: {session_path}")
     if "joint_command" in result:
         print("Joint commands: q/dq/Kp/Kd/tau_ff; all 12 joints and handoff gains verified")
+    if sensor_errors is not None:
+        print(f"Sensor measurement errors: enabled={sensor_errors['enabled']}; seed={sensor_errors['seed']}; "
+              f"actuator feedback verified on {sensor_errors['actuator_feedback_verified_on_unclipped_samples']} samples")
     if push is not None and push["enabled"]:
         print(f"Push: {push['force_world_n']} N for {push['duration_s']:g} s; "
               f"impulse={push['impulse_world_ns']} N*s")

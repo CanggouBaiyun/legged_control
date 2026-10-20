@@ -16,6 +16,13 @@ target_include_directories(go2_model PUBLIC
 target_link_libraries(go2_model PUBLIC pinocchio::pinocchio)
 add_library(go2_estimation STATIC src/state_estimation.cpp src/estimator_preprocessor.cpp)
 target_link_libraries(go2_estimation PUBLIC go2_model)
+add_library(go2_sensor_errors STATIC src/sensor_errors.cpp)
+target_compile_features(go2_sensor_errors PUBLIC cxx_std_17)
+target_include_directories(go2_sensor_errors PUBLIC include)
+target_link_libraries(go2_sensor_errors PUBLIC Eigen3::Eigen)
+add_executable(sensor_errors_check src/sensor_errors_check.cpp)
+target_link_libraries(sensor_errors_check PRIVATE go2_sensor_errors)
+install(TARGETS sensor_errors_check DESTINATION lib/${PROJECT_NAME})
 
 set(GO2_OSQP_ROOT "" CACHE PATH "Prefix containing matching OSQP 1.x C headers and library")
 if(GO2_OSQP_ROOT)
@@ -78,6 +85,7 @@ if(GO2_MUJOCO_ROOT)
   control_simulation
   go2_reference
   go2_estimation
+  go2_sensor_errors
   go2_mujoco_simulate
   )
   target_compile_definitions(control_simulation PRIVATE GO2_OSQP_LIBRARY="${GO2_OSQP_LIBRARY}")
