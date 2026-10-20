@@ -3,6 +3,7 @@
 #include "go2_control_cpp/model.hpp"
 #include "go2_control_cpp/sensors.hpp"
 #include "go2_control_cpp/state_estimation.hpp"
+#include <utility>
 
 namespace go2 {
 
@@ -20,6 +21,15 @@ struct PreprocessorSettings
     // 先等待这一时长避开触地冲击，再用相同时长将可信度从 0 升至 1。
     double contact_settling_time_s = 0.02;
 };
+
+// Flat-ground startup convention: x=y=0, height from measured supporting feet.
+Eigen::Vector3d initialSupportPosition(const EstimatorInput& input);
+
+// No simulator q/v argument: every coordinate comes from sensors or the filter.
+std::pair<Eigen::VectorXd,Eigen::VectorXd> estimatedRobotState(
+    const RobotModel& robot, const PreprocessorSettings& settings,
+    const SensorMeasurements& measurements,
+    const Eigen::Vector3d& position_world, const Eigen::Vector3d& velocity_world);
 
 class EstimatorPreprocessor {
  public:

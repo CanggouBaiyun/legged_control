@@ -193,4 +193,49 @@ EstimatorInput EstimatorPreprocessor::convert(
 
   return result;
 }
+
+Eigen::Vector3d initialSupportPosition(const EstimatorInput& input) {
+  double height=0.0;
+  int count=0;
+  for(const auto& foot:input.feet) {
+    if(foot.contact) {
+      height+=foot.support_height_world-foot.position_relative_world.z();
+      ++count;
+    }
+  }
+  if(count==0) throw std::runtime_error("Estimator initialization requires measured foot contact");
+  height/=count;
+  if(!std::isfinite(height) || height<=0.12 || height>=0.50)
+    throw std::runtime_error("Invalid support-derived startup height");
+  return Eigen::Vector3d(0.0,0.0,height);
+}
+
+std::pair<Eigen::VectorXd,Eigen::VectorXd> estimatedRobotState(
+    const RobotModel& robot, const PreprocessorSettings& settings,
+    const SensorMeasurements& measurements,
+    const Eigen::Vector3d& position_world, const Eigen::Vector3d& velocity_world) {
+  if(!position_world.allFinite() || !velocity_world.allFinite() ||
+      position_world.z()<=0.12 || position_world.z()>=0.50 ||
+      !measurements.orientation_world_from_imu.coeffs().allFinite() ||
+      std::abs(measurements.orientation_world_from_imu.norm()-1.0)>1e-3 ||
+      !measurements.angular_velocity_imu.allFinite() ||
+      !measurements.joint_position.allFinite() || !measurements.joint_velocity.allFinite())
+    throw std::runtime_error("Invalid estimated control state");
+  const Eigen::Matrix3d rotation_base_from_imu=
+      settings.rotation_base_from_imu.normalized().toRotationMatrix();
+  const Eigen::Matrix3d rotation_world_from_base=
+      measurements.orientation_world_from_imu.normalized().toRotationMatrix()*
+      rotation_base_from_imu.transpose();
+  Eigen::VectorXd q=robot.nominal_q,v=Eigen::VectorXd::Zero(robot.model.nv);
+  q.head<3>()=position_world;
+  q.segment<4>(3)=Eigen::Quaterniond(rotation_world_from_base).coeffs();
+  v.head<3>()=rotation_world_from_base.transpose()*velocity_world;
+  v.segment<3>(3)=rotation_base_from_imu*measurements.angular_velocity_imu;
+  for(int i=0;i<12;++i) {
+    const auto& joint=robot.model.joints[robot.model.getJointId(robot.motor_names[i])];
+    q[joint.idx_q()]=measurements.joint_position[i];
+    v[joint.idx_v()]=measurements.joint_velocity[i];
+  }
+  return {q,v};
+}
 }

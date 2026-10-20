@@ -8,6 +8,7 @@ if [[ "${1:-}" == --help ]]; then
     '  [--centroidal-base-accel] (default: existing tracking task)' \
     '  [--estimator-shadow] (log Kalman estimates; control uses simulation truth)' \
     '  [--estimator-control] (simulation truth startup, then estimated state after readiness checks)' \
+    '  [--sensor-startup] (nominal joint preparation -> estimated-state MPC/WBC; no base p/v truth in control)' \
     '  [--wbc-config JSON] (relative to project root; default: built-in WBC settings)' \
     '  [--online] (starts /cmd_vel targets; permits duration >20 s; no --forward/--turn-angle-deg)' \
     '  Online mode without --duration (or --duration 0) runs until you close the window or press Ctrl+C.' \

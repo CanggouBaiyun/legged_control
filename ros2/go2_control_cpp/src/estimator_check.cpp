@@ -1,4 +1,4 @@
-#include "go2_control_cpp/state_estimation.hpp"
+#include "go2_control_cpp/estimator_preprocessor.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -89,12 +89,59 @@ void checkTrot(double rolling_speed) {
   std::cout<<"trot center speed="<<rolling_speed<<": max vx error="<<velocity_error
            <<" m/s, 5 s displacement error="<<displacement_error<<" m\n";
 }
+
+// Exercise non-aligned IMU axes and distinct joint values, independently of MuJoCo.
+void checkSensorStartup(const std::filesystem::path& root) {
+  auto robot=go2::loadSimulationModel(root);
+  go2::PreprocessorSettings settings;
+  settings.rotation_base_from_imu=Eigen::AngleAxisd(0.4,Eigen::Vector3d::UnitX());
+  go2::SensorMeasurements sensors;
+  const Eigen::Matrix3d rotation=Eigen::AngleAxisd(0.7,Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  sensors.orientation_world_from_imu=rotation*settings.rotation_base_from_imu.toRotationMatrix();
+  sensors.angular_velocity_imu=Eigen::Vector3d(0.1,0.2,-0.3);
+  for(int i=0;i<12;++i) {sensors.joint_position[i]=0.01*i;sensors.joint_velocity[i]=-0.02*i;}
+  const Eigen::Vector3d position(1,2,0.28),velocity(0.1,-0.2,0.03);
+  // Poison the model's nominal base so copying it cannot pass the check.
+  robot.nominal_q.head<3>().setConstant(999.0);
+  const auto state=go2::estimatedRobotState(robot,settings,sensors,position,velocity);
+  const auto& q=state.first; const auto& v=state.second;
+  require((q.head<3>()-position).norm()<1e-12,"Startup base position source");
+  require((Eigen::Quaterniond(q[6],q[3],q[4],q[5]).toRotationMatrix()-rotation).norm()<1e-12,
+          "Startup IMU mounting rotation");
+  require((rotation*v.head<3>()-velocity).norm()<1e-12,"Startup world/local velocity conversion");
+  require((v.segment<3>(3)-settings.rotation_base_from_imu*sensors.angular_velocity_imu).norm()<1e-12,
+          "Startup angular velocity conversion");
+  for(int i=0;i<12;++i) {
+    const auto& joint=robot.model.joints[robot.model.getJointId(robot.motor_names[i])];
+    require(q[joint.idx_q()]==sensors.joint_position[i] &&
+            v[joint.idx_v()]==sensors.joint_velocity[i],"Startup named joint mapping");
+  }
+  go2::EstimatorInput input;
+  for(auto& foot:input.feet) {
+    foot.contact=true; foot.support_height_world=0.022;
+    foot.position_relative_world=Eigen::Vector3d(0.2,0.1,-0.258);
+  }
+  input.feet[3].contact=false; input.feet[3].position_relative_world.z()=123;
+  require((go2::initialSupportPosition(input)-Eigen::Vector3d(0,0,0.28)).norm()<1e-12,
+          "Startup support-derived height or ignored swing foot");
+  for(auto& foot:input.feet) foot.contact=false;
+  bool rejected=false;
+  try {go2::initialSupportPosition(input);} catch(const std::runtime_error&) {rejected=true;}
+  require(rejected,"Startup accepted missing support");
+  sensors.orientation_world_from_imu.coeffs().setZero(); rejected=false;
+  try {go2::estimatedRobotState(robot,settings,sensors,position,velocity);}
+  catch(const std::runtime_error&) {rejected=true;}
+  require(rejected,"Startup accepted invalid IMU attitude");
+  std::cout<<"sensor startup: source, mounting, joint mapping and invalid-input checks passed\n";
+}
 }
 
-int main() {
+int main(int argc,char** argv) {
   try {
     checkAcceleration(false); checkAcceleration(true);
     checkTrot(0); checkTrot(.01);
+    if(argc>2) throw std::runtime_error("Usage: estimator_check [PROJECT_ROOT]");
+    if(argc==2) checkSensorStartup(argv[1]);
     std::cout<<"Estimator analytic checks passed\n";
   } catch(const std::exception& error) {
     std::cerr<<error.what()<<'\n'; return 1;

@@ -166,6 +166,7 @@ struct Options {
   bool centroidal_base_accel=false;
   bool estimator_shadow=false;
   bool estimator_control=false;
+  bool sensor_startup=false;
   double duration=20,trot_at=-1,stop_at=-1;
   double joint_kp=20.0,joint_kd=1.0;
 };
@@ -189,18 +190,26 @@ Options options(int argc,char** argv) {
       result.estimator_control = true;
       result.estimator_shadow = true;
     }
+    else if(key=="--sensor-startup") {
+      result.sensor_startup=true;
+      result.estimator_control=true;
+      result.estimator_shadow=true;
+    }
     else if(key=="--online") result.online=true;
     else if(key=="--headless") result.headless=true;
     else if(key=="--check-only") result.check_only=true;
     else if(key=="--help") {
       std::cout<<"Simulation only. --project-root ROOT --target JSON --csv CSV [--headless] [--online] "
           "[--duration SECONDS] [--trot-at SECONDS] [--stop-trot-at SECONDS] "
-          "[--joint-kp KP] [--joint-kd KD] [--centroidal-base-accel] [--wbc-config JSON] [--estimator-shadow] [--estimator-control] [--check-only]\n"
+          "[--joint-kp KP] [--joint-kd KD] [--centroidal-base-accel] [--wbc-config JSON] [--estimator-shadow] [--estimator-control] [--sensor-startup] [--check-only]\n"
           "Joint gains default to Kp=20, Kd=1; both must be finite and non-negative.\n"
           "Online mode accepts external targets and gait commands; scripted runs are limited to 20 s.\n"
           "Online mode runs until user exit when --duration is omitted or zero.\n"
           "--estimator-shadow records Kalman estimates; control continues to use simulation truth.\n"
           "--estimator-control switches after 2 s and 0.2 s of quiet four-foot support; stops if not ready by 3 s.\n"
+          "--sensor-startup uses measured nominal joints with Kp=60/Kd=3, then a 0.2 s MPC/WBC handoff.\n"
+          "Requires nominal preparation pose, quiet four-foot support, and no gait command before readiness.\n"
+          "MPC is prewarmed before simulation time starts; this is not a hardware startup implementation.\n"
           "WBC paths are relative to the project root; omitting --wbc-config keeps built-in defaults.\n";
       std::exit(0);
     } else throw std::runtime_error("Unknown option: "+key);
@@ -325,7 +334,10 @@ const std::string estimator_foot_columns=[] {
   }
   return result;
 }();
-using Row=std::array<double,191>;
+const std::string startup_columns=
+    ",sensor_startup_enabled,startup_stage,startup_pd_weight,control_uses_estimate";
+// Stage: 0=legacy path, 1=joint preparation, 2=handoff, 3=MPC/WBC.
+using Row=std::array<double,195>;
 // The controller submits one second of rows at a time. Disk I/O runs on a
 // separate thread, with a bounded queue even in an unlimited interactive run.
 class ControlLog {
@@ -333,7 +345,7 @@ class ControlLog {
   explicit ControlLog(const std::filesystem::path& path) {
     if(path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     out_.open(path);
-    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<'\n';
+    out_<<std::setprecision(17)<<columns<<estimator_foot_columns<<startup_columns<<'\n';
     if(!out_) throw std::runtime_error("Cannot open control CSV");
     worker_=std::thread([this] {
       try {
@@ -414,6 +426,32 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
     solvers[mode]=std::make_unique<go2::OsqpSolver>(GO2_OSQP_LIBRARY);
   }
   pinocchio::Data diagnostic_data(robot.model);
+  go2::PreprocessorSettings estimator_settings;
+  go2::EstimatorPreprocessor estimator_preprocessor(robot,estimator_settings);
+  go2::LinearKalmanFilter estimator;
+  bool estimator_initialized=false;
+  go2::EstimatorInput initial_estimator_input;
+  Eigen::VectorXd seed_q,seed_v;
+  if(opts.sensor_startup) {
+    const auto measurements=sim.sensors();
+    Eigen::Matrix<double,12,1> nominal_joints;
+    for(int i=0;i<12;++i) {
+      const auto& joint=robot.model.joints[robot.model.getJointId(robot.motor_names[i])];
+      nominal_joints[i]=robot.nominal_q[joint.idx_q()];
+    }
+    if((measurements.joint_position-nominal_joints).cwiseAbs().maxCoeff()>0.10 ||
+        measurements.joint_velocity.cwiseAbs().maxCoeff()>0.10 ||
+        !std::all_of(measurements.foot_contact.begin(),measurements.foot_contact.end(),
+                     [](bool contact){return contact;}))
+      throw std::runtime_error("Sensor startup requires quiet nominal preparation pose and four-foot contact");
+    initial_estimator_input=estimator_preprocessor.convert(measurements);
+    estimator.reset(initial_estimator_input,go2::initialSupportPosition(initial_estimator_input));
+    estimator_initialized=true;
+    std::tie(seed_q,seed_v)=go2::estimatedRobotState(robot,estimator_settings,measurements,
+        estimator.positionWorld(),estimator.velocityWorld());
+    std::cout<<"Sensor startup: first MPC observation uses support-derived height "<<seed_q[2]
+             <<" m; base position/velocity truth is diagnostic only."<<std::endl;
+  }
   go2::LocalMrt mrt;
   auto startup_target=target.trajectory;
   if(opts.online) {
@@ -426,7 +464,9 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
   }
   mrt.initialize(startup_target);
   ocs2::SystemObservation obs;
-  obs.time=0; obs.mode=15; obs.state=mapping.state(q,v); obs.input=go2::CentroidalState::Zero();
+  obs.time=0; obs.mode=15;
+  obs.state=opts.sensor_startup ? mapping.state(seed_q,seed_v) : mapping.state(q,v);
+  obs.input=go2::CentroidalState::Zero();
   const auto deadline=Clock::now()+std::chrono::seconds(30);
   std::cout<<"Waiting for first valid local MRT policy..."<<std::endl;
   while(rclcpp::ok() && !mrt.select(0,.009)) {
@@ -451,6 +491,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
     <<"; base_accel="<<(opts.centroidal_base_accel ? "centroidal" : "tracking")
     <<"; target="<<(opts.online ? "online" : "scripted")
     <<"; session="<<(opts.duration==0 ? "until user exit" : "timed")
+    <<"; startup="<<(opts.sensor_startup ? "sensor joint preparation" : "legacy")
     <<"; estimator="<<(opts.estimator_control ? "control (waiting)" :
                        (opts.estimator_shadow ? "shadow" : "off"))
     <<std::endl;
@@ -458,12 +499,11 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
   double continuous_yaw=obs.state[9];
   double truth_continuous_yaw=obs.state[9];
   bool trot_sent=false,stance_sent=false;
-  go2::PreprocessorSettings estimator_settings;
-  go2::EstimatorPreprocessor estimator_preprocessor(robot,estimator_settings);
-  go2::LinearKalmanFilter estimator;
-  bool estimator_initialized = false;
   bool estimator_control_active = false;
   double estimator_ready_since = -1.0;
+  double handoff_at=-1.0;
+  bool handoff_complete=false;
+  bool wbc_was_active=false;
   std::size_t mode=15,step=0;
   ControlLog log(opts.output);
   std::vector<Row> rows; rows.reserve(500);
@@ -531,7 +571,9 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         if (opts.estimator_shadow) {
         const auto estimator_begin = Clock::now();
 
-        estimator_input = estimator_preprocessor.convert(sensors);
+        // The first sample already initialized the sensor-startup filter at t=0.
+        estimator_input = opts.sensor_startup && step==0 ?
+            initial_estimator_input : estimator_preprocessor.convert(sensors);
         // Independent simulator truth validates preprocessing only. It is not
         // passed into reset/update or used to correct the estimated state.
         truth_foot_motion=sim.footMotion();
@@ -545,30 +587,9 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         }
 
         if (!estimator_initialized) {
-          double initial_height = 0.0;
-          int support_count = 0;
-
-          for (const auto& foot : estimator_input.feet) {
-            if (foot.contact) {
-              initial_height +=
-                  foot.support_height_world - foot.position_relative_world.z();
-              ++support_count;
-            }
-          }
-
-          if (support_count == 0) {
-            throw std::runtime_error(
-                "Estimator initialization requires measured foot contact");
-          }
-
-          initial_height /= support_count;
-
-          const Eigen::Vector3d initial_position(
-              0.0, 0.0, initial_height);
-
-          estimator.reset(estimator_input, initial_position);
+          estimator.reset(estimator_input,go2::initialSupportPosition(estimator_input));
           estimator_initialized = true;
-        } else {
+        } else if(!(opts.sensor_startup && step==0)) {
           estimator.update(estimator_input);
         }
 
@@ -587,7 +608,12 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         const bool all_feet_contact = std::all_of(
             sensors.foot_contact.begin(),sensors.foot_contact.end(),
             [](bool contact) {return contact;});
-        const bool ready = stamp>=2.0 && all_feet_contact &&
+        const bool trusted_support=std::all_of(
+            estimator_input.feet.begin(),estimator_input.feet.end(),
+            [](const auto& foot){return foot.contact_trust>=1.0-1e-9;});
+        const bool preparation_ready=!opts.sensor_startup || (trusted_support &&
+            sensors.joint_velocity.cwiseAbs().maxCoeff()<0.10);
+        const bool ready = preparation_ready && stamp>=2.0 && all_feet_contact &&
             estimated_position.allFinite() && estimated_velocity.allFinite() &&
             estimated_position.z()>0.12 && estimated_position.z()<0.50 &&
             estimated_velocity.norm()<0.02 && sensors.angular_velocity_imu.norm()<0.10;
@@ -595,6 +621,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
           if (estimator_ready_since<0.0) estimator_ready_since=stamp;
           if (stamp-estimator_ready_since>=0.2-1e-9) {
             estimator_control_active=true;
+            handoff_at=stamp;
             std::cout<<"Estimator control activated at t="<<stamp<<" s"<<std::endl;
           }
         } else {
@@ -604,25 +631,24 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
           throw std::runtime_error("Estimator did not become ready before 3 s");
       }
 
-      Eigen::VectorXd control_q=q,control_v=v;
-      if (estimator_control_active) {
-        const Eigen::Matrix3d rotation_base_from_imu=
-            estimator_settings.rotation_base_from_imu.normalized().toRotationMatrix();
-        const Eigen::Matrix3d rotation_world_from_base=
-            sensors.orientation_world_from_imu.normalized().toRotationMatrix()*
-            rotation_base_from_imu.transpose();
-        control_q.head<3>()=estimated_position;
-        control_q.segment<4>(3)=Eigen::Quaterniond(rotation_world_from_base).coeffs();
-        control_v.head<3>()=rotation_world_from_base.transpose()*estimated_velocity;
-        control_v.segment<3>(3)=rotation_base_from_imu*sensors.angular_velocity_imu;
-        for (int i=0;i<12;++i) {
-          const auto& joint=robot.model.joints[robot.model.getJointId(robot.motor_names[i])];
-          control_q[joint.idx_q()]=sensors.joint_position[i];
-          control_v[joint.idx_v()]=sensors.joint_velocity[i];
-        }
-        if (!control_q.allFinite() || !control_v.allFinite() ||
-            control_q[2]<=0.12 || control_q[2]>=0.50)
-          throw std::runtime_error("Invalid estimated control state");
+      const bool control_uses_estimate=opts.sensor_startup || estimator_control_active;
+      Eigen::VectorXd control_q,control_v;
+      if(control_uses_estimate) {
+        std::tie(control_q,control_v)=go2::estimatedRobotState(
+            robot,estimator_settings,sensors,estimated_position,estimated_velocity);
+      } else {
+        control_q=q; control_v=v;
+      }
+      const bool preparing=opts.sensor_startup && !estimator_control_active;
+      const double handoff_progress=handoff_at<0.0 ? 0.0 :
+          std::clamp((stamp-handoff_at)/0.2,0.0,1.0);
+      const double startup_pd_weight=!opts.sensor_startup ? 0.0 :
+          (preparing ? 1.0 : (handoff_progress>=1.0-1e-9 ? 0.0 : 1.0-handoff_progress));
+      const int startup_stage=!opts.sensor_startup ? 0 :
+          (preparing ? 1 : (startup_pd_weight>0.0 ? 2 : 3));
+      if(startup_stage==3 && !handoff_complete) {
+        handoff_complete=true;
+        std::cout<<"Sensor startup handoff complete at t="<<stamp<<" s"<<std::endl;
       }
       const Eigen::Matrix3d control_rotation=Eigen::Quaterniond(
           control_q[6],control_q[3],control_q[4],control_q[5]).toRotationMatrix();
@@ -630,7 +656,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       const auto truth_centroidal_state=mapping.state(q,v);
       truth_continuous_yaw+=std::remainder(
           truth_centroidal_state[9]-truth_continuous_yaw,2.0*std::acos(-1.0));
-      auto current_state=estimator_control_active ?
+      auto current_state=control_uses_estimate ?
           mapping.state(control_q,control_v) : truth_centroidal_state;
       continuous_yaw+=std::remainder(current_state[9]-continuous_yaw,2.0*std::acos(-1.0));
       current_state[9]=continuous_yaw;
@@ -639,7 +665,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         if(opts.trot_at>0 && !trot_sent && stamp+1e-9>=opts.trot_at) {mrt.gait(true); trot_sent=true;}
         if(opts.stop_at>0 && !stance_sent && stamp+1e-9>=opts.stop_at) {mrt.gait(false); stance_sent=true;}
         obs.time=stamp;
-        obs.mode=mrt.getPolicy().modeSchedule_.modeAtTime(stamp);
+        obs.mode=preparing ? 15 : mrt.getPolicy().modeSchedule_.modeAtTime(stamp);
         obs.state=current_state; obs.input=last_input;
         obs.input.tail<12>()=mapping.jointVelocities(control_v); mrt.observe(obs);
       }
@@ -667,25 +693,34 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       if(!opts.online && opts.trot_at<0 && (mode!=15 || future_mode!=15))
         throw std::runtime_error("Standing run received a walking mode");
       const auto mrt_end=Clock::now();
+      go2::WbcReference reference;
+      go2::WbcResult result;
+      result.torques=Eigen::VectorXd::Zero(12);
+      result.contact_forces=Eigen::MatrixXd::Zero(go2::stanceFeet(mode).size(),3);
+      Eigen::VectorXd feedback=Eigen::VectorXd::Zero(12);
+      auto reference_end=Clock::now(),wbc_end=reference_end;
+      if(opts.sensor_startup && startup_stage<3 && (mode!=15 || future_mode!=15))
+        throw std::runtime_error("Wait for sensor startup handoff before commanding a gait");
+      if(!preparing) {
       // Current feedback input supplies joint-PD velocity references.
       const auto point=mapping.point(state_ref,input_ref);
       // WBC motion references and acceleration feedforward follow the plan.
       const auto nominal=mapping.point(state_ref,nominal_input);
       const auto future=mapping.point(future_state,future_input);
       // Contact-force references retain the current feedback correction.
-      auto reference=mapping.reference(control_q,nominal,future,input_ref,mode,future_mode,.005);
+      reference=mapping.reference(control_q,nominal,future,input_ref,mode,future_mode,.005);
       if(opts.centroidal_base_accel) {
         Eigen::VectorXd joint_acceleration=Eigen::VectorXd::Zero(12);
-        if(step>0)
+        if(wbc_was_active)
           joint_acceleration=(input_ref.tail<12>()-last_input.tail<12>())/sim.timestep();
         const auto desired_acceleration=mapping.centroidalBaseAcceleration(point,input_ref,joint_acceleration);
         reference.base_acceleration=go2::baseAccelerationInMeasuredFrame(
             point,desired_acceleration,control_q,control_v);
       }
-      const auto reference_end=Clock::now();
+      reference_end=Clock::now();
       auto& wbc=*controllers.at(mode);
       const auto qp=wbc.formulate(control_q,control_v,reference);
-      const auto result=[&]() {
+      result=[&]() {
         try { return wbc.solve(qp,*solvers.at(mode)); }
         catch(const std::exception& error) {
           // Save only on failure; preserve the original error if writing fails.
@@ -717,11 +752,17 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
           throw;
         }
       }();
-      const auto wbc_end=Clock::now();
-      const Eigen::VectorXd feedback=
+      wbc_end=Clock::now();
+      feedback=
           opts.joint_kp*(point.q.tail<12>()-control_q.tail<12>())+
           opts.joint_kd*(point.v.tail<12>()-control_v.tail<12>());
-      const Eigen::VectorXd torques=result.torques+feedback;
+      }
+      // Nominal pose is a desired preparation posture, not a base-state measurement.
+      const Eigen::VectorXd preparation_torque=
+          60.0*(robot.nominal_q.tail<12>()-control_q.tail<12>())-3.0*control_v.tail<12>();
+      const Eigen::VectorXd torques=(1.0-startup_pd_weight)*(result.torques+feedback)+
+          startup_pd_weight*preparation_torque;
+      wbc_was_active=!preparing;
       const double clip=sim.command(torques);
       last_input=input_ref;
       const auto command_end=Clock::now();
@@ -765,7 +806,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
       row[53]=rpy[0]; row[54]=rpy[1];
       row[55]=static_cast<int>(policy.controllerPtr_->getType());
       row[56]=opts.joint_kp; row[57]=opts.joint_kd;
-      row[58]=double(reference.base_acceleration.has_value());
+      row[58]=double(opts.centroidal_base_accel);
       const auto& settings=opts.wbc_settings;
       row[59]=settings.swing_kp; row[60]=settings.swing_kd;
       row[61]=double(settings.swing_acceleration_feedforward);
@@ -831,6 +872,11 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         }
         row[142+16*i]=foot.contact_trust;
       }
+
+      row[191]=double(opts.sensor_startup);
+      row[192]=startup_stage;
+      row[193]=startup_pd_weight;
+      row[194]=double(control_uses_estimate);
 
       const auto diagnostics_end=Clock::now();
       if(step%10==0) sim.render();

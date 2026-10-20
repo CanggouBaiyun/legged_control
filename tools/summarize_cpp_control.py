@@ -260,6 +260,48 @@ def summarize(path, duration=20.0, commands=None):
             elif (value < 0 if name in ("swing_kp", "swing_kd") else value <= 0):
                 raise RuntimeError(f"Invalid WBC setting: {name}")
             result["wbc_settings"][name] = value
+    startup_fields = ("sensor_startup_enabled", "startup_stage", "startup_pd_weight", "control_uses_estimate")
+    if any(name in data.dtype.names for name in startup_fields):
+        if not all(name in data.dtype.names for name in startup_fields):
+            raise RuntimeError("Incomplete sensor-startup metadata")
+        enabled = np.unique(data["sensor_startup_enabled"])
+        if len(enabled) != 1 or enabled[0] not in (0, 1):
+            raise RuntimeError("Invalid or changing sensor-startup mode")
+        if enabled[0]:
+            stage, weight = data["startup_stage"], data["startup_pd_weight"]
+            if (not np.isin(stage, (1, 2, 3)).all() or stage[0] != 1 or
+                    (np.diff(stage) < 0).any() or (np.diff(stage) > 1).any() or
+                    (weight < 0).any() or (weight > 1).any() or
+                    (np.diff(weight) > 1e-9).any() or
+                    (data["control_uses_estimate"] != 1).any()):
+                raise RuntimeError("Invalid sensor-startup stage, blend or state source")
+            for axis in ("x", "y", "z"):
+                if (not np.allclose(data[f"control_base_{axis}_m"], data[f"estimated_{axis}_m"], atol=1e-10, rtol=0) or
+                        not np.allclose(data[f"control_base_v{axis}_world_mps"], data[f"estimated_v{axis}_world_mps"], atol=1e-10, rtol=0)):
+                    raise RuntimeError("Sensor-startup control did not use the estimated base state")
+            preparing, blending, running = stage == 1, stage == 2, stage == 3
+            if ((data["mode"][~running] != 15).any() or
+                    (weight[preparing] != 1).any() or (weight[running] != 0).any() or
+                    (data["max_wbc_torque_nm"][preparing] != 0).any() or
+                    (data["estimator_control_active"][preparing] != 0).any() or
+                    (data["estimator_control_active"][~preparing] != 1).any()):
+                raise RuntimeError("Invalid preparation or MPC/WBC handoff")
+            if not interactive and (not blending.any() or not running.any()):
+                raise RuntimeError("Sensor startup did not complete its handoff")
+            handoff = float(data["time_s"][blending][0]) if blending.any() else None
+            completed = float(data["time_s"][running][0]) if running.any() else None
+            if handoff is not None and not 2.2 - 1e-9 <= handoff < 3.0:
+                raise RuntimeError("Sensor startup activated outside its readiness window")
+            if completed is not None and abs(completed - handoff - 0.2) > 0.002 + 1e-9:
+                raise RuntimeError("Sensor startup did not blend for 0.2 seconds")
+            result["sensor_startup"] = {
+                "stage_samples": {str(int(value)): int((stage == value).sum()) for value in np.unique(stage)},
+                "handoff_start_s": handoff, "handoff_complete_s": completed,
+                "control_uses_estimate_from_first_sample": True,
+                "preparation_joint_kp": 60.0, "preparation_joint_kd": 3.0,
+                "preparation_wbc_executed": False,
+                "note": "Flat-ground nominal preparation pose; ideal IMU attitude and simulation contact flags. MPC prewarmed before physics starts.",
+            }
     walking = data[data["mode"] != 15]
     if len(walking):
         result["first_non_stance_s"] = float(walking["time_s"][0])
@@ -299,6 +341,10 @@ def summarize(path, duration=20.0, commands=None):
         print(f"Base acceleration source: {result['base_acceleration_source']}")
     if "wbc_settings" in result:
         print(f"WBC settings: {result['wbc_settings']}")
+    if "sensor_startup" in result:
+        startup = result["sensor_startup"]
+        print(f"Sensor startup: handoff {startup['handoff_start_s']} -> {startup['handoff_complete_s']} s; "
+              "estimated base state used from the first sample")
     print(f"Final x: {result['final_x_m']:.6f} m; yaw: {result['final_yaw_deg']:.3f} deg; "
           f"torque: {result['maximum_applied_torque_nm']:.3f} Nm; clipped steps: {result['clipped_steps']}")
     for name in ("control_ms", "loop_ms", "control_start_lateness_ms"):
