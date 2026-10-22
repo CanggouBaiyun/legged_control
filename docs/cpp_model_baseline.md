@@ -1597,3 +1597,195 @@ export ROS_LOG_DIR=/tmp/go2_sensor_event_ros_logs
 ```
 
 单项复现可将 `--case` 改为 `sensor-delay`、`sensor-dropout`、`contact-on` 或 `contact-off`。完成当前事件代码/文档提交后，可通过 PR 收尾本分支；接机只读采样和传感器映射将为真实噪声、接触有效性、时间处理及控制权方案提供数据。
+
+### 在线机身高度与姿态入口（2026-10-22）
+
+分支 `feature/online-body-pose`。在用户已添加的订阅/姿态解析上，补齐成员变量、机身参考渐变、未来参考、竖直速度参考和命令日志。继续由 `online_command` 单独发布 MPC 目标；本节点没有修改 MPC/WBC 权重、步态、估计参数或键盘程序。
+
+接口 `/go2_control/body_pose` 使用 `geometry_msgs/msg/Pose`：`position.z` 为当前平地世界系中的期望机身高度，单位 m；`orientation` 为期望 roll/pitch 的四元数。要求 position.x/y 和解析后的 yaw 为零，yaw 继续沿已有运动命令生成。四元数须有限且范数非零，解析前归一化；非法指令保留上一有效目标。未就绪、观测超过 0.2 s 未更新或会话停止锁定时忽略新姿态命令。
+
+- 目标高度相对 `reference.info` 的 `comHeight` 限制在 ±0.02 m；当前默认 0.27 m，对应 0.25–0.29 m。
+- pitch/roll 各限制在 ±5°；当前参考按观测时间推进，最大高度变化率 0.02 m/s、角度变化率 0.10 rad/s。
+- 当前目标状态填写当前机身参考，时域末端填写按同一变化率预览的机身参考；本段高度斜率同步写入归一化竖直线动量参考。角动量继续沿既有零参考约定，本节点未新增姿态角速度到角动量的映射。
+- 姿态目标为一次发送后保持；平面速度仍沿用 0.5 s 超时规则。`/go2_control/stop` 会锁定停止并将机身目标设回默认高度/零倾角；带姿态条件下的完整停稳退出尚未验收。
+
+命令 CSV 从 30 列扩到 40 列，末尾新增 `body_target_z_m/pitch_rad/roll_rad`、`body_reference_z_m/pitch_rad/roll_rad`、`body_end_z_m/pitch_rad/roll_rad` 和 `target_vz_world_mps`，用于区分用户最终目标、当前参考与预测末端参考；控制 CSV 保持 339 列。
+
+Release 构建通过。一次 20 s / 10,000 步无窗口站立场景启用 SQP、传感器启动、估计状态闭环、Kp=0/Kd=1、质心基座加速度和 `upstream_a1_tasks_go2.json`；未加测量误差或外力。3 s 升到 0.28 m，6 s 请求 pitch=+3°，9 s 请求 roll=-3°，12 s 降到 0.26 m，15 s 请求 0.28 m/pitch=+2°/roll=-2°，17 s 复位。全部保持 mode 15，无力矩截断/策略拒收；403 条目标的参考变化率、时域末端变化范围及竖直速度一致性通过。4.5/4.8/5.1 s 的零四元数、0.4 m 越界高度、非零 yaw 均拒绝，未覆盖原有效目标。
+
+| 动作 | 评估区间 s | 最终目标 | 区间实际均值 |
+| --- | --- | --- | --- |
+| 升高 | 4.0–5.8 | z=0.28 m | z=0.27768 m |
+| 俯仰 | 7.3–8.8 | pitch=+3°，z=0.27 m | pitch=+2.286°，z=0.27465 m |
+| 横滚 | 10.3–11.8 | roll=-3°，z=0.27 m | roll=-1.196°，z=0.27805 m |
+| 降低 | 13.3–14.8 | z=0.26 m | z=0.27577 m |
+| 组合 | 16.0–16.8 | z=0.28 m，pitch=+2°，roll=-2° | z=0.27567 m，pitch=+1.204°，roll=-1.038° |
+| 复位 | 18.5–19.9 | z=0.27 m，pitch/roll=0° | z=0.27819 m，pitch=+0.490°，roll=-0.721° |
+
+预先使用的初步区间均值误差门限为高度 15 mm、角度 2°，用于暴露首轮跟踪问题，不作为最终功能指标。降低高度一项误差 15.77 mm，未通过；横滚虽然位于初步角度门限内，幅值仍不足。`*_checks.json` 的整体 passed=false。14.5–14.9 s 的 MPC 规划高度均值 0.27544 m，实际 0.27516 m，估计高度误差约 0.32 mm；说明该区间主要偏差发生在目标到 MPC 规划之间，不能归因为 WBC 丢失规划高度。固定默认关节参考与位姿代价等因素需继续核对，当前不据此断言根因或宣称姿态功能完成。
+
+本组控制/循环耗时 p99 为 0.6069/0.6711 ms，最大 0.7775/0.8771 ms；前 2 s 后 9000 步均未超过 2 ms。当前 CPU/单组结果不代表目标平台时序验收。
+
+结果前缀 `artifacts/cpp_online_body_pose_20261022`：控制 `.csv`、在线目标 `.commands.csv`、启动器 `_launcher.log`、MPC `_mpc.log`、命令节点 `_command.log`、汇总 `.json`、初步动作检查 `_checks.json`。下一步核对并改善 MPC 位姿目标跟踪，然后接键盘及验证带姿态的停止；仍在本分支推进，不提前合并。
+
+手动启动（另换输出名，避免覆盖本次结果）：
+
+```bash
+bash scripts/run_cpp_simulation.sh \
+  --mpc-solver sqp --online --sensor-startup \
+  --joint-kp 0 --joint-kd 1 --centroidal-base-accel \
+  --wbc-config config/wbc/upstream_a1_tasks_go2.json \
+  --csv artifacts/cpp_body_pose_manual.csv
+```
+
+仿真接管完成后，在 source ROS/工作空间且 ROS_DOMAIN_ID 与仿真相同的另一终端发送升高目标：
+
+```bash
+ros2 topic pub --once /go2_control/body_pose geometry_msgs/msg/Pose \
+  '{position: {z: 0.28}, orientation: {w: 1.0}}'
+```
+
+将 z 改回 0.27 且保持单位四元数即请求复位。该入口目前用于仿真。
+
+### 机身目标跟踪代价修正（2026-10-22）
+
+继续在 `feature/online-body-pose`。读取当前 OCS2 的 `LeggedRobotQuadraticTrackingCost.h`，确认状态偏差直接使用 `state - targetTrajectories.getDesiredState(time)`；在线节点的关节参考始终为 `reference.info` 中的默认角度。四脚支撑时，改变机身高度/倾角需要改变关节角，因此位姿误差和默认关节偏差会共同决定规划结果。
+
+用首轮 t=14.7 s 的实际脚位置作固定支撑位置，求解不同机身高度所需关节角；所有比较点的足位残差均低于 1.1e-12 m。仅考虑高度和关节状态代价，目标为 z=0.26 m、pitch/roll=0：
+
+| 候选机身高度 | 默认关节偏差代价 | 原高度误差代价 | 两项合计 |
+| --- | --- | --- | --- |
+| 0.260 m | 0.12632 | 0 | 0.12632 |
+| 0.270 m | 0.05221 | 0.02500 | 0.07721 |
+| 0.275 m | 0.02698 | 0.05625 | 0.08323 |
+
+高度项为 `0.5 * Qzz * (z-z_goal)^2`，关节项为 `0.5 * 2 * ||q_joint-q_default||^2`。该几何对照省略动力学、输入、其他状态和路径约束，用于识别代价冲突；完整 MPC 仍需闭环验证。原配置下，增加高度误差可以换取更小的关节偏差，不能只比较权重数字 500 与 2 的大小。诊断数值保存在 `artifacts/cpp_body_pose_cost_diagnosis_20261022.json`。
+
+本次仅修改共用 MPC 配置 `config/ocs2/go2/task.info` 的三项状态权重：
+
+| 状态权重 | 原值 | 当前值 |
+| --- | --- | --- |
+| 高度 Q(8,8) | 500 | 5000 |
+| pitch Q(10,10) | 200 | 1000 |
+| roll Q(11,11) | 200 | 1000 |
+
+关节权重继续为 2，MPC 输入代价、WBC 权重、低层 PD、步态与估计参数沿用既有配置。本次改变的是最优规划的取舍；配置在 MPC 启动时加载，已有 C++ 可执行文件无需为该参数修改重新编译。
+
+用同一目标时序、相同评估区间再跑一组 20 s / 10,000 步站立动作，未加噪声/外力。新增 `tools/run_cpp_body_pose_scenario.py` 固定发送动作和非法请求，检查 ROS 目标消息、变化率/竖直参考一致性，并保存动作报告；控制 CSV 中站立阶段无摆动目标的空列按缺失值处理。
+
+| 动作/指标 | 首轮实测区间均值 | 当前实测区间均值 | 最终目标 |
+| --- | --- | --- | --- |
+| 升高 z | 27.768 cm | 27.851 cm | 28 cm |
+| pitch | +2.286° | +2.862° | +3° |
+| roll | -1.196° | -2.087° | -3° |
+| 降低 z | 27.577 cm | 26.328 cm | 26 cm |
+| 组合 z / pitch / roll | 27.567 cm / +1.205° / -1.038° | 27.622 cm / +1.730° / -1.506° | 28 cm / +2° / -2° |
+| 复位 z / pitch / roll | 27.819 cm / +0.490° / -0.721° | 27.248 cm / +0.194° / -0.487° | 27 cm / 0° / 0° |
+
+本轮初步门限收紧到各评估区间的**均值误差**：高度 ≤5 mm、pitch/roll 各 ≤1°，六个动作均通过；其中最大高度均值误差 3.776 mm，最大角度均值误差 0.913°。404 条在线目标完成参考变化率与时域末端核对，零四元数/越界高度/非零 yaw 拒绝，无力矩截断/策略拒收。门限不覆盖每步峰值或尚未测试的 ±5° 边界、反方向倾角、噪声及 trot 中调姿。跟踪仍有残余偏差，不宣称精确跟踪或完整姿态功能已经验收。
+
+当前共用配置还运行了一组 20 s / 10,000 步的传感器启动→trot→前进→站立检查。前进目标 0.09 m，最终 x=0.091789 m、yaw=-0.017°；最后 3 s 均为 mode 15，x 变化范围 0.188 mm；无力矩截断/策略拒收。该运行验证未带机身调姿指令的既有低速动作，未替代运动中调姿与带姿态的停止验收。
+
+| 计时 | 站立调姿 | trot/前进/停步 |
+| --- | --- | --- |
+| control p99 / max | 0.5811 / 0.8289 ms | 1.1472 / 2.5928 ms |
+| loop p99 / max | 0.6543 / 0.8819 ms | 1.1969 / 2.6628 ms |
+| 2 s 后 control / loop >2 ms | 0 / 0（9000 步） | 2 / 3（9000 步） |
+
+结果前缀：站立调姿 `artifacts/cpp_online_body_pose_tracking_20261022`（`_checks.json` 的 passed=true），动作回归 `artifacts/cpp_body_pose_weights_forward_20261022`。首轮结果继续保留。重跑固定调姿场景时使用新前缀：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+/usr/bin/python3 tools/run_cpp_body_pose_scenario.py \
+  --domain 218 --prefix artifacts/cpp_body_pose_repeat
+```
+
+工具拒绝覆盖已有结果。此节点可提交/push 保存，继续在同一分支补键盘、带姿态的停止和运动中小幅调姿，再完成本阶段 PR。
+
+### 机身姿态键盘与停稳退出（2026-10-22）
+
+继续在 `feature/online-body-pose`；上一节点提交为 `971d06d`。键盘新增 Pose 发布，接入既有 `/go2_control/body_pose`，MPC 目标仍由 `online_command` 统一发布。默认高度从项目 `reference.info` 的 `comHeight` 读取，可用 `--reference-file` 指定一致的配置。每次按键更新并发送最终目标，C++ 节点沿既有变化率生成参考；键盘不直接计算关节角或力矩。
+
+| 按键 | 动作 |
+| --- | --- |
+| R / F | 机身目标高度增加 / 减少 5 mm |
+| I / K | pitch 增加 / 减少 1° |
+| J / L | roll 增加 / 减少 1° |
+| U | 默认高度、pitch/roll=0° |
+| T / G | trot / 零速并请求四足站立；保留机身目标 |
+| 空格 / X | 平面速度清零，保留步态与机身目标 |
+| P | 锁定停止、零速、默认机身姿态和站立，停稳后结束仿真 |
+| Esc / Ctrl+C | 请求零速、姿态复位和站立，退出键盘，仿真继续 |
+
+原 WASD、Q/E、方向键和 H 帮助继续使用。目标高度限制为默认值 ±2 cm，pitch/roll 各 ±5°；四元数按 `Rz(0)*Ry(pitch)*Rx(roll)` 生成。观测中断时清空速度和本地姿态缓存，恢复后须按 U 请求默认姿态、按 T 再开始运动，避免自动恢复旧速度。
+
+`control_simulation.cpp` 的在线停止检查增加两个条件：当前激活策略中的高度/倾角目标必须回到默认值；估计高度距默认值小于 8 mm、估计 pitch/roll 各小于 1°。随后与既有四脚支撑、零目标速度、关节/机身速度门限一起连续满足 0.3 s，才结束。停止超时仍为 5 s；脚本预设模式的停止行为沿用原路径。该修改避免只因机器人在倾斜姿态下静止，就完成 P 退出。
+
+Release 构建通过。`tools/run_cpp_body_pose_scenario.py --keyboard` 通过 PTY 运行实际键盘程序，使用真实终端输入/解析路径，初始设置最长 25 s、由 P 主动结束。实际动作时序：3 s `rr`，5 s `fff`，7 s `u`，8 s `ii`，10 s `ull`，12 s `t`，14 s `urijw`，18 s `p`。14 s 的组合为高度 0.275 m、pitch/roll 各 +1°、前进速度 0.03 m/s；18.4 s 再由其他发布者发送一次非零速度和非默认姿态，检查停止锁定。
+
+| 结果 | 数值 |
+| --- | --- |
+| 实际时长 / 控制步 | 19.448 s / 9724 |
+| 停止请求 / 完成 | 18.002 s / 19.448 s，reason=controlled_stop |
+| 模式样本 | 6: 1226；9: 1350；15: 7148 |
+| 在线目标核对 | 393 条，变化率/时域末端/竖直参考一致性通过 |
+| 行进调姿 15.5–17.5 s 均值 | z=0.275607 m；pitch=+0.975°；roll=+0.939° |
+| 力矩截断 / 策略拒收 | 0 / 0 |
+| 最大执行力矩 | 18.177 Nm |
+| control p99 / max | 1.1479 / 2.7744 ms |
+| loop p99 / max | 1.1964 / 2.8289 ms |
+| 2 s 后 control / loop >2 ms | 7 / 9（8724 步） |
+
+五个动作评估区间全部满足既有初步均值误差门限（高度 5 mm、角度 1°）。最后 150 个样本持续四足站立且估计高度/实际倾角位于停止范围；停止锁定后的额外目标未改变默认姿态目标或恢复有效平面速度。键盘程序正常返回 0，控制会话保存为 controlled_stop。本轮未另做非法 Pose 请求，检查 JSON 的 `invalid_command_checks_passed=null` 表示未执行该子项；非法请求结果沿用上一固定站立场景。
+
+结果前缀 `artifacts/cpp_keyboard_body_pose_20261022`，包括 `_keyboard.log`、`_checks.json`、`.session.json`、控制/命令 CSV 和启动/MPC 日志，整体 passed=true。另用合成观测和实际 PTY 按键核对上下界及 Esc：73 条机身命令均位于 0.25–0.29 m、±5°，四元数归一化；Esc 返回 0，并发送零速、四足站立和默认姿态。结果 `artifacts/keyboard_exit_20261022.json`；此项只检查消息和退出路径，不是 ±5° 真实仿真动作验收。
+
+重跑无窗口键盘综合场景（使用新前缀）：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+/usr/bin/python3 tools/run_cpp_body_pose_scenario.py --keyboard \
+  --domain 218 --prefix artifacts/cpp_keyboard_body_pose_repeat
+```
+
+官方窗口人工观察待用户完成。终端 1：
+
+```bash
+ROS_DOMAIN_ID=216 bash scripts/run_cpp_simulation.sh \
+  --mpc-solver sqp --online --sensor-startup \
+  --joint-kp 0 --joint-kd 1 --centroidal-base-accel \
+  --wbc-config config/wbc/upstream_a1_tasks_go2.json \
+  --csv artifacts/cpp_keyboard_body_pose_viewer.csv
+```
+
+终端 2（项目目录）：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+export ROS_DOMAIN_ID=216
+/usr/bin/python3 tools/keyboard_teleop.py
+```
+
+等待传感器启动接管完成。依次用 R/F、I/K、J/L 观察站立动作，U 复位；T 切入 trot 后可用 W 前进、R/I/J 各一次观察小幅调姿，最后 P。无需额外开 gait 终端。窗口不限时，P 需等待停稳才关闭，Esc 只结束键盘。人工动作确认、残余跟踪偏差、全幅度/噪声/扰动工况继续分别记录，未连接机器人。
+
+#### 本轮官方窗口反馈与记录
+
+用户完成上述窗口会话后明确确认“调姿正常，手动关闭窗口”。`cpp_keyboard_body_pose_viewer.session.json` 记录 stopped / viewer_closed、222.312 s / 111,156 步，controlled_stop=false；命令 CSV 无 stop_latched 样本，本组未验收人工按 P。P 的带姿态停稳结果采用上方 PTY 自动仿真。
+
+原启动器 `.json` 汇总未生成，相关进程已退出，原终端退出码未保存。本次通过流式读取既有 CSV 补做独立核对，结果保存为 `artifacts/cpp_keyboard_body_pose_viewer.viewer_check.json`；该文件与原启动器汇总分别命名，不据此断言启动器原退出状态或缺失原因。
+
+| 核对项 | 窗口记录 |
+| --- | --- |
+| CSV / 样本连续性 | 339 列；111,156 行；相邻采样间隔 2 ms 连续 |
+| 模式样本 | 15: 37,246；9: 37,050；6: 36,860 |
+| 高度目标 / 倾角目标范围 | z 始终 0.27 m；pitch -5° 至 +2°，roll -5° 至 +5° |
+| 力矩截断 / 最大执行力矩 | 0 步 / 18.884 Nm |
+| 最大动力学 / 接触加速度残差 | 1.224e-5 / 1.983e-6 |
+| control p99 / max（2 s 后） | 1.2069 / 2.7157 ms |
+| loop p99 / max（2 s 后） | 1.6350 / 4.7621 ms |
+| control / loop >2 ms | 22 / 287（110,156 步） |
+
+最后 3 s 仍包含 trot，倾角峰值约 5.115°；该会话以用户手动关窗结束，不作为恢复默认姿态或最终四脚站稳验收。窗口记录只包含角度目标变化，升降功能沿用之前自动场景的记录；窗口反馈不替代精度量化。策略拒收数量没有保存原终端计数，未从连续 CSV 推断为零。本功能节点可提交/push 并通过 PR 收尾，后续新功能分支在合并后创建。

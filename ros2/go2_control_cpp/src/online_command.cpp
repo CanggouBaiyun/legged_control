@@ -1,6 +1,8 @@
 #include <ocs2_core/misc/LoadData.h>
 #include <ocs2_ros_interfaces/command/TargetTrajectoriesRosPublisher.h>
 #include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <Eigen/Geometry>
 #include <std_msgs/msg/empty.hpp>
 #include <rclcpp/rclcpp.hpp>
 
@@ -45,7 +47,9 @@ class OnlineCommand {
         !std::isfinite(horizon_) || horizon_<=0 ||
         default_joints_.size()!=12 || !default_joints_.allFinite())
       throw std::runtime_error("Invalid online target configuration");
-
+        //顺序： 高度、pitch、roll；单位：m、rad、rad
+        body_target_ << height_, 0.0, 0.0;
+        body_reference_ = body_target_;
     if(!command_log.empty()) {
       const std::filesystem::path path(command_log);
       if(path.has_parent_path())
@@ -62,7 +66,10 @@ class OnlineCommand {
             "target_vx_world_mps,target_vy_world_mps,"
             "target_x_m,target_y_m,target_yaw_rad,"
             "target_end_time_s,target_end_x_m,target_end_y_m,target_end_yaw_rad,"
-            "integrated_reference,reference_lead_x_m,reference_lead_y_m,reference_lead_yaw_rad,stop_latched\n";
+            "integrated_reference,reference_lead_x_m,reference_lead_y_m,reference_lead_yaw_rad,stop_latched,"
+            "body_target_z_m,body_target_pitch_rad,body_target_roll_rad,"
+            "body_reference_z_m,body_reference_pitch_rad,body_reference_roll_rad,"
+            "body_end_z_m,body_end_pitch_rad,body_end_roll_rad,target_vz_world_mps\n";
     }
 
     observation_sub_=node_->create_subscription<
@@ -77,12 +84,15 @@ class OnlineCommand {
         [this](geometry_msgs::msg::Twist::ConstSharedPtr msg) {
           receiveCommand(*msg);
         });
-
+    body_pose_sub_ = node_->create_subscription<geometry_msgs::msg::Pose>("/go2_control/body_pose", 1, [this](geometry_msgs::msg::Pose::ConstSharedPtr msg){
+      receiveBodyPose(*msg);
+    });
     stop_sub_=node_->create_subscription<std_msgs::msg::Empty>("/go2_control/stop",1,
         [this](std_msgs::msg::Empty::ConstSharedPtr) {
           if(stop_latched_) return;
           stop_latched_=true;
           command_.setZero(); command_valid_=false; was_moving_=false;
+          body_target_ << height_, 0.0, 0.0;
           previous_world_velocity_.setZero(); previous_yaw_rate_=0;
           if(ready_) hold_pose_=observation_.state.segment<6>(6);
           RCLCPP_INFO(node_->get_logger(),"Session stop latched; holding zero-velocity targets, ignoring new motion commands");
@@ -95,6 +105,8 @@ class OnlineCommand {
         "Waiting for observations; /cmd_vel -> MPC targets at 20 Hz");
     RCLCPP_INFO(node_->get_logger(),"Position reference: %s",
         integrate_reference_ ? "integrated (bounded lead)" : "measured pose at each target");
+    RCLCPP_INFO(node_->get_logger(),
+        "/go2_control/body_pose: absolute position.z in m, roll/pitch quaternion, x/y/yaw=0; height offset <= 0.02 m, tilt <= 5 deg");
   }
 
  private:
@@ -121,6 +133,9 @@ class OnlineCommand {
       reference_time_=next.time;
       previous_world_velocity_.setZero();
       previous_yaw_rate_=0;
+      body_target_ << height_, 0.0, 0.0;
+      body_reference_ = body_target_;
+      body_reference_time_ = next.time;
     }
 
     observation_=next;
@@ -159,6 +174,56 @@ class OnlineCommand {
         std::clamp(msg.linear.x,-0.10,0.10),
         std::clamp(msg.linear.y,-0.05,0.05),
         std::clamp(msg.angular.z,-0.20,0.20);
+  }
+
+  void receiveBodyPose(const geometry_msgs::msg::Pose& msg){
+    if(!ready_ || stop_latched_ ||
+        std::chrono::duration<double>(Clock::now()-observation_received_).count()>0.2)
+      return;
+
+    Eigen::Quaterniond orientation(
+      msg.orientation.w, msg.orientation.x,
+      msg.orientation.y, msg.orientation.z);
+
+    const double norm = orientation.norm();
+
+    if (!std::isfinite(msg.position.x) ||
+        !std::isfinite(msg.position.y) ||
+        !std::isfinite(msg.position.z) ||
+        !orientation.coeffs().allFinite() ||
+        !std::isfinite(norm) || norm < 1e-9 ||
+        std::abs(msg.position.x) > 1e-9 ||
+        std::abs(msg.position.y) > 1e-9) {
+      RCLCPP_WARN(node_->get_logger(), "Invalid body pose; keeping previous target");
+      return;
+    }
+
+    orientation.normalize();
+    const Eigen::Matrix3d rotation = orientation.toRotationMatrix();
+
+    const double roll = std::atan2(rotation(2, 1), rotation(2, 2));
+    const double pitch =
+        std::asin(std::clamp(-rotation(2, 0), -1.0, 1.0));
+    const double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+
+    constexpr double angle_limit = 5.0 * 3.141592653589793 / 180.0;
+
+    if (std::abs(msg.position.z - height_) > 0.02 + 1e-9 ||
+        std::abs(roll) > angle_limit + 1e-9 ||
+        std::abs(pitch) > angle_limit + 1e-9 ||
+        std::abs(yaw) > 1e-6) {
+      RCLCPP_WARN(node_->get_logger(),
+          "Body pose rejected: height offset <= 0.02 m, roll/pitch <= 5 deg, yaw = 0");
+      return;
+    }
+
+    body_target_ << msg.position.z, pitch, roll;
+
+    RCLCPP_INFO(node_->get_logger(),
+        "Body target: z=%.3f m, pitch=%.2f deg, roll=%.2f deg",
+        body_target_[0],
+        pitch * 180.0 / 3.141592653589793,
+        roll * 180.0 / 3.141592653589793);
   }
 
   void publish() {
@@ -206,9 +271,29 @@ class OnlineCommand {
     was_moving_=moving;
     reference_time_=observation_.time;
 
-    pose[2]=height_;
-    pose[4]=0;
-    pose[5]=0;
+    const double body_dt = std::clamp(
+        observation_.time - body_reference_time_, 0.0, 0.2);
+    body_reference_time_ = observation_.time;
+
+    // 高度、pitch、roll 的变化率，单位分别为 m/s、rad/s、rad/s。
+    const Eigen::Vector3d body_rates(0.02, 0.10, 0.10);
+    for (int i = 0; i < 3; ++i) {
+      const double maximum_step = body_rates[i] * body_dt;
+      body_reference_[i] += std::clamp(
+          body_target_[i] - body_reference_[i], -maximum_step, maximum_step);
+    }
+
+    // 用同一目标预览 MPC 时域末端，避免当前参考变化、未来参考仍固定。
+    Eigen::Vector3d future_body = body_reference_;
+    for (int i = 0; i < 3; ++i) {
+      const double maximum_step = body_rates[i] * horizon_;
+      future_body[i] += std::clamp(
+          body_target_[i] - future_body[i], -maximum_step, maximum_step);
+    }
+
+    pose[2] = body_reference_[0];
+    pose[4] = body_reference_[1];
+    pose[5] = body_reference_[2];
 
     // Planar body-heading velocity -> world-frame velocity.
     const double c=std::cos(observed_pose[3]);
@@ -230,6 +315,14 @@ class OnlineCommand {
     future[6]+=world_velocity[0]*horizon_;
     future[7]+=world_velocity[1]*horizon_;
     future[9]+=command[2]*horizon_;
+    future[8] = future_body[0];
+    future[10] = future_body[1];
+    future[11] = future_body[2];
+
+    // 状态前三项是归一化线动量；竖直参考与本段高度轨迹一致。
+    const double vertical_velocity = (future[8] - current[8]) / horizon_;
+    current[2] = vertical_velocity;
+    future[2] = vertical_velocity;
 
     const ocs2::vector_t zero_input=ocs2::vector_t::Zero(24);
     const ocs2::TargetTrajectories target(
@@ -254,7 +347,10 @@ class OnlineCommand {
           <<','<<future[6]<<','<<future[7]<<','<<future[9]
           <<','<<int(integrate_reference_)
           <<','<<pose[0]-observed_pose[0]<<','<<pose[1]-observed_pose[1]
-          <<','<<pose[3]-observed_pose[3]<<','<<int(stop_latched_)<<std::endl;
+          <<','<<pose[3]-observed_pose[3]<<','<<int(stop_latched_);
+      for (const auto& values : {body_target_, body_reference_, future_body})
+        for (int i = 0; i < 3; ++i) command_log_ << ',' << values[i];
+      command_log_ << ',' << vertical_velocity << std::endl;
       if(!command_log_)
         throw std::runtime_error("Failed writing online command log");
     }
@@ -268,6 +364,7 @@ class OnlineCommand {
   rclcpp::Subscription<
       geometry_msgs::msg::Twist>::SharedPtr command_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr stop_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr body_pose_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   ocs2::SystemObservation observation_;
@@ -284,6 +381,9 @@ class OnlineCommand {
   std::uint64_t command_sequence_=0,target_sequence_=0;
   double height_=0,horizon_=0;
   double reference_time_=0,previous_yaw_rate_=0;
+  Eigen::Vector3d body_target_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d body_reference_ = Eigen::Vector3d::Zero();
+  double body_reference_time_ = 0.0;
   bool integrate_reference_=true;
   bool ready_=false,was_moving_=false,command_valid_=false;
   bool stop_latched_=false;
