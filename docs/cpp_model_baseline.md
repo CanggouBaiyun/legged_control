@@ -1702,3 +1702,90 @@ source /home/bot/Project/ocs2_ws/install/local_setup.bash
 ```
 
 工具拒绝覆盖已有结果。此节点可提交/push 保存，继续在同一分支补键盘、带姿态的停止和运动中小幅调姿，再完成本阶段 PR。
+
+### 机身姿态键盘与停稳退出（2026-10-22）
+
+继续在 `feature/online-body-pose`；上一节点提交为 `971d06d`。键盘新增 Pose 发布，接入既有 `/go2_control/body_pose`，MPC 目标仍由 `online_command` 统一发布。默认高度从项目 `reference.info` 的 `comHeight` 读取，可用 `--reference-file` 指定一致的配置。每次按键更新并发送最终目标，C++ 节点沿既有变化率生成参考；键盘不直接计算关节角或力矩。
+
+| 按键 | 动作 |
+| --- | --- |
+| R / F | 机身目标高度增加 / 减少 5 mm |
+| I / K | pitch 增加 / 减少 1° |
+| J / L | roll 增加 / 减少 1° |
+| U | 默认高度、pitch/roll=0° |
+| T / G | trot / 零速并请求四足站立；保留机身目标 |
+| 空格 / X | 平面速度清零，保留步态与机身目标 |
+| P | 锁定停止、零速、默认机身姿态和站立，停稳后结束仿真 |
+| Esc / Ctrl+C | 请求零速、姿态复位和站立，退出键盘，仿真继续 |
+
+原 WASD、Q/E、方向键和 H 帮助继续使用。目标高度限制为默认值 ±2 cm，pitch/roll 各 ±5°；四元数按 `Rz(0)*Ry(pitch)*Rx(roll)` 生成。观测中断时清空速度和本地姿态缓存，恢复后须按 U 请求默认姿态、按 T 再开始运动，避免自动恢复旧速度。
+
+`control_simulation.cpp` 的在线停止检查增加两个条件：当前激活策略中的高度/倾角目标必须回到默认值；估计高度距默认值小于 8 mm、估计 pitch/roll 各小于 1°。随后与既有四脚支撑、零目标速度、关节/机身速度门限一起连续满足 0.3 s，才结束。停止超时仍为 5 s；脚本预设模式的停止行为沿用原路径。该修改避免只因机器人在倾斜姿态下静止，就完成 P 退出。
+
+Release 构建通过。`tools/run_cpp_body_pose_scenario.py --keyboard` 通过 PTY 运行实际键盘程序，使用真实终端输入/解析路径，初始设置最长 25 s、由 P 主动结束。实际动作时序：3 s `rr`，5 s `fff`，7 s `u`，8 s `ii`，10 s `ull`，12 s `t`，14 s `urijw`，18 s `p`。14 s 的组合为高度 0.275 m、pitch/roll 各 +1°、前进速度 0.03 m/s；18.4 s 再由其他发布者发送一次非零速度和非默认姿态，检查停止锁定。
+
+| 结果 | 数值 |
+| --- | --- |
+| 实际时长 / 控制步 | 19.448 s / 9724 |
+| 停止请求 / 完成 | 18.002 s / 19.448 s，reason=controlled_stop |
+| 模式样本 | 6: 1226；9: 1350；15: 7148 |
+| 在线目标核对 | 393 条，变化率/时域末端/竖直参考一致性通过 |
+| 行进调姿 15.5–17.5 s 均值 | z=0.275607 m；pitch=+0.975°；roll=+0.939° |
+| 力矩截断 / 策略拒收 | 0 / 0 |
+| 最大执行力矩 | 18.177 Nm |
+| control p99 / max | 1.1479 / 2.7744 ms |
+| loop p99 / max | 1.1964 / 2.8289 ms |
+| 2 s 后 control / loop >2 ms | 7 / 9（8724 步） |
+
+五个动作评估区间全部满足既有初步均值误差门限（高度 5 mm、角度 1°）。最后 150 个样本持续四足站立且估计高度/实际倾角位于停止范围；停止锁定后的额外目标未改变默认姿态目标或恢复有效平面速度。键盘程序正常返回 0，控制会话保存为 controlled_stop。本轮未另做非法 Pose 请求，检查 JSON 的 `invalid_command_checks_passed=null` 表示未执行该子项；非法请求结果沿用上一固定站立场景。
+
+结果前缀 `artifacts/cpp_keyboard_body_pose_20261022`，包括 `_keyboard.log`、`_checks.json`、`.session.json`、控制/命令 CSV 和启动/MPC 日志，整体 passed=true。另用合成观测和实际 PTY 按键核对上下界及 Esc：73 条机身命令均位于 0.25–0.29 m、±5°，四元数归一化；Esc 返回 0，并发送零速、四足站立和默认姿态。结果 `artifacts/keyboard_exit_20261022.json`；此项只检查消息和退出路径，不是 ±5° 真实仿真动作验收。
+
+重跑无窗口键盘综合场景（使用新前缀）：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+/usr/bin/python3 tools/run_cpp_body_pose_scenario.py --keyboard \
+  --domain 218 --prefix artifacts/cpp_keyboard_body_pose_repeat
+```
+
+官方窗口人工观察待用户完成。终端 1：
+
+```bash
+ROS_DOMAIN_ID=216 bash scripts/run_cpp_simulation.sh \
+  --mpc-solver sqp --online --sensor-startup \
+  --joint-kp 0 --joint-kd 1 --centroidal-base-accel \
+  --wbc-config config/wbc/upstream_a1_tasks_go2.json \
+  --csv artifacts/cpp_keyboard_body_pose_viewer.csv
+```
+
+终端 2（项目目录）：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+export ROS_DOMAIN_ID=216
+/usr/bin/python3 tools/keyboard_teleop.py
+```
+
+等待传感器启动接管完成。依次用 R/F、I/K、J/L 观察站立动作，U 复位；T 切入 trot 后可用 W 前进、R/I/J 各一次观察小幅调姿，最后 P。无需额外开 gait 终端。窗口不限时，P 需等待停稳才关闭，Esc 只结束键盘。人工动作确认、残余跟踪偏差、全幅度/噪声/扰动工况继续分别记录，未连接机器人。
+
+#### 本轮官方窗口反馈与记录
+
+用户完成上述窗口会话后明确确认“调姿正常，手动关闭窗口”。`cpp_keyboard_body_pose_viewer.session.json` 记录 stopped / viewer_closed、222.312 s / 111,156 步，controlled_stop=false；命令 CSV 无 stop_latched 样本，本组未验收人工按 P。P 的带姿态停稳结果采用上方 PTY 自动仿真。
+
+原启动器 `.json` 汇总未生成，相关进程已退出，原终端退出码未保存。本次通过流式读取既有 CSV 补做独立核对，结果保存为 `artifacts/cpp_keyboard_body_pose_viewer.viewer_check.json`；该文件与原启动器汇总分别命名，不据此断言启动器原退出状态或缺失原因。
+
+| 核对项 | 窗口记录 |
+| --- | --- |
+| CSV / 样本连续性 | 339 列；111,156 行；相邻采样间隔 2 ms 连续 |
+| 模式样本 | 15: 37,246；9: 37,050；6: 36,860 |
+| 高度目标 / 倾角目标范围 | z 始终 0.27 m；pitch -5° 至 +2°，roll -5° 至 +5° |
+| 力矩截断 / 最大执行力矩 | 0 步 / 18.884 Nm |
+| 最大动力学 / 接触加速度残差 | 1.224e-5 / 1.983e-6 |
+| control p99 / max（2 s 后） | 1.2069 / 2.7157 ms |
+| loop p99 / max（2 s 后） | 1.6350 / 4.7621 ms |
+| control / loop >2 ms | 22 / 287（110,156 步） |
+
+最后 3 s 仍包含 trot，倾角峰值约 5.115°；该会话以用户手动关窗结束，不作为恢复默认姿态或最终四脚站稳验收。窗口记录只包含角度目标变化，升降功能沿用之前自动场景的记录；窗口反馈不替代精度量化。策略拒收数量没有保存原终端计数，未从连续 CSV 推断为零。本功能节点可提交/push 并通过 PR 收尾，后续新功能分支在合并后创建。

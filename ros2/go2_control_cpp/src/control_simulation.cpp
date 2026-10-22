@@ -604,6 +604,15 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
              <<" m; base position/velocity truth is diagnostic only."<<std::endl;
   }
   go2::LocalMrt mrt;
+  double online_stop_height=0.0;
+  if(opts.online) {
+    Tree reference_settings;
+    boost::property_tree::read_info(
+        (opts.root/"config/ocs2/go2/reference.info").string(),reference_settings);
+    online_stop_height=reference_settings.get<double>("comHeight");
+    if(!std::isfinite(online_stop_height) || online_stop_height<=0)
+      throw std::runtime_error("Invalid online stopping height");
+  }
   auto startup_target=target.trajectory;
   if(opts.online) {
     const ocs2::vector_t initial_state=target.trajectory.stateTrajectory.front();
@@ -854,6 +863,7 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
         stop_goal=target.trajectory.stateTrajectory.front();
         stop_goal.head<6>().setZero();
         stop_goal[6]=current_state[6];stop_goal[7]=current_state[7];stop_goal[9]=current_state[9];
+        if(opts.online) {stop_goal[8]=online_stop_height;stop_goal[10]=0;stop_goal[11]=0;}
         mrt.requestStop();mrt.gait(false);
         std::cout<<"Controlled stop requested at t="<<stamp<<" s"<<std::endl;
       }
@@ -1146,8 +1156,18 @@ void run(const Options& opts,const go2::RobotModel& robot,const Target& target,g
                                        [](bool contact){return contact;});
       const bool zero_target=goal.head<6>().norm()<1e-9 &&
           active_target_trajectory.stateTrajectory.front().isApprox(active_target_trajectory.stateTrajectory.back(),1e-9);
+      // Online P also restores the body pose. Wait for that target to reach
+      // the active policy and for the estimated body to settle near neutral.
+      bool body_settled=true;
+      if(opts.online && session.stopping()) {
+        const auto control_rpy=pinocchio::rpy::matrixToRpy(control_rotation);
+        body_settled=std::abs(goal[8]-stop_goal[8])<1e-5 &&
+            goal.segment<2>(10).cwiseAbs().maxCoeff()<1e-5 &&
+            std::abs(control_q[2]-stop_goal[8])<0.008 &&
+            control_rpy.head<2>().cwiseAbs().maxCoeff()<std::acos(-1.0)/180.0;
+      }
       if(session.observeStop(stamp,mode==15 && future_mode==15 && !preparing &&
-          startup_pd_weight==0.0 && all_contact && zero_target &&
+          startup_pd_weight==0.0 && all_contact && zero_target && body_settled &&
           control_base_velocity_world.norm()<0.02 && sensors.angular_velocity_imu.norm()<0.1 &&
           sensors.joint_velocity.cwiseAbs().maxCoeff()<0.1)) break;
     }
