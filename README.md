@@ -10,6 +10,8 @@ Model-based locomotion control for the Unitree Go2, using Pinocchio, MuJoCo and 
 
 ## Status
 
+**Online body targets (2026-10-22):** `/go2_control/body_pose` (`geometry_msgs/msg/Pose`) supplies bounded height and roll/pitch targets with rate limits and logging. Rebalancing MPC pose and nominal-joint costs let the same 20 s standing scenario pass initial mean-error gates of 5 mm and 1 degree; mean height for a 26 cm target improved from 27.58 to 26.33 cm. A separate 20 s trot/forward/stop run completed without clipping or rejected policies. Residual errors, keyboard integration, stopping while tilted and posture changes during locomotion remain pending. See [cost correction and results](docs/cpp_model_baseline.md#机身目标跟踪代价修正2026-10-22).
+
 | Component | Status |
 | --- | --- |
 | Floating-base model, joint indexing and limits | Implemented |
