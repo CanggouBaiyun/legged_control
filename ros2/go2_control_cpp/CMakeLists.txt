@@ -72,6 +72,7 @@ if(GO2_MUJOCO_ROOT)
   add_library(go2_reference STATIC src/reference.cpp)
   target_link_libraries(go2_reference PUBLIC go2_wbc)
   add_executable(online_command src/online_command.cpp)
+  target_include_directories(online_command PRIVATE include)
   target_compile_features(online_command PRIVATE cxx_std_17)
   ament_target_dependencies(
     online_command

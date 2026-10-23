@@ -22,7 +22,8 @@ if [[ "${1:-}" == --help ]]; then
     '  [--online-reference measured|integrated] (default: integrated; requires --online)' \
     '  [--trot-at 3] [--stop-trot-at 15] [--forward] [--turn-angle-deg -10] [--csv PATH]' \
     'Online velocities are body-heading vx/vy and yaw rate; publish repeatedly (timeout: 0.5 s).' \
-    'Zero velocity holds position; it does not switch the gait to stance.' \
+    'Velocity mode: zero holds position without switching gait. Active goals require explicit cancellation.' \
+    'Online goal: /go2_control/goal (PoseStamped, odom/base_link); tools/send_goal.py; Space/G cancels.' \
     'Online body pose: /go2_control/body_pose (Pose z/roll/pitch); keyboard R/F, I/K, J/L, U.' \
     'Closes its own processes on exit; stops control if an owned worker exits.'
   exit 0
@@ -172,7 +173,7 @@ if [[ "${GO2_ONLINE}" == 1 ]]; then
     -p integrateReference:="${GO2_INTEGRATE_REFERENCE}" \
     >"${GO2_COMMAND_LOG}" 2>&1 200>&- &
   GO2_COMMAND_PID=$!
-  printf 'Online commands: /cmd_vel, /go2_control/body_pose; command CSV: %s; node log: %s\n' \
+  printf 'Online commands: /cmd_vel, /go2_control/body_pose, /go2_control/goal; command CSV: %s; node log: %s\n' \
     "${GO2_COMMAND_CSV}" "${GO2_COMMAND_LOG}"
   printf 'Online position reference: %s\n' "${GO2_ONLINE_REFERENCE}"
 fi
