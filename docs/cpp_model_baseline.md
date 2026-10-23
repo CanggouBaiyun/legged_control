@@ -1789,3 +1789,103 @@ export ROS_DOMAIN_ID=216
 | control / loop >2 ms | 22 / 287（110,156 步） |
 
 最后 3 s 仍包含 trot，倾角峰值约 5.115°；该会话以用户手动关窗结束，不作为恢复默认姿态或最终四脚站稳验收。窗口记录只包含角度目标变化，升降功能沿用之前自动场景的记录；窗口反馈不替代精度量化。策略拒收数量没有保存原终端计数，未从连续 CSV 推断为零。本功能节点可提交/push 并通过 PR 收尾，后续新功能分支在合并后创建。
+
+### 在线位置与朝向目标（2026-10-23）
+
+机身姿态 PR #24 已合并，先同步 `main=dcbeff7`，再建立 `feature/online-goal-pose`。本阶段继续由 `online_command` 唯一发布 `/legged_robot_mpc_target`，新增上层位置目标；控制仍使用传感器启动、估计状态、SQP、本地 MRT 和 C++ WBC。
+
+#### 接口与命令优先级
+
+- `/go2_control/goal`：`geometry_msgs/msg/PoseStamped`，x/y 单位 m、朝向使用只含 yaw 的四元数；z 必须为零，高度/roll/pitch 沿用独立 `body_pose` 接口。`header.stamp` 暂不参与变换，参考起点使用节点收到请求时的新鲜估计观测。
+- `frame_id=odom` 表示估计器局部世界系中的绝对 x/y/yaw；`base_link` 表示接收请求时机身水平朝向系的相对 dx/dy/dyaw，转换一次后固定，不随身体转动重新解释。尚无地图/TF 转换，其他 frame 拒绝。这里 `odom` 只命名当前估计器的局部世界坐标，不表示已经接入外部定位。
+- 一次平面位移最多 2 m。四元数归一化并要求有限、范数非零、无 roll/pitch；非法请求保留上一有效目标。yaw 使用 `remainder(delta, 2*pi)` 取最短角差，内部连续展开。
+- 目标一次发送后保持，不沿用速度命令的 0.5 s 超时。必须另行请求 trot；站立收到目标时先等待，实际进入 mode 9/6 后重取轨迹起点。启动后超过 0.5 s 没有行走模式则取消；观测超过 0.2 s 未更新、时间回退、跟踪超时也清除目标。超时为接收请求起的“规划持续时间 +15 s”。这些故障/取消后不会自行恢复旧目标。
+- `/go2_control/cancel_goal`：`std_msgs/msg/Empty`，取消并捕获当前估计位置。非零有效 `/cmd_vel` 立即接管；零速度心跳可以与位置目标共存。需要明确取消时使用此 topic 或键盘空格/X/G/Esc。发送位置目标前先按空格清除键盘已锁存的运动速度，否则其后续非零心跳会接管。
+- P/`/go2_control/stop` 优先级最高：清除目标，沿已验证的零速/姿态复位/站立/停稳退出流程执行，锁定后不接受新目标或速度。到达目标不会自动切站立；机器人零平面速度保持位置和朝向，保留 trot，G 才切站立。
+- `/go2_control/goal_status`：`std_msgs/msg/String`，形如 `1:waiting_for_trot`、`1:tracking`、`1:reached`、`1:cancelled`、`1:velocity_takeover`、`1:session_stop`。编号在每次有效目标时递增。新会话时间回退时状态重置为 idle，编号继续递增；此状态是命令节点的判断，不代表外部定位或实机到达验收。
+
+#### 从最终目标生成 MPC 参考
+
+`goal_reference.hpp` 用五次时间缩放 `s(u)=10u^3-15u^4+6u^5`，将起点与终点插值；位置参考为 `p_start + s*(p_goal-p_start)`，速度为其解析导数。每条轨迹起止速度与加速度为零；通过持续时间限制水平速度范数 ≤0.05 m/s、yaw 变化率 ≤0.20 rad/s、水平加速度范数 ≤0.10 m/s²、yaw 加速度 ≤0.50 rad/s²。限制针对单条参考轨迹，不是机器人实际速度/加速度的保证；替换目标或手动接管重新锚定，未验证任意运动中的连续速度重规划。
+
+每个 MPC 时域用 11 个采样点，x/y/yaw 与速度来自同一轨迹；高度/倾角继续按既有变化率预览。归一化线动量参考仍按上游速度约定填写世界线速度；角动量沿既有零参考约定，尚未新增 yaw 速度到角动量映射。没有直接修改关节指令或绕过 MPC/WBC。
+
+轨迹时间完成后，还需估计平面误差 ≤1 cm、yaw 误差 ≤1°、平滑后的水平速度 ≤0.02 m/s、yaw 变化率 ≤0.10 rad/s，连续满足 0.3 s 才宣布 reached。速度采用时间常数 0.30 s 的一阶低通，yaw 速度由连续观测的最短角差计算。到达保持使用最终位置目标。第一轮仿真发现瞬时三维速度门限会被原地 trot 的周期运动打断，已据此修正，未放宽位置/角度门限；原始结果 `cpp_online_goal_20261023` 保留。
+
+最终目标、当前参考、激活策略仍分别记录：`.commands.csv` 的 `goal_x/y/yaw` 是最终命令目标，`target_x/y/yaw` 是本次发布的当前轨迹点；控制 CSV 原有 `goal_*` 字段继续表示激活 MPC 策略中的目标，不能直接当成本次命令的终点。命令日志新增目标编号、active/reached、已运行/规划时间、位置/yaw 误差及平滑速度。汇总器允许位置目标独立于手动速度超时工作，同时保留手动模式的超时清零/参考超前限制检查，并检查目标速度上界。
+
+#### 自动仿真结果
+
+结果前缀 `artifacts/cpp_online_goal_settled_20261023`。实际键盘程序由 PTY 驱动，完整场景包括：传感器准备/接管、T、相对前进 0.12 m/左移 0.04 m/yaw +10°、非法 frame/零四元数、绝对目标、空格取消、非零 W 接管、G 取消并站立、再次 T、目标行走中调高度/俯仰、P、停止后追加目标。
+
+| 指标 | 结果 |
+| --- | --- |
+| 首个目标接收 / reached | 约 5.02 / 10.16 s；约 5.14 s 确认到达，轨迹持续时间约 4.743 s |
+| 到达时估计位置 / yaw 误差 | 6.266 mm / 0.885° |
+| 到达后至 11.8 s 真值平面误差最大值 | 6.694 mm；真值仅用于检查，不反馈目标生成 |
+| 有效目标 / 非法与停止后追加目标 | 5 个 / 均未增加有效编号 |
+| 空格、G 取消 / 非零速度接管 / P | 均通过；零心跳不取消有效目标 |
+| P 请求 / 停稳结束 | 21.022 / 22.478 s，22.480 s / 11,240 步，reason=controlled_stop |
+| 最大执行力矩 / 力矩截断 | 18.309 Nm / 0 |
+| 最大动力学 / 接触加速度残差 | 1.228e-5 / 1.901e-6 |
+| 控制耗时 mean / p99 / max | 0.506 / 1.305 / 3.212 ms |
+| 循环耗时 mean / p99 / max | 0.547 / 1.359 / 3.264 ms |
+| 排除前 2 s 后控制 / 循环 >2 ms | 10 / 11 步，共 10,240 步 |
+
+场景检查 `_checks.json` 的 passed=true。C++ 数值检查覆盖端点、解析速度和差分一致性、速度/加速度上界、±π 最短路径与非有限输入。ROS 合成观测检查 `artifacts/cpp_goal_interface_boundaries_20261023.json` 的 passed=true，覆盖坐标变换、等待步态、观测中断、时间回退、用户发送工具确认和停止优先级；其结论仅限接口，不替代跨 ±π 真实运动验收。首轮被替换目标未宣布 reached，不将其算作成功到达。仍需用户在官方查看器确认动作；当前仅验证小位移/小角度平地工况，没有噪声/外力，不宣称完成 2 m 全范围、跨 ±π 物理运动、提速或实机部署。
+
+#### 使用方法
+
+三个终端均先进入项目目录，ROS 终端需 source ROS/工作区并使用相同 ROS_DOMAIN_ID。第一终端：
+
+```bash
+bash scripts/run_cpp_simulation.sh \
+  --mpc-solver sqp --online --sensor-startup \
+  --joint-kp 0 --joint-kd 1 --centroidal-base-accel \
+  --wbc-config config/wbc/upstream_a1_tasks_go2.json \
+  --csv artifacts/cpp_goal_manual.csv
+```
+
+第二终端启动键盘（默认 domain 216），按 T，等待实际开始 trot；先按空格清除旧运动速度。第三终端发送相对目标：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+export ROS_DOMAIN_ID=216
+/usr/bin/python3 tools/send_goal.py --x 0.12 --y 0.04 --yaw-deg 10
+```
+
+工具等待新鲜观测和目标节点，并等待接收确认；等待到达可在第一终端对应的 `_command.log` 看 reached，或另用 `ros2 topic echo /go2_control/goal_status`。`--frame odom` 切绝对坐标；`--cancel` 取消。键盘方向键接管、空格/X 取消并保留 trot、G 取消并站立、P 停稳退出。窗口无固定时长。
+
+重跑时用新前缀，避免覆盖记录：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source /home/bot/Project/ocs2_ws/install/local_setup.bash
+/usr/bin/python3 tools/run_cpp_goal_scenario.py \
+  --domain 218 --prefix artifacts/cpp_goal_repeat
+/usr/bin/python3 tools/check_cpp_goal_interface.py \
+  --domain 219 --prefix artifacts/cpp_goal_interface_repeat
+/usr/bin/g++ -std=c++17 -O2 -I/usr/include/eigen3 \
+  -Iros2/go2_control_cpp/include tests/cpp/test_goal_reference.cpp \
+  -o /tmp/go2_test_goal_reference
+/tmp/go2_test_goal_reference
+```
+
+本阶段代码/文档提交并 push，窗口确认后再通过 PR 合并；下一功能为扩展速度与过渡，不另起无关调参分支。
+
+
+### 位置目标窗口确认与长日志汇总（2026-10-23）
+
+用户确认“挺好的”，实际会话 `artifacts/cpp_goal_manual` 持续 634.118 s / 317,059 步。会话报告为 stopped / controlled_stop：632.794 s 收到 P 停止请求，634.116 s 达到停止条件，最后一帧后计时为 634.118 s。结束前 150 步为 mode 15、接管混合权重为零，估计机身速度范数最大 0.00640 m/s。用户动作评价和自动日志分别记录。
+
+- 第 1 个目标约 27.10 s 接收，但没有进入行走，轨迹时间保持零，随后 tracking_timeout；不计为到达成功。
+- 第 2 个目标约 298.96 s 接收，304.06 s 确认 reached，间隔 5.10 s；估计位置/yaw 误差 6.260 mm / 0.841°。最终目标是收到请求时机身水平朝向系下的相对位移，不能直接把局部世界 x=0.12 m 当作完整终点。
+- 全程最大执行力矩 19.051 Nm，无力矩截断；最大动力学/接触加速度残差 1.276e-5 / 2.050e-6。策略身份、年龄、连续采样及关节执行指令核对通过。
+- 排除前 2 s 后共 316,059 步，控制 mean/p99/max=0.399/1.173/2.766 ms，循环 mean/p99/max=0.502/1.571/3.845 ms；控制/循环超过 2 ms 为 38/569 步。该长会话包含等待、站立、原地 trot 与目标运动，不代表连续高速运行验收。
+
+原启动器标准汇总最初未生成，退出状态未保存。先对现有 1.7 GiB CSV 作独立流式核对，结果为 `.viewer_check.json`。随后修正 `summarize_cpp_control.py`：使用 `loadtxt` 增量解析到结构化数值数组，避免 `genfromtxt` 为全部文本行保留大量 Python 临时对象；保持空摆脚字段为 NaN、单行/空数组形状及非法数值/损坏行拒收。最终数值数组仍在内存中，后续分析的内存用量仍随日志长度增加，尚非任意时长日志的有界内存汇总。
+
+另将连续时间对照的绝对容差由 1 ns 调整为 10 ns；本组 MuJoCo 重复累加 0.002 s 后最大浮点误差约 1.72 ns，原 1 ns 门限会误拒该完整记录。新容差仍远小于漏失一个 2 ms 控制步，策略/残差/会话与停止检查继续保留。对空字段、NaN、空/单行、损坏行和重复表头增加回归；连同既有推扰汇总测试共 9 passed。使用修正后的汇总器读取本次原始 CSV，完整标准汇总成功写入 `artifacts/cpp_goal_manual.json`；未重跑物理仿真，也不据此断言最初未生成汇总的唯一原因。
+
+`send_goal.py` 的确认提示按实际状态区分：waiting_for_trot 才提示按 T，tracking 明确提示已经追踪、无需再按 T。当前功能的自动场景、接口边界、用户窗口确认及文档已齐，可提交/push 并收尾 PR；合并后进入速度范围和加减速过渡阶段。

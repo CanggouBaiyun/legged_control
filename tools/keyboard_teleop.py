@@ -31,6 +31,7 @@ HELP = """
   Esc / Ctrl+C：退出键盘程序，请求零速、姿态复位和站立，窗口继续运行
 
 按一下方向键会持续运动；不同轴可以叠加。空格停止移动但保留 trot。
+外部位置目标可与键盘共用；方向键接管，空格/X/G/Esc 取消位置目标。
 先按 T，等 MPC 切入 trot 后速度才会发送。键盘退出不会关闭 MuJoCo。
 机身高度限制为默认值 ±2 cm，俯仰/横滚限制为 ±5°；目标按变化率逐渐执行。
 """
@@ -45,6 +46,7 @@ class KeyboardControl:
         self.Twist, self.ModeSchedule = Twist, ModeSchedule
         self.Pose = Pose
         self.Empty = Empty
+        self.cancel_goal = node.create_publisher(Empty, "/go2_control/cancel_goal", 1)
         self.stop = node.create_publisher(Empty, "/go2_control/stop", 1)
         self.session_stop_requested = False
         self.velocity = node.create_publisher(Twist, "/cmd_vel", 1)
@@ -79,6 +81,8 @@ class KeyboardControl:
                 self.velocity.get_subscription_count() > 0)
 
     def request_gait(self, trot):
+        if not trot:
+            self.cancel_goal.publish(self.Empty())
         self.command = [0.0, 0.0, 0.0]
         if not self.connected() or self.gait.get_subscription_count() == 0:
             print("等待仿真和 MPC 就绪后，再按 T/G。", flush=True)
@@ -97,8 +101,9 @@ class KeyboardControl:
             return
         key = key.lower()
         if key in (" ", "x"):
+            self.cancel_goal.publish(self.Empty())
             self.command = [0.0, 0.0, 0.0]
-            print("所有速度已归零。", flush=True)
+            print("目标行走已取消，所有速度已归零。", flush=True)
         elif key == "p":
             if not self.connected() or self.stop.get_subscription_count() == 0:
                 print("等待仿真连接后再请求结束会话。", flush=True)

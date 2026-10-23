@@ -1,9 +1,26 @@
 """Summarize a completed native C++ simulation CSV (outside the control loop)."""
 import argparse
+import csv
 import json
 from pathlib import Path
 
 import numpy as np
+
+
+def load_numeric_csv(path):
+    """Read our numeric CSV without retaining Python strings for the entire run.
+
+    genfromtxt's temporary Python rows can dominate memory in long viewer
+    sessions. loadtxt parses incrementally into the same structured array;
+    absent swing targets remain NaN, as in the original reader.
+    """
+    with Path(path).open() as stream:
+        names = next(csv.reader(stream), None)
+        if not names or any(not name for name in names) or len(set(names)) != len(names):
+            raise RuntimeError(f"Missing or duplicate CSV column names: {path}")
+        return np.loadtxt(stream, delimiter=",", dtype=[(name, np.float64) for name in names],
+                          converters=lambda token: float(token) if token.strip() else np.nan,
+                          ndmin=1)
 
 
 def summarize_sensor_errors(data, session):
@@ -207,7 +224,7 @@ def summarize_push(data):
 
 def summarize_commands(path, allow_empty=False):
     """Summarize commands sampled when targets were published, outside control."""
-    data = np.atleast_1d(np.genfromtxt(path, delimiter=",", names=True))
+    data = load_numeric_csv(path)
     required = (
         "target_sequence", "time_s", "wall_elapsed_s", "command_sequence",
         "command_age_s", "command_valid", "command_timed_out",
@@ -242,7 +259,8 @@ def summarize_commands(path, allow_empty=False):
     effective = np.column_stack([data[name] for name in effective_fields])
     if (np.abs(effective) > np.array([0.10, 0.05, 0.20]) + 1e-9).any():
         raise RuntimeError("Effective online velocity exceeded its configured limit")
-    zero_required = (data["command_timed_out"] == 1) | (data["command_valid"] == 0)
+    goal_active = data["goal_active"] == 1 if "goal_active" in data.dtype.names else np.zeros(len(data), dtype=bool)
+    zero_required = ((data["command_timed_out"] == 1) | (data["command_valid"] == 0)) & ~goal_active
     if (np.abs(effective[zero_required]) > 1e-9).any():
         raise RuntimeError("Invalid or expired command produced nonzero velocity")
     changed = np.ones(len(data), dtype=bool)
@@ -289,7 +307,7 @@ def summarize_commands(path, allow_empty=False):
         if len(modes) != 1 or modes[0] not in (0, 1):
             raise RuntimeError("Invalid or changing position-reference mode")
         result["position_reference_mode"] = "integrated" if modes[0] else "measured"
-        translating_or_turning = (np.abs(effective) > 1e-9).any(axis=1)
+        translating_or_turning = (np.abs(effective) > 1e-9).any(axis=1) & ~goal_active
         lead_xy = np.hypot(data["reference_lead_x_m"], data["reference_lead_y_m"])
         lead_yaw = np.abs(data["reference_lead_yaw_rad"])
         result["max_moving_position_lead_m"] = float(lead_xy[translating_or_turning].max()) if translating_or_turning.any() else 0.0
@@ -297,6 +315,20 @@ def summarize_commands(path, allow_empty=False):
         if modes[0] and ((lead_xy[translating_or_turning] > 0.05 + 1e-9).any() or
                          (lead_yaw[translating_or_turning] > 0.20 + 1e-9).any()):
             raise RuntimeError("Integrated reference exceeded its lead limit")
+    if "goal_active" in data.dtype.names:
+        for name in ("goal_active", "goal_reached"):
+            if not np.isin(data[name], (0, 1)).all():
+                raise RuntimeError(f"Invalid goal flag: {name}")
+        for name in ("goal_sequence", "goal_elapsed_s", "goal_duration_s", "goal_x_m", "goal_y_m", "goal_yaw_rad", "goal_position_error_m", "goal_yaw_error_rad"):
+            if not np.isfinite(data[name]).all():
+                raise RuntimeError(f"Non-finite goal metadata: {name}")
+        if (np.hypot(data["target_vx_world_mps"][goal_active], data["target_vy_world_mps"][goal_active]) > .05+1e-9).any():
+            raise RuntimeError("Goal reference exceeded 0.05 m/s")
+        result["goals"] = {
+            "accepted_count": int(data["goal_sequence"].max()),
+            "reached_sequences": [int(x) for x in np.unique(data["goal_sequence"][data["goal_reached"] == 1])],
+            "active_samples": int(goal_active.sum()),
+        }
     return result
 
 
@@ -305,7 +337,7 @@ def summarize(path, duration=20.0, commands=None):
         raise RuntimeError("Duration must be finite and non-negative")
     interactive = duration == 0
     requested_duration = duration
-    data = np.atleast_1d(np.genfromtxt(path, delimiter=",", names=True))
+    data = load_numeric_csv(path)
     session_path = path.with_suffix(".session.json")
     session = None
     if session_path.exists():
@@ -338,7 +370,9 @@ def summarize(path, duration=20.0, commands=None):
             continue
         if not np.isfinite(data[name]).all():
             raise RuntimeError(f"Non-finite data: {name}")
-    if not np.allclose(data["time_s"], np.arange(len(data)) * 0.002, atol=1e-9, rtol=0):
+    # Repeated MuJoCo time += 0.002 accumulates nanosecond-scale rounding over
+    # minutes. This tolerance remains far below one missing 2 ms sample.
+    if not np.allclose(data["time_s"], np.arange(len(data)) * 0.002, atol=1e-8, rtol=0):
         raise RuntimeError("CSV does not contain consecutive 2 ms samples")
     if (np.diff(data["policy_sequence"]) < 0).any() or len(np.unique(data["policy_reset_epoch"])) != 1:
         raise RuntimeError("Policy identity moved backward or changed epoch")
