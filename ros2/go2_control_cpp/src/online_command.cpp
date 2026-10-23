@@ -5,6 +5,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/string.hpp>
 #include "go2_control_cpp/goal_reference.hpp"
+#include "go2_control_cpp/velocity_reference.hpp"
 #include <Eigen/Geometry>
 #include <std_msgs/msg/empty.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -45,6 +46,25 @@ class OnlineCommand {
         reference_file,"defaultJointState",default_joints_);
     ocs2::loadData::loadCppDataType(
         task_file,"mpc.timeHorizon",horizon_);
+        ocs2::loadData::loadEigenMatrix(
+        reference_file, "onlineCommand.maxVelocity",
+        velocity_limits_);
+    ocs2::loadData::loadEigenMatrix(
+        reference_file, "onlineCommand.maxAcceleration",
+        acceleration_limits_);
+    ocs2::loadData::loadEigenMatrix(
+        reference_file, "onlineCommand.maxDeceleration",
+        deceleration_limits_);
+
+    if (!velocity_limits_.allFinite() ||
+        !acceleration_limits_.allFinite() ||
+        !deceleration_limits_.allFinite() ||
+        (velocity_limits_.array() <= 0.0).any() ||
+        (acceleration_limits_.array() <= 0.0).any() ||
+        (deceleration_limits_.array() <= 0.0).any()) {
+      throw std::runtime_error(
+          "Online velocity, acceleration and deceleration limits must be finite and positive");
+    }
 
     if(!std::isfinite(height_) || height_<=0 ||
         !std::isfinite(horizon_) || horizon_<=0 ||
@@ -198,10 +218,13 @@ class OnlineCommand {
     // motion takes over immediately; Space/G/Esc send explicit cancellation.
     if(std::max({std::abs(msg.linear.x),std::abs(msg.linear.y),std::abs(msg.angular.z)})>1e-9)
       cancelGoal("velocity_takeover");
-    command_<<
-        std::clamp(msg.linear.x,-0.10,0.10),
-        std::clamp(msg.linear.y,-0.05,0.05),
-        std::clamp(msg.angular.z,-0.20,0.20);
+    command_ <<
+    std::clamp(msg.linear.x,
+                -velocity_limits_[0], velocity_limits_[0]),
+    std::clamp(msg.linear.y,
+                -velocity_limits_[1], velocity_limits_[1]),
+    std::clamp(msg.angular.z,
+                -velocity_limits_[2], velocity_limits_[2]);
   }
 
   Eigen::Vector3d observedPlanarPose() const {
@@ -321,6 +344,10 @@ class OnlineCommand {
         std::chrono::duration<double>(
             now-observation_received_).count()>0.2) {
       if(goal_active_ || goal_reached_) cancelGoal("observation_lost");
+      smoothed_command_.setZero();
+      velocity_reference_time_ = -1.0;
+      command_.setZero();
+      command_valid_ = false;
       return;
     }
 
@@ -328,14 +355,40 @@ class OnlineCommand {
     if(node_->count_publishers("/legged_robot_mpc_target")>1)
       throw std::runtime_error("Multiple MPC target publishers; stop the other target node");
 
-    const double command_age=command_sequence_==0 ? -1.0 :
-        std::chrono::duration<double>(now-command_received_).count();
-    const bool timed_out=command_sequence_==0 || command_age>0.5;
-    Eigen::Vector3d command=command_;
-    if(!command_valid_ || timed_out)
-      command.setZero();
+    const double command_age = command_sequence_ == 0 ? -1.0 :
+        std::chrono::duration<double>(now - command_received_).count();
+    const bool timed_out = command_sequence_ == 0 || command_age > 0.5;
 
-    const bool moving=command.cwiseAbs().maxCoeff()>1e-9;
+    double velocity_dt = observation_.time - velocity_reference_time_;
+
+    if (velocity_reference_time_ < 0.0 ||
+        velocity_dt < 0.0 || velocity_dt > 0.2) {
+      smoothed_command_.setZero();
+      velocity_dt = 0.0;
+    }
+    velocity_reference_time_ = observation_.time;
+
+    Eigen::Vector3d target_command = command_;
+
+    const bool walking =
+        last_walking_time_ >= 0.0 &&
+        observation_.time - last_walking_time_ <= 0.5;
+
+    // 这些情况清除速度参考；正常发送零速度时则按减速度降速。
+    if (!command_valid_ || timed_out ||
+        stop_latched_ || goal_active_ || !walking) {
+      target_command.setZero();
+      smoothed_command_.setZero();
+    }
+
+    const auto velocity_step = go2_control_cpp::sampleVelocity(
+        smoothed_command_, target_command,
+        acceleration_limits_, deceleration_limits_, velocity_dt);
+
+    smoothed_command_ = velocity_step.velocity;
+    Eigen::Vector3d command = smoothed_command_;
+
+    const bool moving = command.cwiseAbs().maxCoeff() > 1e-9;
     const Eigen::Matrix<double,6,1> observed_pose=
         observation_.state.segment<6>(6);
     if(goal_active_) {
@@ -383,10 +436,20 @@ class OnlineCommand {
       if(!was_moving_ || dt<0 || dt>0.2) {
         hold_pose_=observed_pose;
       } else {
-        // Integrate the previously published command over observation time.
-        // Re-anchoring every update would erase accumulated position error.
-        hold_pose_.head<3>()+=previous_world_velocity_*dt;
-        hold_pose_[3]+=previous_yaw_rate_*dt;
+        // Integrate the velocity ramp; rotate horizontal motion
+        // using the approximate midpoint heading of this interval.
+        const double middle_yaw =
+            observed_pose[3] - 0.5 * velocity_step.integral[2];
+        const double c_step = std::cos(middle_yaw);
+        const double s_step = std::sin(middle_yaw);
+
+        hold_pose_[0] +=
+            c_step * velocity_step.integral[0] -
+            s_step * velocity_step.integral[1];
+        hold_pose_[1] +=
+            s_step * velocity_step.integral[0] +
+            c_step * velocity_step.integral[1];
+        hold_pose_[3] += velocity_step.integral[2];
       }
       // Bound the lead during poor tracking or a disturbance.
       const Eigen::Vector2d lead=hold_pose_.head<2>()-observed_pose.head<2>();
@@ -456,7 +519,10 @@ class OnlineCommand {
     future[2] = vertical_velocity;
 
     ocs2::TargetTrajectories target;
-    const int intervals=goal_active_ ? 10 : 1;
+    const int intervals = 10;
+    Eigen::Vector3d previous_integral = Eigen::Vector3d::Zero();
+    Eigen::Vector2d preview_displacement = Eigen::Vector2d::Zero();
+    double previous_preview = 0.0;
     for(int k=0;k<=intervals;++k) {
       const double preview=horizon_*k/intervals;
       ocs2::vector_t state=current;
@@ -472,9 +538,38 @@ class OnlineCommand {
           command << c*velocity[0]+s*velocity[1],-s*velocity[0]+c*velocity[1],velocity[2];
         }
       } else {
-        state[6]+=world_velocity[0]*preview;
-        state[7]+=world_velocity[1]*preview;
-        state[9]+=command[2]*preview;
+        const auto sample = go2_control_cpp::sampleVelocity(
+            command, target_command,
+            acceleration_limits_, deceleration_limits_, preview);
+
+        const double middle_time = 0.5 * (previous_preview + preview);
+        const auto middle = go2_control_cpp::sampleVelocity(
+            command, target_command,
+            acceleration_limits_, deceleration_limits_, middle_time);
+
+        const Eigen::Vector3d increment =
+            sample.integral - previous_integral;
+
+        const double middle_yaw = observed_pose[3] + middle.integral[2];
+        const double cm = std::cos(middle_yaw);
+        const double sm = std::sin(middle_yaw);
+
+        preview_displacement[0] += cm * increment[0] - sm * increment[1];
+        preview_displacement[1] += sm * increment[0] + cm * increment[1];
+
+        state[6] = pose[0] + preview_displacement[0];
+        state[7] = pose[1] + preview_displacement[1];
+        state[9] = pose[3] + sample.integral[2];
+
+        const double future_yaw = observed_pose[3] + sample.integral[2];
+        const double cf = std::cos(future_yaw);
+        const double sf = std::sin(future_yaw);
+
+        state[0] = cf * sample.velocity[0] - sf * sample.velocity[1];
+        state[1] = sf * sample.velocity[0] + cf * sample.velocity[1];
+
+        previous_integral = sample.integral;
+        previous_preview = preview;
       }
       for(int i=0;i<3;++i) {
         const int index=i==0 ? 8 : i==1 ? 10 : 11;
@@ -548,6 +643,11 @@ class OnlineCommand {
   ocs2::SystemObservation observation_;
   ocs2::vector_t default_joints_;
   Eigen::Vector3d command_=Eigen::Vector3d::Zero();
+  Eigen::Vector3d smoothed_command_ = Eigen::Vector3d::Zero();
+  double velocity_reference_time_ = -1.0;
+  Eigen::Vector3d velocity_limits_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d acceleration_limits_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d deceleration_limits_ = Eigen::Vector3d::Zero();
   Eigen::Vector3d requested_=Eigen::Vector3d::Zero();
   Eigen::Vector3d previous_world_velocity_=Eigen::Vector3d::Zero();
   Eigen::Matrix<double,6,1> hold_pose_=

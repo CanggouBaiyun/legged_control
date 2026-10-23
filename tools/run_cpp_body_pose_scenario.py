@@ -142,9 +142,11 @@ try:
     assert len(sent) == len(events)
     assert len(targets) > 200
     for message in targets:
-        assert len(message.state_trajectory) == 2
-        first, last = (state.value for state in message.state_trajectory)
-        horizon = message.time_trajectory[1] - message.time_trajectory[0]
+        assert len(message.state_trajectory) >= 2
+        assert len(message.time_trajectory) == len(message.state_trajectory)
+        first = message.state_trajectory[0].value
+        last = message.state_trajectory[-1].value
+        horizon = message.time_trajectory[-1] - message.time_trajectory[0]
         assert all(math.isfinite(x) for x in first + last)
         for index, limit in ((8, 0.02), (10, 0.10), (11, 0.10)):
             assert abs(last[index] - first[index]) <= limit*horizon + 1e-6

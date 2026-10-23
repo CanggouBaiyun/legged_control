@@ -3,6 +3,32 @@ targetRotationVelocity              0.3;
 
 comHeight                           0.27
 
+onlineCommand
+{
+  ; 顺序：前后、左右、转向
+  ; 单位：m/s、m/s、rad/s
+  maxVelocity
+  {
+    (0,0)  1.5
+    (1,0)  1.5
+    (2,0)  0.20
+  }
+
+  ; 单位：m/s^2、m/s^2、rad/s^2
+  maxAcceleration
+  {
+    (0,0)  0.5
+    (1,0)  0.5
+    (2,0)  0.5
+  }
+
+  maxDeceleration
+  {
+    (0,0)  0.8
+    (1,0)  0.8
+    (2,0)  0.8
+  }
+}
 defaultJointState
 {
   (0,0)   0.0
